@@ -1,38 +1,65 @@
-//! io_uring Server (Linux only)
+//! io_uring Server (Linux only).
 //!
-//! Uses tokio-uring for zero-copy, async I/O with io_uring.
-//! This provides significant performance improvement on Linux.
+//! Uses `tokio-uring` for zero-copy, async I/O with io_uring.
+//! Command processing is delegated to the same
+//! [`process_command_into`] function as the Tokio server so that
+//! behaviour is identical regardless of the I/O backend.
 //!
-//! Enable with: cargo run --release --features io-uring -- server 6380 io_uring
+//! Enable with: `cargo run --release --features io-uring -- server 6380 io_uring`
 
+use crate::core::expiration::ExpirationManager;
 use crate::core::kv::KvStore;
 use crate::core::server::tcp::{parse_command_bounds, process_command_into};
+use crate::core::wal::Wal;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Default listen port.
 const DEFAULT_PORT: u16 = 6379;
+
+/// Per-connection read buffer size (1 MiB).
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// io_uring-based TCP server.
 pub struct IoUringServer {
     store: Arc<KvStore>,
+    wal: Option<Arc<Wal>>,
+    expiry: Option<Arc<ExpirationManager>>,
     pub port: u16,
 }
 
 impl IoUringServer {
+    /// Create a server with default settings (port 6379).
     pub fn new() -> Self {
         Self {
             store: Arc::new(KvStore::new()),
+            wal: None,
+            expiry: None,
             port: DEFAULT_PORT,
         }
     }
 
+    /// Create a server that listens on *port*.
     pub fn with_port(port: u16) -> Self {
         Self {
             store: Arc::new(KvStore::new()),
+            wal: None,
+            expiry: None,
             port,
         }
     }
 
+    /// Create a fully configured server.
+    pub fn with_components(
+        port: u16,
+        store: Arc<KvStore>,
+        wal: Option<Arc<Wal>>,
+        expiry: Option<Arc<ExpirationManager>>,
+    ) -> Self {
+        Self { store, wal, expiry, port }
+    }
+
+    /// Block the calling thread running the io_uring event loop.
     pub fn run(&self) {
         tokio_uring::start(self.run_inner());
     }
@@ -42,8 +69,8 @@ impl IoUringServer {
 
         let addr: SocketAddr = format!("0.0.0.0:{}", self.port)
             .parse()
-            .expect("Invalid address");
-            
+            .expect("invalid address");
+
         let listener = match TcpListener::bind(addr) {
             Ok(l) => l,
             Err(e) => {
@@ -55,6 +82,9 @@ impl IoUringServer {
         println!("FastKV io_uring server listening on {}", addr);
         println!("Using io_uring for maximum performance!");
 
+        let wal = self.wal.clone();
+        let expiry = self.expiry.clone();
+
         loop {
             let (stream, client_addr) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -65,27 +95,27 @@ impl IoUringServer {
             };
 
             let store = Arc::clone(&self.store);
-            
+            let wal = wal.clone();
+            let expiry = expiry.clone();
+
             tokio_uring::spawn(async move {
-                handle_client(stream, store, client_addr).await;
+                handle_client(stream, store, wal, expiry, client_addr).await;
             });
         }
     }
 }
 
+/// Per-connection state and main read/write loop (io_uring edition).
 async fn handle_client(
     stream: tokio_uring::net::TcpStream,
     store: Arc<KvStore>,
+    wal: Option<Arc<Wal>>,
+    expiry: Option<Arc<ExpirationManager>>,
     addr: SocketAddr,
 ) {
-    println!("[{}] Client connected (io_uring)", addr);
-
     let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
-    let mut response = Vec::with_capacity(4096);
-
-    // Need mutable stream for read/write
-    let stream = stream;
+    let mut response: Vec<u8> = Vec::with_capacity(4096);
 
     loop {
         let (result, buf) = stream.read(buffer).await;
@@ -103,32 +133,38 @@ async fn handle_client(
         leftover.extend_from_slice(&buffer[..n]);
         response.clear();
 
-        let mut processed = 0;
-        while processed < leftover.len() {
-            match parse_command_bounds(&leftover[processed..]) {
-                Some((consumed, is_inline)) => {
-                    let cmd_data = &leftover[processed..processed + consumed];
-                    process_command_into(cmd_data, &store, &mut response, is_inline);
-                    processed += consumed;
+        let mut consumed = 0;
+        let mut should_close = false;
+        while consumed < leftover.len() {
+            match parse_command_bounds(&leftover[consumed..]) {
+                Some((len, is_inline)) => {
+                    let cmd_data = &leftover[consumed..consumed + len];
+                    should_close = process_command_into(
+                        cmd_data,
+                        &store,
+                        wal.as_deref(),
+                        expiry.as_deref(),
+                        &mut response,
+                        is_inline,
+                    );
+                    consumed += len;
+                    if should_close { break; }
                 }
                 None => break,
             }
         }
-
-        leftover.drain(..processed);
+        leftover.drain(..consumed);
 
         if !response.is_empty() {
-            let (result, buf) = stream.write_all(response).await;
-            response = buf;
-            
+            let (result, resp) = stream.write_all(response).await;
+            response = resp;
             if let Err(e) = result {
                 eprintln!("[{}] Write error: {}", addr, e);
                 break;
             }
         }
+        if should_close { break; }
     }
-
-    println!("[{}] Client disconnected", addr);
 }
 
 impl Default for IoUringServer {

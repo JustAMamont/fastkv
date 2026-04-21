@@ -1,6 +1,8 @@
-//! Server implementations
+//! Server implementations.
 //!
-//! TCP servers for accepting Redis client connections.
+//! TCP servers for accepting Redis client connections. Both servers share
+//! the same command-dispatch logic via [`process_command_into`] and
+//! [`parse_command_bounds`] in the [`tcp`] module.
 
 pub mod tcp;
 
