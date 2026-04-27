@@ -288,10 +288,10 @@ Operations:
 ### WAL (Write-Ahead Log)
 
 ```
-┌──────────┬──────────┬──────────┬────────┬────┬────────┬────┬────────┐
-│  magic   │  version │  crc32c  │  op    │ kl │  key   │ vl │  value │
-│  4 bytes │  2 bytes │  4 bytes │  1 byte│ 2B │ kl B   │ 2B │  vl B  │
-└──────────┴──────────┴──────────┴────────┴────┴────────┴────┴────────┘
+┌─────────┬─────────┬─────────┬────────┬────┬──────┬────┬───────┐
+│ magic   │ version │ crc32c  │ op     │ kl │ key  │ vl │ value │
+│ 4 bytes │ 2 bytes │ 4 bytes │ 1 byte │ 2B │ kl B │ 2B │ vl B  │
+└─────────┴─────────┴─────────┴────────┴────┴──────┴────┴───────┘
 
 Fsync policies:  always (safest) | everysec (balanced) | never (fastest)
 
