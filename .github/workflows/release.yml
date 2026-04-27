@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Build server + Go client, publish release
+  # ──────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            runner: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            binary: fast_kv
+            ext: ""
+          - target: aarch64-linux
+            runner: ubuntu-latest
+            rust-target: aarch64-unknown-linux-gnu
+            binary: fast_kv
+            ext: ""
+            cross: true
+          - target: x86_64-windows
+            runner: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            binary: fast_kv.exe
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          targets: ${{ matrix.rust-target }}
+
+      - name: Install cross compiler (aarch64-linux)
+        if: matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build server
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target ${{ matrix.rust-target }}
+
+      - name: Package server
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.rust-target }}/release/${{ matrix.binary }} dist/fastkv-server-${{ matrix.target }}${{ matrix.ext }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.target }}
+          path: dist/
+
+  go-client:
+    name: Go client (cross-compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Cross-compile
+        working-directory: clients/go/fastkv
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p bin
+          for entry in \
+            "linux   amd64" \
+            "linux   arm64" \
+            "windows amd64 .exe" \
+            "windows arm64 .exe" \
+            "darwin  amd64" \
+            "darwin  arm64"; do
+            read os arch ext <<< "$entry"
+            out="bin/fastkv-go-${os}-${arch}${ext}"
+            echo "Building $out ..."
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "$out" .
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-client
+          path: clients/go/fastkv/bin/
+
+  # ──────────────────────────────────────────────
+  # Publish GitHub Release
+  # ──────────────────────────────────────────────
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [build, go-client]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts/ -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*

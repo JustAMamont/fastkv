@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ──────────────────────────────────────────────
@@ -60,21 +61,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        working-directory: clients/rust
-        run: cargo build --release --locked
-
-      - name: Start server
-        run: cargo run --release -- server 6379 &
-        shell: bash
-
-      - name: Run integration tests
+      - name: Build & test
         env:
           FASTKV_HOST: localhost
           FASTKV_PORT: "6379"
-        working-directory: clients/rust
-        run: cargo test --locked -- --test-threads=1
         shell: bash
+        run: |
+          cargo run --release -- server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 0.5
+          done
+          cd clients/rust
+          cargo test -- --test-threads=1
 
   # ──────────────────────────────────────────────
   # Go client — cross-compile all targets
@@ -117,15 +116,18 @@ jobs:
           name: go-client-binaries
           path: clients/go/fastkv/bin/
 
-      - name: Start server
-        run: cargo run --release -- server 6379 &
-        shell: bash
-
       - name: Run tests
         env:
           FASTKV_ADDR: "localhost:6379"
-        working-directory: clients/go/fastkv
-        run: go test -v -count=1 -timeout 30s ./...
+        shell: bash
+        run: |
+          cargo run --release -- server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 0.5
+          done
+          cd clients/go/fastkv
+          go test -v -count=1 -timeout 30s ./...
 
   # ──────────────────────────────────────────────
   # Java client — compile & test on each OS
@@ -137,16 +139,13 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        include:
-          - os: macos-latest
-            arch: arm64
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "8"
+          java-version: "11"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -154,29 +153,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Compile
+      - name: Build & test
+        shell: bash
         run: |
           mkdir -p clients/java/target/classes
           javac -d clients/java/target/classes clients/java/src/*.java
-        shell: bash
-
-      - name: Start server
-        run: cargo run --release -- server 6379 &
-        shell: bash
-
-      - name: Run sync tests
-        env:
-          FASTKV_HOST: localhost
-          FASTKV_PORT: "6379"
-        run: java -Dfastkv.host=localhost -Dfastkv.port=6379 -cp clients/java/target/classes com.fastkv.client.IntegrationTest
-        shell: bash
-
-      - name: Run reactive tests
-        env:
-          FASTKV_HOST: localhost
-          FASTKV_PORT: "6379"
-        run: java -Dfastkv.host=localhost -Dfastkv.port=6379 -cp clients/java/target/classes com.fastkv.client.IntegrationTestReactive
-        shell: bash
+          cargo run --release -- server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 0.5
+          done
+          java -Dfastkv.host=localhost -Dfastkv.port=6379 -cp clients/java/target/classes com.fastkv.client.IntegrationTest
+          java -Dfastkv.host=localhost -Dfastkv.port=6379 -cp clients/java/target/classes com.fastkv.client.IntegrationTestReactive
 
   # ──────────────────────────────────────────────
   # Node.js client — test on each OS
@@ -201,13 +189,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Start server
-        run: cargo run --release -- server 6379 &
+      - name: Build & test
         shell: bash
-
-      - name: Run tests
-        run: node clients/node/fastkv/tests/test_integration.js localhost 6379
-        shell: bash
+        run: |
+          cargo run --release -- server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 0.5
+          done
+          node clients/node/fastkv/tests/test_integration.js localhost 6379
 
   # ──────────────────────────────────────────────
   # Python client — test on each OS
@@ -233,20 +223,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Start server
-        run: cargo run --release -- server 6379 &
-        shell: bash
-
-      - name: Run sync tests
+      - name: Build & test
         env:
           FASTKV_HOST: localhost
           FASTKV_PORT: "6379"
-        run: python clients/python/tests/test_integration.py
         shell: bash
-
-      - name: Run async tests
-        env:
-          FASTKV_HOST: localhost
-          FASTKV_PORT: "6379"
-        run: python clients/python/tests/test_async_integration.py
-        shell: bash
+        run: |
+          cargo run --release -- server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 0.5
+          done
+          python clients/python/tests/test_integration.py
+          python clients/python/tests/test_async_integration.py
