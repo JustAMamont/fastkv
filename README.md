@@ -1,73 +1,85 @@
 # FastKV
 
-High-performance, Redis-compatible key-value store written in Rust.
+High-performance, Redis-compatible key-value store written in Rust with lock-free data structures and zero-dependency client SDKs in Go, Python, Java, and Node.js.
 
 ## Features
 
-- **Lock-free hash table** — thread-safe without mutexes, uses atomic CAS and optimistic version reads
-- **Redis-compatible** — supports RESP protocol, works with `redis-cli`
-- **Pipeline support** — batch multiple commands for higher throughput
-- **WAL persistence** — crash-consistent write-ahead log with configurable fsync (Phase 2)
-- **String operations** — INCR, DECR, INCRBY, APPEND, STRLEN, GETRANGE, SETRANGE, MGET, MSET, EXISTS (Phase 3)
-- **TTL / Expiration** — EXPIRE, TTL, PTTL, PERSIST with lazy + active key purging (Phase 4)
-- **Hash data type** — HSET, HGET, HDEL, HGETALL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HMSET (Phase 6)
-- **io_uring (Linux)** — optional kernel bypass for maximum performance
-- **Cross-platform** — works on Linux, macOS, Windows
+- **Lock-free hash table** — thread-safe without mutexes; uses atomic CAS and optimistic version reads
+- **Redis-compatible RESP protocol** — works with `redis-cli` and any Redis-compatible tooling
+- **Pipeline support** — batch multiple commands in a single round-trip for higher throughput
+- **WAL persistence** — crash-consistent write-ahead log with configurable fsync policy and TTL recovery
+- **TTL / Expiration** — `EXPIRE`, `TTL`, `PTTL`, `PERSIST` with lazy + active key purging, persisted to WAL
+- **Hash data type** — `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HMGET`, `HMSET`
+- **List data type** — `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LREM`, `LTRIM`, `LSET`
+- **String operations** — `INCR`, `DECR`, `INCRBY`, `APPEND`, `STRLEN`, `GETRANGE`, `SETRANGE`, `MGET`, `MSET`, `EXISTS`
+- **io_uring (Linux)** — optional kernel-bypass networking for maximum throughput
+- **Client SDKs** — zero-dependency libraries for Go, Python, Java, and Node.js
 
 ## Performance
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  FastKV vs Redis (io_uring, 2 cores)                            │
-├─────────────────────────────────────────────────────────────────┤
-│  Sequential:   2.2x faster                                      │
-│  Pipeline:     1.6x faster (batch=100)                          │
-│  Multi-thread: 2.1x faster (8 threads)                          │
-├─────────────────────────────────────────────────────────────────┤
-│  Peak throughput: ~713,000 ops/sec (GET, pipeline batch=500)    │
-└─────────────────────────────────────────────────────────────────┘
+FastKV vs Redis (io_uring, 2 cores)
+─────────────────────────────────────────────────────────
+  Sequential:   2.2x faster
+  Pipeline:     1.6x faster (batch=100)
+  Multi-thread: 2.1x faster (8 threads)
+  Peak throughput: ~713 000 ops/sec (GET, pipeline batch=500)
+─────────────────────────────────────────────────────────
 ```
 
-## Requirements
+## Quick Start
 
-- Rust 1.90+
-- Linux (for io_uring), macOS, or Windows
-
-## Build
+### Build
 
 ```bash
-git clone <repo-url>
-cd fast_kv
-
-# Debug build (fast compilation)
-cargo build
-
-# Release build (maximum performance)
 cargo build --release
-
-# With io_uring support (Linux only)
-cargo build --release --features io-uring
 ```
 
-## Run Server
+### Run Server
 
 ```bash
-# Default server (Tokio, cross-platform) — WAL + TTL enabled by default
+# Default (Tokio, cross-platform) — WAL + TTL + Lists enabled by default
 cargo run --release -- server 6379
 
-# With io_uring (Linux only, requires --features io-uring)
+# With io_uring (Linux only)
 cargo run --release --features io-uring -- server 6379 io_uring
-
-# Custom port
-cargo run --release -- server 6380
 ```
+
+### Connect with redis-cli
+
+```bash
+redis-cli -p 6379
+```
+
+```
+127.0.0.1:6379> SET hello world
+OK
+127.0.0.1:6379> GET hello
+"world"
+127.0.0.1:6379> PING
+PONG
+```
+
+## Client Libraries
+
+All clients speak RESP directly over TCP — no Redis SDK dependency required.
+
+| Language | Zero Dependencies | Pipeline | Directory |
+|----------|:-:|:-:|-----------|
+| **Rust** | tokio only | Yes | `clients/rust/` |
+| Go | stdlib only | Yes | `clients/go/fastkv/` |
+| Python | stdlib only | Yes | `clients/python/fastkv/` |
+| Java | JDK 8+ only | Yes | `clients/java/` |
+| Node.js | stdlib only | Yes | `clients/node/fastkv/` |
+
+See [`clients/README.md`](clients/README.md) for API reference and usage examples.
 
 ## Environment Variables
 
-| Variable      | Default            | Description                                           |
-|---------------|--------------------|-------------------------------------------------------|
-| `FASTKV_DIR`  | `./fastkv_data`    | Directory for WAL file                                |
-| `FASTKV_FSYNC`| `everysec`         | WAL fsync policy: `always`, `everysec`, or `never`    |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FASTKV_DIR` | `./fastkv_data` | Directory for WAL file |
+| `FASTKV_FSYNC` | `everysec` | WAL fsync policy: `always`, `everysec`, or `never` |
 
 ```bash
 # Strongest durability (fsync after every write)
@@ -77,446 +89,252 @@ FASTKV_FSYNC=always cargo run --release -- server 6379
 FASTKV_FSYNC=never cargo run --release -- server 6379
 ```
 
-## Test with redis-cli
+## Supported Commands
 
-```bash
-redis-cli -p 6379
-```
+### Core
 
-### Core commands
+| Command | Description |
+|---------|-------------|
+| `SET key value [NX\|XX] [EX seconds\|PX ms]` | Set key-value with optional conditions and TTL |
+| `GET key` | Get value by key |
+| `DEL key [key ...]` | Delete one or more keys |
+| `EXISTS key [key ...]` | Count existing keys |
+| `PING` | Health check |
+| `ECHO msg` | Echo message |
+| `DBSIZE` | Number of keys |
+| `INFO` | Server info |
+| `COMMAND` | Command discovery |
+| `QUIT` | Close connection |
 
-```
-127.0.0.1:6379> SET hello world
-OK
-127.0.0.1:6379> GET hello
-"world"
-127.0.0.1:6379> DEL hello
-(integer) 1
-127.0.0.1:6379> GET hello
-(nil)
-127.0.0.1:6379> PING
-PONG
-127.0.0.1:6379> DBSIZE
-(integer) 0
-127.0.0.1:6379> EXISTS mykey
-(integer) 0
-```
+### String Operations
 
-### String operations (Phase 3)
+| Command | Description |
+|---------|-------------|
+| `INCR` / `DECR` | Increment / decrement by 1 |
+| `INCRBY n` / `DECRBY n` | Increment / decrement by n |
+| `APPEND key value` | Append to string |
+| `STRLEN key` | String length |
+| `GETRANGE key start end` | Substring by byte range |
+| `SETRANGE key offset value` | Overwrite at offset |
+| `MSET k1 v1 k2 v2 ...` | Set multiple keys |
+| `MGET k1 k2 ...` | Get multiple keys |
 
-```
-127.0.0.1:6379> SET counter 10
-OK
-127.0.0.1:6379> INCR counter
-(integer) 11
-127.0.0.1:6379> INCRBY counter 5
-(integer) 16
-127.0.0.1:6379> DECR counter
-(integer) 15
-127.0.0.1:6379> DECRBY counter 10
-(integer) 5
+### Expiration
 
-127.0.0.1:6379> SET msg Hello
-OK
-127.0.0.1:6379> APPEND msg " World"
-(integer) 11
-127.0.0.1:6379> STRLEN msg
-(integer) 11
-127.0.0.1:6379> GETRANGE msg 0 4
-"Hello"
-127.0.0.1:6379> SETRANGE msg 6 "Redis"
-(integer) 11
-127.0.0.1:6379> GET msg
-"Hello Redis"
+| Command | Description |
+|---------|-------------|
+| `EXPIRE key seconds` | Set TTL in seconds |
+| `TTL key` | Remaining TTL in seconds |
+| `PTTL key` | Remaining TTL in milliseconds |
+| `PERSIST key` | Remove TTL |
 
-127.0.0.1:6379> MSET a 1 b 2 c 3
-OK
-127.0.0.1:6379> MGET a b c missing
-1) "1"
-2) "2"
-3) "3"
-4) (nil)
-```
+### Hash
 
-### Expiration commands (Phase 4)
+| Command | Description |
+|---------|-------------|
+| `HSET key field value` | Set hash field |
+| `HGET key field` | Get hash field |
+| `HDEL key field [field ...]` | Delete hash fields |
+| `HGETALL key` | Get all fields and values |
+| `HEXISTS key field` | Check field exists |
+| `HLEN key` | Number of fields |
+| `HKEYS key` | All field names |
+| `HVALS key` | All field values |
+| `HMGET key field [field ...]` | Get multiple fields |
+| `HMSET key f1 v1 f2 v2 ...` | Set multiple fields |
 
-```
-127.0.0.1:6379> SET session abc123
-OK
-127.0.0.1:6379> EXPIRE session 3600
-(integer) 1
-127.0.0.1:6379> TTL session
-(integer) 3599
-127.0.0.1:6379> PTTL session
-(integer) 3598976
-127.0.0.1:6379> PERSIST session
-(integer) 1
-127.0.0.1:6379> TTL session
-(integer) -2
-```
+### List
 
-### Hash commands (Phase 6)
+| Command | Description |
+|---------|-------------|
+| `LPUSH key elem [elem ...]` | Push to head |
+| `RPUSH key elem [elem ...]` | Push to tail |
+| `LPOP key` / `RPOP key` | Pop from head / tail |
+| `LRANGE key start stop` | Get range |
+| `LLEN key` | List length |
+| `LINDEX key index` | Element by index |
+| `LREM key count elem` | Remove elements by value |
+| `LTRIM key start stop` | Trim list to range |
+| `LSET key index elem` | Set element by index |
 
-```
-127.0.0.1:6379> HSET myhash name Alice
-(integer) 1
-127.0.0.1:6379> HSET myhash age 30
-(integer) 1
-127.0.0.1:6379> HGET myhash name
-"Alice"
-127.0.0.1:6379> HGETALL myhash
-1) "name"
-2) "Alice"
-3) "age"
-4) "30"
-127.0.0.1:6379> HEXISTS myhash name
-(integer) 1
-127.0.0.1:6379> HLEN myhash
-(integer) 2
-127.0.0.1:6379> HDEL myhash age
-(integer) 1
-127.0.0.1:6379> TTL myhash
-(integer) -2
-```
+> Lists are in-memory only (not persisted to WAL). Suitable for ephemeral data such as queues and buffers.
 
 ## Testing
 
+### Server Unit Tests (122 tests)
+
 ```bash
-# Run all unit tests
 cargo test
-
-# Run tests for a specific module
-cargo test --lib -- core::kv::tests
-cargo test --lib -- core::wal::tests
-cargo test --lib -- core::expiration::tests
-cargo test --lib -- core::resp::tests
-cargo test --lib -- core::server::tcp::tests
-
-# Built-in smoke tests (no cargo test required)
-cargo run --release -- test
 ```
 
-### Test coverage (45+ tests)
+| Module | Tests | Coverage |
+|--------|------:|----------|
+| `kv.rs` | 29 | GET/SET/DEL, INCR/DECR, MGET/MSET, APPEND, STRLEN, GETRANGE, SETRANGE, lock-free ops, concurrent |
+| `wal.rs` | 16 | Create/recover, CRC-32C, alignment, binary keys, large values, EXPIRE entry |
+| `expiration.rs` | 14 | EXPIRE/TTL/PERSIST, lazy/active purging, concurrent, DEL cascade |
+| `hash.rs` | 20 | HSET/HGET/HDEL, HGETALL, HEXISTS, HLEN, HKEYS/HVALS, HMGET/HMSET, edge cases |
+| `list.rs` | 17 | LPUSH/RPUSH, LPOP/RPOP, LRANGE, LLEN, LINDEX, LREM, LTRIM, LSET, WRONGTYPE |
+| `resp.rs` | 18 | RESP array/inline parse, encode, roundtrip, binary data, error types |
+| `tcp.rs` | 8 | Dispatch handlers, DEL list cleanup, WRONGTYPE, PING, inline parsing |
 
-| Module         | Tests | Coverage                                    |
-|----------------|-------|---------------------------------------------|
-| `kv.rs`        | 25    | Core GET/SET/DEL, INCR/DECR, MGET/MSET, APPEND, STRLEN, GETRANGE, SETRANGE, edge cases (inline size, capacity, concurrent) |
-| `wal.rs`       | 14    | Create/recover, CRC, alignment, binary keys, large values, empty keys/values, error display |
-| `expiration.rs`| 14    | Expire/TTL/persist, lazy/active purging, concurrent, edge cases |
-| `resp.rs`      | 16    | RESP array/inline parse, encode, roundtrip, binary data, error types |
-| `tcp.rs`       | 18    | All command handlers (GET/SET/DEL/INCR/EXPIRE/TTL/...), inline, ping, echo, info |
+### Integration Tests (all clients)
+
+```bash
+# Install all toolchains (Rust, Go, Python, Java, Node.js)
+./scripts/install_deps.sh
+
+# Run everything: server unit tests + all client integration tests
+./scripts/setup_and_test.sh
+```
+
+| Suite | Tests |
+|-------|------:|
+| Rust (server) | 122 |
+| Rust (client) | 25 |
+| Python | 27 |
+| Go | 37 |
+| Java | 52 |
+| Node.js | 51 |
 
 ## Benchmarks
 
-### In-memory (no network)
-
 ```bash
-# Single-threaded
-cargo run --release -- bench
-
-# Multi-threaded
-cargo run --release -- bench-threads
-
-# With Criterion — all benchmarks
+# In-memory (Criterion)
 cargo bench --bench kv_benchmark
-```
 
-Criterion benchmark groups:
-- `set_operations` — SET with varying key counts (100, 1K, 10K)
-- `get_operations` — GET with varying key counts
-- `incr_operations` — atomic INCR on 10K counters
-- `exists_operations` — EXISTS on 10K keys
-- `mget_operations` — MGET 100 keys
-- `string_operations` — APPEND, STRLEN, GETRANGE, SETRANGE on 10K keys
-- `wal_write` — WAL SET with fsync=never
-- `wal_recovery` — replay 10K entries from WAL file
-- `expiration` — EXPIRE and TTL on 10K keys
-- `threaded_set/get/incr` — concurrent operations (1/2/4/8 threads)
-
-### Network (vs Redis)
-
-```bash
-# Terminal 1: Start Redis
-docker run -d --name redis -p 6379:6379 redis
-
-# Terminal 2: Start FastKV
-cargo run --release --features io-uring -- server 6380 io_uring
-
-# Terminal 3: Run benchmark
+# Network (vs Redis)
 cargo run --release --example netbench -- all
-
-# Specific tests
-cargo run --release --example netbench -- seq       # Sequential only
-cargo run --release --example netbench -- pipeline  # Pipeline only
-cargo run --release --example netbench -- multi     # Multi-threaded only
-
-# Custom operations count
-cargo run --release --example netbench -- all 50000
 ```
 
 ## Project Structure
 
 ```
-fast_kv/
-├── Cargo.toml                 # Dependencies and features
+fastkv/
+├── Cargo.toml
+├── README.md
 ├── src/
-│   ├── lib.rs                 # Library entry point
-│   ├── main.rs                # CLI application
+│   ├── lib.rs
+│   ├── main.rs
 │   └── core/
-│       ├── mod.rs             # Core module
-│       ├── kv.rs              # Lock-free hash table + string operations
-│       ├── resp.rs            # RESP protocol parser/encoder
-│       ├── wal.rs             # Write-Ahead Log (Phase 2)
-│       ├── expiration.rs      # TTL / key expiration (Phase 4)
-│       ├── hash.rs             # Hash data type (Phase 6)
+│       ├── mod.rs
+│       ├── kv.rs               # Lock-free hash table + string operations
+│       ├── resp.rs             # RESP protocol parser/encoder
+│       ├── wal.rs              # Write-ahead log (SET/DEL/EXPIRE)
+│       ├── expiration.rs       # TTL / key expiration
+│       ├── hash.rs             # Hash data type
+│       ├── list.rs             # List data type
 │       └── server/
-│           ├── mod.rs         # Server module
-│           ├── tcp.rs         # Tokio TCP server (cross-platform)
-│           └── io_uring.rs    # io_uring server (Linux only)
+│           ├── mod.rs
+│           ├── tcp.rs          # Tokio TCP server (cross-platform)
+│           └── io_uring.rs     # io_uring server (Linux only)
+├── clients/
+│   ├── README.md                     # Client SDK overview
+│   ├── rust/
+│   │   ├── src/                      # lib.rs, resp.rs, pipeline.rs
+│   │   ├── tests/integration_test.rs  # Integration tests
+│   │   └── examples/example.rs       # Usage example
+│   ├── go/fastkv/
+│   │   ├── fastkv.go                 # Client implementation
+│   │   ├── integration_test.go       # Integration tests
+│   │   └── example_test.go           # Usage examples (go test)
+│   ├── python/
+│   │   ├── fastkv/                   # Package (client.py, resp.py, ...)
+│   │   └── tests/
+│   │       ├── test_integration.py   # Integration tests
+│   │       └── example.py            # Usage example
+│   ├── java/
+│   │   └── src/*.java                 # Client + tests + examples
+│   └── node/fastkv/
+│       ├── client.js, resp.js, ...   # Client implementation
+│       └── tests/
+│           ├── test_integration.js   # Integration tests
+│           └── example.js            # Usage example
+├── scripts/
+│   ├── install_deps.sh               # Install all toolchains
+│   └── setup_and_test.sh             # Run all tests
+├── tests/
+│   └── test_fastkv.py                # Server-level tests (uses redis-py)
 ├── benches/
-│   ├── kv_benchmark.rs        # In-memory criterion benchmarks
-│   └── network_benchmark.rs   # Network criterion benchmarks
+│   ├── kv_benchmark.rs
+│   └── network_benchmark.rs
 └── examples/
-    └── netbench.rs            # CLI network benchmark
+    └── netbench.rs                   # Network benchmark (cargo run --example)
 ```
-
-## Supported Commands
-
-| Command     | Status | Description                                |
-|-------------|--------|--------------------------------------------|
-| SET         | Done   | Set key-value                              |
-| GET         | Done   | Get value by key                           |
-| DEL         | Done   | Delete key                                 |
-| PING        | Done   | Health check                               |
-| ECHO        | Done   | Echo message                               |
-| DBSIZE      | Done   | Number of keys                             |
-| INFO        | Done   | Server info                                |
-| COMMAND     | Done   | Command discovery                          |
-| QUIT        | Done   | Close connection                           |
-| EXISTS      | Done   | Check key exists                           |
-| INCR        | Done   | Increment value by 1                       |
-| INCRBY      | Done   | Increment value by N                       |
-| DECR        | Done   | Decrement value by 1                       |
-| DECRBY      | Done   | Decrement value by N                       |
-| APPEND      | Done   | Append to string value                     |
-| STRLEN      | Done   | Get string length                          |
-| GETRANGE    | Done   | Get substring                              |
-| SETRANGE    | Done   | Overwrite substring                        |
-| MGET        | Done   | Get multiple keys                          |
-| MSET        | Done   | Set multiple keys                          |
-| EXPIRE      | Done   | Set TTL (seconds)                          |
-| TTL         | Done   | Get remaining TTL (seconds)                |
-| PTTL        | Done   | Get remaining TTL (milliseconds)           |
-| PERSIST     | Done   | Remove TTL                                 |
-| KEYS        | TODO   | List keys (pattern)                        |
-| SCAN        | TODO   | Iterate keys                               |
-| HGET/HSET   | Done   | Hash operations                            |
-| HDEL        | Done   | Delete hash field                          |
-| HGETALL     | Done   | Get all hash fields                        |
-| HEXISTS     | Done   | Check field exists                         |
-| HLEN        | Done   | Number of hash fields                      |
-| HKEYS       | Done   | Get all field names                        |
-| HVALS       | Done   | Get all field values                       |
-| HMGET/HMSET | Done   | Multi-field hash operations                |
-| LPUSH/RPUSH | TODO   | List operations                            |
-| SADD/SREM   | TODO   | Set operations                             |
-| ZADD/ZRANGE | TODO   | Sorted Set operations                      |
 
 ## Architecture
 
 ### Lock-free Hash Table
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  LockFreeEntry (64-byte cache-line aligned)                 │
-├─────────────────────────────────────────────────────────────┤
-│  hash: AtomicU64      - Hash value (0 = empty)              │
-│  key_len: AtomicU32   - Key length                          │
-│  value_len: AtomicU32 - Value length                        │
-│  version: AtomicU64   - For optimistic reading              │
-│  data: [AtomicU8; 128] - Inline key + value storage         │
-└─────────────────────────────────────────────────────────────┘
+LockFreeEntry (64-byte cache-line aligned)
+┌─────────────────────────────────────────────┐
+│  hash: AtomicU64        — 0 = empty         │
+│  key_len: AtomicU32                         │
+│  value_len: AtomicU32                       │
+│  version: AtomicU64     — optimistic reads  │
+│  data: [AtomicU8; 128]  — inline key+value  │
+└─────────────────────────────────────────────┘
 
 Operations:
-- SET: CAS (Compare-And-Swap) for lock-free insertion
-- GET: Optimistic read with version check
-- DEL: Atomic hash reset
-- INCR: CAS loop on version for atomic read-modify-write
-```
-
-### Memory Layout
-
-```
-Default capacity: 1,000,000 entries
-Entry size: ~192 bytes
-Total memory: ~192 MB
-
-┌─────────┬─────────┬─────────┬─────┬─────────┐
-│ Entry 0 │ Entry 1 │ Entry 2 │ ... │ Entry N │
-└─────────┴─────────┴─────────┴─────┴─────────┘
+  SET  — CAS (Compare-And-Swap) for lock-free insertion
+  GET  — Optimistic read with version check
+  DEL  — Atomic hash reset
+  INCR — CAS loop on version for atomic read-modify-write
 ```
 
 ### WAL (Write-Ahead Log)
 
 ```
-┌──────────┬──────────┬──────────┬────────┬────┬────────┬────┬────────┐
-│  magic   │  version │  crc32   │  op    │kl  │  key   │vl  │  value │
-│ 4 bytes  │ 2 bytes  │ 4 bytes  │ 1 byte │2B  │ kl B   │2B  │  vl B  │
-└──────────┴──────────┴──────────┴────────┴────┴────────┴────┴────────┘
+┌─────────┬─────────┬─────────┬────────┬────┬──────┬────┬───────┐
+│ magic   │ version │ crc32c  │ op     │ kl │ key  │ vl │ value │
+│ 4 bytes │ 2 bytes │ 4 bytes │ 1 byte │ 2B │ kl B │ 2B │ vl B  │
+└─────────┴─────────┴─────────┴────────┴────┴──────┴────┴───────┘
 
-Fsync policies:
-  always    → fsync after every write (safest)
-  everysec  → background thread fsyncs every ~1s (balanced)
-  never     → rely on OS page cache (fastest)
+Fsync policies:  always (safest) | everysec (balanced) | never (fastest)
 
-Recovery: read all entries, verify CRC, replay into KV store.
-Corrupted trailing entries are silently discarded.
+Recovery:
+  Phase 1 — replay SET and DEL entries into KV store
+  Phase 2 — replay EXPIRE entries into expiration manager
+  Corrupted trailing entries are silently discarded
 ```
 
 ### Expiration
 
-```
-Two strategies:
-1. Lazy expiration — check TTL on every GET/EXISTS access
-2. Active expiration — background thread purges expired keys every 100ms
+Two strategies work together:
 
-Data structures:
-  deadlines: Mutex<HashMap<Vec<u8>, Instant>>  (key → deadline)
-```
+1. **Lazy** — check TTL on every `GET` / `EXISTS` access
+2. **Active** — background thread purges expired keys every 100 ms
 
-## TODO / Roadmap
+EXPIRE entries are written to WAL and restored on recovery after keys are loaded.
 
-### Phase 1: Core (Done)
+## Roadmap
 
-- [x] Lock-free hash table
-- [x] RESP protocol parser
-- [x] TCP server (Tokio)
-- [x] Pipeline support
-- [x] io_uring support (Linux)
-- [x] Benchmarks
+- [x] Phase 1 — Core: lock-free hash table, RESP protocol, TCP server (Tokio + io_uring), pipeline
+- [x] Phase 2 — Persistence: WAL with CRC-32C, alignment, fsync policies, recovery
+- [x] Phase 3 — String ops: INCR/DECR, APPEND/STRLEN, GETRANGE/SETRANGE, MGET/MSET
+- [x] Phase 4 — Expiration: EXPIRE/TTL/PTTL/PERSIST, lazy + active purging, WAL persistence
+- [x] Phase 5 — Hash: HSET/HGET/HDEL/HGETALL/HEXISTS/HLEN/HKEYS/HVALS/HMGET/HMSET
+- [x] Phase 6 — List: LPUSH/RPUSH, LPOP/RPOP, LRANGE/LLEN/LINDEX, LREM/LTRIM/LSET, WRONGTYPE
+- [x] Phase 7 — Client SDKs: Go, Python, Java, Node.js (zero-dependency, pipeline support)
+- [ ] Phase 8 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
+- [ ] Phase 9 — Sorted Set: ZADD, ZREM, ZRANGE, ZSCORE, ZRANK, ZCARD
+- [ ] Phase 10 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), Lua scripting
+- [ ] Phase 11 — Cluster: hash-slot sharding, node discovery, failover
 
-### Phase 2: Persistence (Done)
+## Requirements
 
-- [x] WAL (Write-Ahead Log)
-  - [x] Append-only log file with binary format
-  - [x] CRC-32C checksum per entry
-  - [x] fsync options (always, every-second, never)
-  - [x] 16-byte aligned entries (direct-I/O friendly)
-- [x] Recovery on startup (replay WAL)
-- [x] Environment variables for configuration (`FASTKV_DIR`, `FASTKV_FSYNC`)
-
-### Phase 3: Data Types — String Operations (Done)
-
-- [x] INCR, DECR, INCRBY, DECRBY
-- [x] APPEND, STRLEN
-- [x] GETRANGE, SETRANGE
-- [x] MGET, MSET
-- [x] EXISTS
-
-### Phase 4: Expiration (Done)
-
-- [x] TTL support (EXPIRE, TTL, PTTL, PERSIST)
-- [x] Lazy expiration (check on access)
-- [x] Active expiration (background thread, 200 keys/cycle, 100ms interval)
-
-### Phase 5: Advanced Features (Priority: Low)
-
-- [ ] Pub/Sub (SUBSCRIBE, PUBLISH, PSUBSCRIBE)
-- [ ] Transactions (MULTI, EXEC, DISCARD, WATCH)
-- [ ] Lua scripting
-- [ ] Replication (master-slave, PSYNC)
-
-### Phase 6: Composite Data Types (In Progress)
-
-- [x] Hash (HGET, HSET, HDEL, HGETALL, HEXISTS, HLEN, HKEYS, HVALS, HMGET, HMSET)
-- [ ] List (LPUSH, RPUSH, LPOP, RPOP, LRANGE)
-- [ ] Set (SADD, SREM, SMEMBERS, SISMEMBER)
-- [ ] Sorted Set (ZADD, ZREM, ZRANGE, ZSCORE)
-
-### Phase 7: Vector Search (Future)
-
-- [ ] HNSW (Hierarchical Navigable Small World)
-- [ ] ANN search, cosine similarity, euclidean distance
-- [ ] VADD, VSEARCH, VDEL commands
-
-### Phase 8: Clustering (Future)
-
-- [ ] Hash-slot sharding
-- [ ] Node discovery, data migration, failover
-
-### Phase 9: Performance Optimizations (In Progress)
-
-- [x] **Zero-alloc key comparison** — stack buffers replace heap Vec
-- [x] **Relaxed atomic ordering on data reads** — Ordering::Relaxed on AtomicU8
-- [x] **Bounded probing** — MAX_PROBE_STEPS = 256
-- [x] **Zero-alloc RESP encoding** — write_*() direct to buffer
-- [x] **Hardware-accelerated CRC-32C** — SSE4.2/ARM CRC instructions
-- [x] **Wyhash-inspired hash function** — 8-byte chunked processing (~2-3x faster than FNV-1a)
-- [x] **Batched expiration** — single-lock scan + batch delete (5x less mutex contention)
-- [x] **Single-buffer WAL writes** — eliminated extra payload Vec allocation
-- [x] **Inline atoi RESP parsing** — no from_utf8+parse overhead
-- [x] **Zero-alloc INFO command** — direct buffer writing, no format!()
-- [ ] SIMD hash functions
-- [ ] Zero-copy RESP parsing
-- [ ] Memory pooling
-- [ ] Batched network I/O
-- [ ] CPU affinity, NUMA awareness
+- Rust 1.85+ (edition 2024)
+- Linux (for io_uring), macOS, or Windows
 
 ## Troubleshooting
 
-### Connection Refused
-
-```bash
-netstat -tlnp | grep 6379
-cargo run --release -- server 6380   # try a different port
-```
-
-### Low Performance
-
-```bash
-# 1. Use release build
-cargo build --release
-
-# 2. Check CPU governor (should be "performance", not "powersave")
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# 3. Use io_uring on Linux
-cargo run --release --features io-uring -- server 6379 io_uring
-```
-
-### Compilation Error with io_uring
-
-```bash
-# io_uring requires Linux kernel 5.1+
-uname -r
-grep -i io_uring /boot/config-$(uname -r)
-```
-
-### WAL / Data Issues
-
-```bash
-# WAL file location (default)
-ls ./fastkv_data/fastkv.wal
-
-# Delete WAL to start fresh
-rm ./fastkv_data/fastkv.wal
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create feature branch: `git checkout -b feature/my-feature`
-3. Commit changes: `git commit -am 'Add feature'`
-4. Push branch: `git push origin feature/my-feature`
-5. Submit Pull Request
+| Problem | Solution |
+|---------|----------|
+| Connection refused | `ss -tlnp \| grep 6379` — check if server is running |
+| Low performance | Use `cargo build --release`; check CPU governor; enable io_uring on Linux |
+| io_uring build error | Requires Linux kernel 5.1+: `uname -r` |
+| Stale WAL data | Delete WAL to start fresh: `rm ./fastkv_data/fastkv.wal` |
 
 ## License
 
 MIT
-
-## References
-
-- [Redis Protocol Specification](https://redis.io/docs/latest/develop/reference/protocol-spec/)
-- [io_uring](https://kernel.dk/io_uring.pdf)
-- [Lock-free Programming](https://preshing.com/20120612/an-introduction-to-lock-free-programming/)
-- [HNSW Paper](https://arxiv.org/abs/1603.09320)

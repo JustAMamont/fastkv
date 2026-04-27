@@ -4,8 +4,9 @@
 //! and quick tests.
 
 use fast_kv::{
-    ExpirationManager, FsyncPolicy, KvStore, VERSION, Wal,
+    ExpirationManager, FsyncPolicy, KvStore, ListManager, VERSION, Wal,
     core::expiration::spawn_active_expiration,
+    WalOp,
 };
 use std::env;
 use std::sync::Arc;
@@ -111,7 +112,25 @@ fn run_server(args: &[String]) {
     // --- KV store ---
     let store = Arc::new(KvStore::new());
 
+    // --- List manager ---
+    let lists_mgr = Arc::new(ListManager::new(Arc::clone(&store)));
+    let lists = Some(Arc::clone(&lists_mgr));
+
+    // --- Expiration ---
+    let expiry = Some(Arc::new(ExpirationManager::with_on_expire(
+        Arc::clone(&store),
+        {
+            let mgr = Arc::clone(&lists_mgr);
+            Arc::new(move |key: &[u8]| mgr.remove_key(key))
+        },
+    )));
+    let _expiry_handle = spawn_active_expiration(expiry.as_ref().unwrap().clone());
+    println!("Expiration: enabled (active purging)");
+    println!("Lists: enabled");
+
+    // --- WAL recovery ---
     // Recover and replay WAL entries exactly once.
+    // Phase 1: replay SET and DEL.
     if let Some(ref wal_arc) = wal {
         let entries = match Wal::recover(wal_arc.path()) {
             Ok(e) => e,
@@ -122,19 +141,30 @@ fn run_server(args: &[String]) {
         };
         for entry in &entries {
             match entry.op {
-                fast_kv::WalOp::Set => { store.set(&entry.key, &entry.value); }
-                fast_kv::WalOp::Del => { store.del(&entry.key); }
+                WalOp::Set => { store.set(&entry.key, &entry.value); }
+                WalOp::Del => { store.del(&entry.key); }
+                WalOp::Expire => { /* handled in Phase 2 */ }
             }
         }
         if !entries.is_empty() {
-            println!("Replayed {} WAL entries. Current DBSIZE: {}", entries.len(), store.len());
+            let set_del_count = entries.iter().filter(|e| e.op != WalOp::Expire).count();
+            println!("Replayed {} WAL entries (SET/DEL). Current DBSIZE: {}", set_del_count, store.len());
+        }
+
+        // Phase 2: replay EXPIRE entries (after all keys exist).
+        let expire_entries: Vec<_> = entries.iter().filter(|e| e.op == WalOp::Expire).collect();
+        if let Some(ref exp) = expiry {
+            for entry in &expire_entries {
+                let deadline_ms = u64::from_le_bytes(
+                    entry.value.clone().try_into().unwrap_or([0u8; 8]),
+                );
+                exp.expire_at_deadline_ms(&entry.key, deadline_ms);
+            }
+            if !expire_entries.is_empty() {
+                println!("Restored {} TTL entries from WAL.", expire_entries.len());
+            }
         }
     }
-
-    // --- Expiration ---
-    let expiry = Some(Arc::new(ExpirationManager::new(Arc::clone(&store))));
-    let _expiry_handle = spawn_active_expiration(expiry.as_ref().unwrap().clone());
-    println!("Expiration: enabled (active purging)");
 
     println!();
 
@@ -143,7 +173,7 @@ fn run_server(args: &[String]) {
         "io_uring" => {
             use fast_kv::core::server::IoUringServer;
             println!("Starting FastKV io_uring server on port {}...", port);
-            let server = IoUringServer::with_components(port, store, wal, expiry);
+            let server = IoUringServer::with_components(port, store, wal, expiry, lists);
             server.run();
         }
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -154,7 +184,7 @@ fn run_server(args: &[String]) {
         _ => {
             use fast_kv::core::server::TokioServer;
             println!("Starting FastKV Tokio server on port {}...", port);
-            let server = TokioServer::with_components(port, store, wal, expiry);
+            let server = TokioServer::with_components(port, store, wal, expiry, lists);
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(server.run());
         }

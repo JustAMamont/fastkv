@@ -45,10 +45,11 @@
 
 pub mod core;
 
-pub use core::kv::{KvStore, KvStoreSingleThreaded, KvStoreSimple, IncrError};
+pub use core::kv::KvStore;
 pub use core::resp::{Command, RespEncoder, RespParser};
 pub use core::wal::{Wal, WalEntry, WalOp, FsyncPolicy};
 pub use core::expiration::ExpirationManager;
 pub use core::hash::{HashError, HashDelResult, WRONGTYPE_ERR};
+pub use core::list::ListManager;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

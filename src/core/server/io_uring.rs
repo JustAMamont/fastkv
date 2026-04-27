@@ -9,7 +9,8 @@
 
 use crate::core::expiration::ExpirationManager;
 use crate::core::kv::KvStore;
-use crate::core::server::tcp::{parse_command_bounds, process_command_into};
+use crate::core::list::ListManager;
+use crate::core::server::tcp::{parse_command_bounds, process_command_into, ServerContext};
 use crate::core::wal::Wal;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ pub struct IoUringServer {
     store: Arc<KvStore>,
     wal: Option<Arc<Wal>>,
     expiry: Option<Arc<ExpirationManager>>,
+    lists: Option<Arc<ListManager>>,
     pub port: u16,
 }
 
@@ -35,6 +37,7 @@ impl IoUringServer {
             store: Arc::new(KvStore::new()),
             wal: None,
             expiry: None,
+            lists: None,
             port: DEFAULT_PORT,
         }
     }
@@ -45,6 +48,7 @@ impl IoUringServer {
             store: Arc::new(KvStore::new()),
             wal: None,
             expiry: None,
+            lists: None,
             port,
         }
     }
@@ -55,8 +59,9 @@ impl IoUringServer {
         store: Arc<KvStore>,
         wal: Option<Arc<Wal>>,
         expiry: Option<Arc<ExpirationManager>>,
+        lists: Option<Arc<ListManager>>,
     ) -> Self {
-        Self { store, wal, expiry, port }
+        Self { store, wal, expiry, lists, port }
     }
 
     /// Block the calling thread running the io_uring event loop.
@@ -84,6 +89,7 @@ impl IoUringServer {
 
         let wal = self.wal.clone();
         let expiry = self.expiry.clone();
+        let lists = self.lists.clone();
 
         loop {
             let (stream, client_addr) = match listener.accept().await {
@@ -98,8 +104,10 @@ impl IoUringServer {
             let wal = wal.clone();
             let expiry = expiry.clone();
 
+                let lists = lists.clone();
+
             tokio_uring::spawn(async move {
-                handle_client(stream, store, wal, expiry, client_addr).await;
+                handle_client(stream, store, wal, expiry, lists, client_addr).await;
             });
         }
     }
@@ -111,11 +119,19 @@ async fn handle_client(
     store: Arc<KvStore>,
     wal: Option<Arc<Wal>>,
     expiry: Option<Arc<ExpirationManager>>,
+    lists: Option<Arc<ListManager>>,
     addr: SocketAddr,
 ) {
     let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
     let mut response: Vec<u8> = Vec::with_capacity(4096);
+
+    let ctx = ServerContext {
+        store: &store,
+        wal: wal.as_deref(),
+        expiry: expiry.as_deref(),
+        lists: lists.as_deref(),
+    };
 
     loop {
         let (result, buf) = stream.read(buffer).await;
@@ -141,9 +157,7 @@ async fn handle_client(
                     let cmd_data = &leftover[consumed..consumed + len];
                     should_close = process_command_into(
                         cmd_data,
-                        &store,
-                        wal.as_deref(),
-                        expiry.as_deref(),
+                        &ctx,
                         &mut response,
                         is_inline,
                     );

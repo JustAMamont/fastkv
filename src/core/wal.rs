@@ -77,6 +77,8 @@ pub enum WalOp {
     Set = 0x01,
     /// Delete a key.
     Del = 0x02,
+    /// Set a TTL deadline on a key.
+    Expire = 0x03,
 }
 
 impl TryFrom<u8> for WalOp {
@@ -86,6 +88,7 @@ impl TryFrom<u8> for WalOp {
         match value {
             0x01 => Ok(WalOp::Set),
             0x02 => Ok(WalOp::Del),
+            0x03 => Ok(WalOp::Expire),
             other => Err(WalError::UnknownOp(other)),
         }
     }
@@ -294,6 +297,19 @@ impl Wal {
     /// Returns [`WalError::Io`] on write failure.
     pub fn del(&self, key: &[u8]) -> Result<(), WalError> {
         self.append(WalOp::Del, key, &[])
+    }
+
+    /// Append an EXPIRE entry to the WAL.
+    ///
+    /// *deadline_ms* is an absolute timestamp (milliseconds since UNIX epoch)
+    /// representing when the key should expire. On recovery, if the deadline
+    /// has already passed the key is treated as immediately expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] on write failure.
+    pub fn expire(&self, key: &[u8], deadline_ms: u64) -> Result<(), WalError> {
+        self.append(WalOp::Expire, key, &deadline_ms.to_le_bytes())
     }
 
     /// Append an arbitrary entry to the WAL.
@@ -617,6 +633,7 @@ mod tests {
     fn test_wal_op_try_from() {
         assert_eq!(WalOp::try_from(0x01).unwrap(), WalOp::Set);
         assert_eq!(WalOp::try_from(0x02).unwrap(), WalOp::Del);
+        assert_eq!(WalOp::try_from(0x03).unwrap(), WalOp::Expire);
         assert!(matches!(WalOp::try_from(0xFF), Err(WalError::UnknownOp(0xFF))));
         assert!(matches!(WalOp::try_from(0x00), Err(WalError::UnknownOp(0x00))));
     }
@@ -631,6 +648,23 @@ mod tests {
 
         let err = WalError::ChecksumMismatch { expected: 1, actual: 2 };
         assert!(err.to_string().contains("CRC mismatch"));
+    }
+
+    #[test]
+    fn test_wal_expire_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expire.wal");
+        let wal = Wal::open(&path, FsyncPolicy::Never).unwrap();
+        wal.set(b"session", b"abc123").unwrap();
+        wal.expire(b"session", 1700000000000).unwrap();
+        drop(wal);
+
+        let entries = Wal::recover(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].op, WalOp::Set);
+        assert_eq!(entries[1].op, WalOp::Expire);
+        assert_eq!(entries[1].key, b"session");
+        assert_eq!(entries[1].value, 1700000000000u64.to_le_bytes());
     }
 
     #[test]

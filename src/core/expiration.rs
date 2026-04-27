@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::kv::KvStore;
 
@@ -70,6 +70,8 @@ pub struct ExpirationManager {
     shutdown: AtomicBool,
     /// Reference to the KV store so we can delete expired keys.
     store: Arc<KvStore>,
+    /// Optional callback invoked when a key is expired and deleted.
+    on_expire: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
 }
 
 // SAFETY: all fields are `Send + Sync`.
@@ -86,6 +88,25 @@ impl ExpirationManager {
             deadlines: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             store,
+            on_expire: None,
+        }
+    }
+
+    /// Create an expiration manager with a cleanup callback.
+    ///
+    /// The callback is invoked whenever a key is purged (either lazily
+    /// via [`purge_if_expired`], actively via [`active_expire_cycle`], or
+    /// via [`ttl`]). This allows external components (e.g. `ListManager`)
+    /// to clean up auxiliary data when a key expires.
+    pub fn with_on_expire(
+        store: Arc<KvStore>,
+        on_expire: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    ) -> Self {
+        Self {
+            deadlines: Mutex::new(HashMap::new()),
+            shutdown: AtomicBool::new(false),
+            store,
+            on_expire: Some(on_expire),
         }
     }
 
@@ -114,6 +135,12 @@ impl ExpirationManager {
         map.remove(key).is_some()
     }
 
+    /// Check whether *key* has an associated deadline (whether expired or not).
+    pub fn has_deadline(&self, key: &[u8]) -> bool {
+        let map = self.deadlines.lock().unwrap_or_else(|e| e.into_inner());
+        map.contains_key(key)
+    }
+
     /// Return the remaining time-to-live for *key*.
     ///
     /// * `Some(remaining)` — the key has a TTL and has not yet expired.
@@ -128,6 +155,7 @@ impl ExpirationManager {
                 map.remove(key);
                 drop(map);
                 self.store.del(key);
+                self.fire_on_expire(key);
                 return None;
             }
             Some(deadline - Instant::now())
@@ -156,6 +184,7 @@ impl ExpirationManager {
                 map.remove(key);
                 drop(map);
                 self.store.del(key);
+                self.fire_on_expire(key);
                 return true;
             }
         }
@@ -183,6 +212,71 @@ impl ExpirationManager {
     /// Signal the active-expiration thread (if any) to stop.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    // -------------------------------------------------------------------
+    // WAL persistence helpers
+    // -------------------------------------------------------------------
+
+    /// Set a TTL and return the absolute deadline as milliseconds since
+    /// UNIX epoch. The returned value can be persisted to WAL and later
+    /// passed to [`expire_at_deadline_ms`] during recovery.
+    ///
+    /// Returns `None` if the key does not exist.
+    pub fn expire_with_deadline(&self, key: &[u8], ttl: Duration) -> Option<u64> {
+        if self.store.get(key).is_none() {
+            return None;
+        }
+        let deadline = Instant::now() + ttl;
+        let mut map = self.deadlines.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(key.to_vec(), deadline);
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Some(now_ms.saturating_add(ttl.as_millis() as u64))
+    }
+
+    /// Restore a TTL from a WAL entry.
+    ///
+    /// *deadline_ms* is an absolute timestamp (milliseconds since UNIX epoch)
+    /// that was previously returned by [`expire_with_deadline`].
+    ///
+    /// If the deadline has already passed the key is deleted immediately.
+    /// Returns `true` if the key exists and a TTL was set.
+    pub fn expire_at_deadline_ms(&self, key: &[u8], deadline_ms: u64) -> bool {
+        if self.store.get(key).is_none() {
+            return false;
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        if deadline_ms <= now_ms {
+            // Already expired — purge immediately.
+            self.store.del(key);
+            self.fire_on_expire(key);
+            return true;
+        }
+
+        let remaining = Duration::from_millis(deadline_ms - now_ms);
+        let deadline = Instant::now() + remaining;
+        let mut map = self.deadlines.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(key.to_vec(), deadline);
+        true
+    }
+
+    // -------------------------------------------------------------------
+    // Internal: on-expire callback
+    // -------------------------------------------------------------------
+
+    #[inline]
+    fn fire_on_expire(&self, key: &[u8]) {
+        if let Some(ref cb) = self.on_expire {
+            cb(key);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -226,6 +320,7 @@ impl ExpirationManager {
         // Phase 3: delete from KV store (no lock held).
         for key in buf.drain(..) {
             self.store.del(&key);
+            self.fire_on_expire(&key);
         }
     }
 }

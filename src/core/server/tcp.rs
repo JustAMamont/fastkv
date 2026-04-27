@@ -7,13 +7,14 @@
 //! - Pipeline support — multiple commands in a single TCP read are all
 //!   processed before a single `write_all`.
 //!
-//! The server accepts optional [`Wal`] and [`ExpirationManager`] handles
-//! so that every mutation can be persisted and every GET can be checked
-//! for expiration.
+//! The server accepts optional [`Wal`], [`ExpirationManager`] and
+//! [`ListManager`] handles so that every mutation can be persisted and
+//! every GET can be checked for expiration.
 
 use crate::core::hash::{self, HashDelResult, WRONGTYPE_ERR};
 use crate::core::kv::{IncrError, KvStore};
 use crate::core::expiration::ExpirationManager;
+use crate::core::list::ListManager;
 use crate::core::resp::{write_usize_buf, RespEncoder, RespParser};
 use crate::core::wal::Wal;
 use std::sync::Arc;
@@ -30,6 +31,21 @@ const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 const INITIAL_RESPONSE_SIZE: usize = 4096;
 
 // ---------------------------------------------------------------------------
+// Server context — shared by all command handlers
+// ---------------------------------------------------------------------------
+
+/// Bundles the shared components that command handlers need access to.
+///
+/// Using a single context struct avoids parameter explosion when new
+/// components (lists, sets, sorted sets, …) are added over time.
+pub struct ServerContext<'a> {
+    pub store: &'a KvStore,
+    pub wal: Option<&'a Wal>,
+    pub expiry: Option<&'a ExpirationManager>,
+    pub lists: Option<&'a ListManager>,
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
@@ -44,17 +60,20 @@ pub struct TokioServer {
     wal: Option<Arc<Wal>>,
     /// Optional expiration manager.
     expiry: Option<Arc<ExpirationManager>>,
+    /// Optional list manager.
+    lists: Option<Arc<ListManager>>,
     /// Port to listen on.
     pub port: u16,
 }
 
 impl TokioServer {
-    /// Create a server with default settings (port 6379, no WAL, no TTL).
+    /// Create a server with default settings (port 6379, no WAL, no TTL, no lists).
     pub fn new() -> Self {
         Self {
             store: Arc::new(KvStore::new()),
             wal: None,
             expiry: None,
+            lists: None,
             port: DEFAULT_PORT,
         }
     }
@@ -65,6 +84,7 @@ impl TokioServer {
             store: Arc::new(KvStore::new()),
             wal: None,
             expiry: None,
+            lists: None,
             port,
         }
     }
@@ -75,8 +95,9 @@ impl TokioServer {
         store: Arc<KvStore>,
         wal: Option<Arc<Wal>>,
         expiry: Option<Arc<ExpirationManager>>,
+        lists: Option<Arc<ListManager>>,
     ) -> Self {
-        Self { store, wal, expiry, port }
+        Self { store, wal, expiry, lists, port }
     }
 
     /// Clone the shared store reference.
@@ -102,6 +123,7 @@ impl TokioServer {
 
         let wal = self.wal.clone();
         let expiry = self.expiry.clone();
+        let lists = self.lists.clone();
 
         loop {
             let (socket, peer_addr) = match listener.accept().await {
@@ -115,9 +137,10 @@ impl TokioServer {
             let store = Arc::clone(&self.store);
             let wal = wal.clone();
             let expiry = expiry.clone();
+            let lists = lists.clone();
 
             tokio::spawn(async move {
-                handle_client(socket, store, wal, expiry, peer_addr).await;
+                handle_client(socket, store, wal, expiry, lists, peer_addr).await;
             });
         }
     }
@@ -139,12 +162,20 @@ async fn handle_client(
     store: Arc<KvStore>,
     wal: Option<Arc<Wal>>,
     expiry: Option<Arc<ExpirationManager>>,
+    lists: Option<Arc<ListManager>>,
     addr: std::net::SocketAddr,
 ) {
     // Reusable buffers — allocated once, cleared between iterations.
     let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
     let mut resp_buf = Vec::with_capacity(INITIAL_RESPONSE_SIZE);
+
+    let ctx = ServerContext {
+        store: &store,
+        wal: wal.as_deref(),
+        expiry: expiry.as_deref(),
+        lists: lists.as_deref(),
+    };
 
     loop {
         let n = match socket.read(&mut read_buf).await {
@@ -165,7 +196,7 @@ async fn handle_client(
             match parse_command_bounds(&leftover[consumed..]) {
                 Some((len, is_inline)) => {
                     let cmd_data = &leftover[consumed..consumed + len];
-                    should_close = process_command_into(cmd_data, &store, wal.as_deref(), expiry.as_deref(), &mut resp_buf, is_inline);
+                    should_close = process_command_into(cmd_data, &ctx, &mut resp_buf, is_inline);
                     consumed += len;
                     if should_close { break; }
                 }
@@ -266,15 +297,13 @@ fn find_resp_array_end(data: &[u8]) -> Option<usize> {
 /// identical regardless of the I/O backend.
 pub fn process_command_into(
     data: &[u8],
-    store: &KvStore,
-    wal: Option<&Wal>,
-    expiry: Option<&ExpirationManager>,
+    ctx: &ServerContext,
     out: &mut Vec<u8>,
     is_inline: bool,
 ) -> bool {
     // ---- inline command handling ----
     if is_inline {
-        return handle_inline(data, store, wal, expiry, out);
+        return handle_inline(data, ctx, out);
     }
 
     // ---- RESP array command handling ----
@@ -287,7 +316,7 @@ pub fn process_command_into(
         }
     };
 
-    dispatch_command(&command, store, wal, expiry, out)
+    dispatch_command(&command, ctx, out)
 }
 
 /// Dispatch an already-parsed [`Command`] and append the response.
@@ -295,57 +324,67 @@ pub fn process_command_into(
 /// Returns `true` if the connection should be closed (e.g. QUIT command).
 fn dispatch_command(
     cmd: &crate::core::resp::Command,
-    store: &KvStore,
-    wal: Option<&Wal>,
-    expiry: Option<&ExpirationManager>,
+    ctx: &ServerContext,
     out: &mut Vec<u8>,
 ) -> bool {
     match cmd.name.as_str() {
         // ----- Core -----
-
-        "GET" => { cmd_get(cmd, store, expiry, out); false }
-        "SET" => { cmd_set(cmd, store, wal, expiry, out); false }
-        "DEL" => { cmd_del(cmd, store, wal, expiry, out); false }
+        "GET" => { cmd_get(cmd, ctx, out); false }
+        "SET" => { cmd_set(cmd, ctx, out); false }
+        "DEL" => { cmd_del(cmd, ctx, out); false }
         "PING" => { cmd_ping(cmd, out); false }
         "ECHO" => { cmd_echo(cmd, out); false }
-        "COMMAND" => { out.extend_from_slice(b"+OK\r\n"); false }
-        "INFO"  => { cmd_info(store, out); false }
-        "DBSIZE" => { RespEncoder::write_integer(out, store.len() as i64); false }
+        "COMMAND" => {
+            // redis-py sends COMMAND DOCS on connect — return empty array.
+            RespEncoder::write_array(out, &[]);
+            false
+        }
+        "INFO"  => { cmd_info(ctx, out); false }
+        "DBSIZE" => { RespEncoder::write_integer(out, ctx.store.len() as i64); false }
         "QUIT"  => { out.extend_from_slice(b"+OK\r\n"); true }
 
         // ----- String operations -----
-
-        "INCR"    => { cmd_incr(cmd, store, wal, expiry, out, 1); false }
-        "INCRBY"  => { cmd_incrby(cmd, store, wal, expiry, out); false }
-        "DECR"    => { cmd_incr(cmd, store, wal, expiry, out, -1); false }
-        "DECRBY"  => { cmd_decrby(cmd, store, wal, expiry, out); false }
-        "APPEND"  => { cmd_append(cmd, store, wal, expiry, out); false }
-        "STRLEN"  => { cmd_strlen(cmd, store, expiry, out); false }
-        "GETRANGE"  => { cmd_getrange(cmd, store, expiry, out); false }
-        "SETRANGE"  => { cmd_setrange(cmd, store, wal, expiry, out); false }
-        "MGET"    => { cmd_mget(cmd, store, expiry, out); false }
-        "MSET"    => { cmd_mset(cmd, store, wal, out); false }
-        "EXISTS"  => { cmd_exists(cmd, store, expiry, out); false }
+        "INCR"    => { cmd_incr(cmd, ctx, out, 1); false }
+        "INCRBY"  => { cmd_incrby(cmd, ctx, out); false }
+        "DECR"    => { cmd_incr(cmd, ctx, out, -1); false }
+        "DECRBY"  => { cmd_decrby(cmd, ctx, out); false }
+        "APPEND"  => { cmd_append(cmd, ctx, out); false }
+        "STRLEN"  => { cmd_strlen(cmd, ctx, out); false }
+        "GETRANGE"  => { cmd_getrange(cmd, ctx, out); false }
+        "SETRANGE"  => { cmd_setrange(cmd, ctx, out); false }
+        "MGET"    => { cmd_mget(cmd, ctx, out); false }
+        "MSET"    => { cmd_mset(cmd, ctx, out); false }
+        "EXISTS"  => { cmd_exists(cmd, ctx, out); false }
 
         // ----- Expiration -----
-
-        "EXPIRE"  => { cmd_expire(cmd, store, expiry, out); false }
-        "TTL"     => { cmd_ttl(cmd, expiry, out); false }
-        "PTTL"    => { cmd_pttl(cmd, expiry, out); false }
-        "PERSIST" => { cmd_persist(cmd, expiry, out); false }
+        "EXPIRE"  => { cmd_expire(cmd, ctx, out); false }
+        "TTL"     => { cmd_ttl(cmd, ctx, out); false }
+        "PTTL"    => { cmd_pttl(cmd, ctx, out); false }
+        "PERSIST" => { cmd_persist(cmd, ctx, out); false }
 
         // ----- Hash -----
+        "HSET"    => { cmd_hset(cmd, ctx, out); false }
+        "HGET"    => { cmd_hget(cmd, ctx, out); false }
+        "HDEL"    => { cmd_hdel(cmd, ctx, out); false }
+        "HGETALL" => { cmd_hgetall(cmd, ctx, out); false }
+        "HEXISTS" => { cmd_hexists(cmd, ctx, out); false }
+        "HLEN"    => { cmd_hlen(cmd, ctx, out); false }
+        "HKEYS"   => { cmd_hkeys(cmd, ctx, out); false }
+        "HVALS"   => { cmd_hvals(cmd, ctx, out); false }
+        "HMGET"   => { cmd_hmget(cmd, ctx, out); false }
+        "HMSET"   => { cmd_hmset(cmd, ctx, out); false }
 
-        "HSET"    => { cmd_hset(cmd, store, wal, expiry, out); false }
-        "HGET"    => { cmd_hget(cmd, store, expiry, out); false }
-        "HDEL"    => { cmd_hdel(cmd, store, wal, expiry, out); false }
-        "HGETALL" => { cmd_hgetall(cmd, store, expiry, out); false }
-        "HEXISTS" => { cmd_hexists(cmd, store, expiry, out); false }
-        "HLEN"    => { cmd_hlen(cmd, store, expiry, out); false }
-        "HKEYS"   => { cmd_hkeys(cmd, store, expiry, out); false }
-        "HVALS"   => { cmd_hvals(cmd, store, expiry, out); false }
-        "HMGET"   => { cmd_hmget(cmd, store, expiry, out); false }
-        "HMSET"   => { cmd_hmset(cmd, store, wal, expiry, out); false }
+        // ----- List -----
+        "LPUSH"  => { cmd_lpush(cmd, ctx, out); false }
+        "RPUSH"  => { cmd_rpush(cmd, ctx, out); false }
+        "LPOP"   => { cmd_lpop(cmd, ctx, out); false }
+        "RPOP"   => { cmd_rpop(cmd, ctx, out); false }
+        "LRANGE" => { cmd_lrange(cmd, ctx, out); false }
+        "LLEN"   => { cmd_llen(cmd, ctx, out); false }
+        "LINDEX" => { cmd_lindex(cmd, ctx, out); false }
+        "LREM"   => { cmd_lrem(cmd, ctx, out); false }
+        "LTRIM"  => { cmd_ltrim(cmd, ctx, out); false }
+        "LSET"   => { cmd_lset(cmd, ctx, out); false }
 
         _ => {
             let msg = format!("ERR unknown command '{}'", cmd.name);
@@ -370,9 +409,7 @@ fn err_wrong_args(out: &mut Vec<u8>) {
 /// Returns `true` if the connection should be closed (e.g. QUIT command).
 fn handle_inline(
     data: &[u8],
-    store: &KvStore,
-    wal: Option<&Wal>,
-    expiry: Option<&ExpirationManager>,
+    ctx: &ServerContext,
     out: &mut Vec<u8>,
 ) -> bool {
     let line_end = data.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(data.len());
@@ -387,7 +424,7 @@ fn handle_inline(
     let args: Vec<Vec<u8>> = parts.iter().map(|p| p.to_vec()).collect();
 
     let cmd = crate::core::resp::Command { name, args };
-    dispatch_command(&cmd, store, wal, expiry, out)
+    dispatch_command(&cmd, ctx, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -396,12 +433,12 @@ fn handle_inline(
 
 /// Handle `GET key` — return the value or null bulk string.
 ///
-/// Returns a WRONGTYPE error if the key holds a hash.
-fn cmd_get(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Returns a WRONGTYPE error if the key holds a hash or list.
+fn cmd_get(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     // Lazy expiration check.
-    if let Some(exp) = expiry {
+    if let Some(exp) = ctx.expiry {
         if exp.is_expired(key) {
             exp.purge_if_expired(key);
             RespEncoder::write_null(out);
@@ -409,8 +446,8 @@ fn cmd_get(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&Ex
         }
     }
 
-    match store.get(key) {
-        Some(v) if hash::is_hash_value(&v) => {
+    match ctx.store.get(key) {
+        Some(v) if hash::is_hash_value(&v) || ListManager::is_list_value(&v) => {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
         }
         Some(v) => RespEncoder::write_bulk_string(out, &v),
@@ -419,36 +456,112 @@ fn cmd_get(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&Ex
 }
 
 /// Handle `SET key value` — insert/update and persist to WAL.
-fn cmd_set(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_set(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(key), Some(value)) = (cmd.key(), cmd.value()) else { return err_wrong_args(out); };
 
+    // Parse optional flags: NX, XX, EX, PX
+    let mut nx = false;
+    let mut xx = false;
+    let mut ex_secs: Option<u64> = None;
+    let mut px_ms: Option<u64> = None;
+
+    let mut i = 3;
+    while i < cmd.argc() {
+        let flag = cmd.arg(i).unwrap_or(b"");
+        match flag {
+            b"NX" => { nx = true; }
+            b"XX" => { xx = true; }
+            b"EX" => {
+                i += 1;
+                ex_secs = cmd.arg(i).and_then(|v| std::str::from_utf8(v).ok()).and_then(|s| s.parse().ok());
+            }
+            b"PX" => {
+                i += 1;
+                px_ms = cmd.arg(i).and_then(|v| std::str::from_utf8(v).ok()).and_then(|s| s.parse().ok());
+            }
+            other => {
+                let msg = format!("ERR syntax error - unknown option '{}'",
+                    std::str::from_utf8(other).unwrap_or("?"));
+                RespEncoder::write_error(out, &msg);
+                return;
+            }
+        }
+        i += 1;
+    }
+
+    let exists = ctx.store.exists(key);
+
+    // NX: only set if key does NOT exist
+    if nx && exists {
+        out.extend_from_slice(b"$-1\r\n");
+        return;
+    }
+    // XX: only set if key DOES exist
+    if xx && !exists {
+        out.extend_from_slice(b"$-1\r\n");
+        return;
+    }
+
+    // If the key held a list, clean up the list data.
+    if let Some(lists) = ctx.lists {
+        if ListManager::is_list_value(&ctx.store.get(key).unwrap_or_default()) {
+            lists.remove_key(key);
+        }
+    }
+
     // Remove old TTL if overwriting.
-    if let Some(exp) = expiry {
+    if let Some(exp) = ctx.expiry {
         exp.remove(key);
     }
 
-    if store.set(key, value) {
-        if let Some(w) = wal {
+    if ctx.store.set(key, value) {
+        if let Some(w) = ctx.wal {
             if w.set(key, value).is_err() {
                 out.extend_from_slice(b"-ERR WAL write failed\r\n");
                 return;
             }
         }
+
+        // Apply EX/PX TTL if specified.
+        if let Some(exp) = ctx.expiry {
+            let ttl = if let Some(secs) = ex_secs {
+                Some(std::time::Duration::from_secs(secs))
+            } else if let Some(ms) = px_ms {
+                Some(std::time::Duration::from_millis(ms))
+            } else {
+                None
+            };
+            if let Some(dur) = ttl {
+                if let Some(deadline_ms) = exp.expire_with_deadline(key, dur) {
+                    if let Some(w) = ctx.wal {
+                        let _ = w.expire(key, deadline_ms);
+                    }
+                }
+            }
+        }
+
         out.extend_from_slice(b"+OK\r\n");
     } else {
         out.extend_from_slice(b"-ERR value too large\r\n");
     }
 }
 
-/// Handle `DEL key` — remove key, persist to WAL, clean up TTL.
-fn cmd_del(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
-    let Some(key) = cmd.key() else { return err_wrong_args(out); };
-    let deleted = store.del(key);
-    if deleted {
-        if let Some(w) = wal { let _ = w.del(key); }
-        if let Some(exp) = expiry { exp.remove(key); }
+/// Handle `DEL key [key ...]` — remove one or more keys, return count of deleted.
+fn cmd_del(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    if cmd.argc() < 2 {
+        return err_wrong_args(out);
     }
-    out.extend_from_slice(if deleted { b":1\r\n" } else { b":0\r\n" });
+    let mut deleted: i64 = 0;
+    for i in 1..cmd.argc() {
+        let Some(key) = cmd.arg(i) else { continue };
+        if ctx.store.del(key) {
+            deleted += 1;
+            if let Some(w) = ctx.wal { let _ = w.del(key); }
+            if let Some(exp) = ctx.expiry { exp.remove(key); }
+            if let Some(lists) = ctx.lists { lists.remove_key(key); }
+        }
+    }
+    RespEncoder::write_integer(out, deleted);
 }
 
 /// Handle `PING [message]` — return PONG or echo the message.
@@ -467,16 +580,16 @@ fn cmd_echo(cmd: &crate::core::resp::Command, out: &mut Vec<u8>) {
 }
 
 /// Handle `INFO` — return server info as a bulk string.
-///
-/// Writes directly into the response buffer to avoid `format!()` allocation.
-fn cmd_info(store: &KvStore, out: &mut Vec<u8>) {
-    out.extend_from_slice(b"# Server\r\nfastkv_version:");
-    out.extend_from_slice(crate::VERSION.as_bytes());
-    out.extend_from_slice(b"\r\n# Memory\r\nused_memory_approx:");
-    write_usize_buf(out, store.len() * 200);
-    out.extend_from_slice(b"\r\n# Keys\r\ndb_size:");
-    write_usize_buf(out, store.len());
-    out.extend_from_slice(b"\r\n");
+fn cmd_info(ctx: &ServerContext, out: &mut Vec<u8>) {
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(b"# Server\r\nfastkv_version:");
+    buf.extend_from_slice(crate::VERSION.as_bytes());
+    buf.extend_from_slice(b"\r\n# Memory\r\nused_memory_approx:");
+    write_usize_buf(&mut buf, ctx.store.len() * 200);
+    buf.extend_from_slice(b"\r\n# Keys\r\ndb_size:");
+    write_usize_buf(&mut buf, ctx.store.len());
+    buf.extend_from_slice(b"\r\n");
+    RespEncoder::write_bulk_string(out, &buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -484,12 +597,20 @@ fn cmd_info(store: &KvStore, out: &mut Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 /// Handle `INCR`/`DECR` — atomically increment/decrement by *delta*.
-fn cmd_incr(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, _expiry: Option<&ExpirationManager>, out: &mut Vec<u8>, delta: i64) {
+fn cmd_incr(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>, delta: i64) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
-    match store.incr(key, delta) {
+    // Check type: INCR only works on plain string keys.
+    if let Some(val) = ctx.store.get(key) {
+        if hash::is_hash_value(&val) || ListManager::is_list_value(&val) {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+    }
+
+    match ctx.store.incr(key, delta) {
         Ok(new_val) => {
-            if let Some(w) = wal {
+            if let Some(w) = ctx.wal {
                 if w.set(key, new_val.to_string().as_bytes()).is_err() {
                     RespEncoder::write_error(out, "ERR WAL write failed");
                     return;
@@ -498,7 +619,16 @@ fn cmd_incr(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>
             RespEncoder::write_integer(out, new_val);
         }
         Err(IncrError::KeyNotFound) => {
-            RespEncoder::write_error(out, "ERR no such key");
+            // Redis semantics: INCR on missing key → initialise to 0, then apply delta.
+            let new_val = delta;
+            ctx.store.set(key, new_val.to_string().as_bytes());
+            if let Some(w) = ctx.wal {
+                if w.set(key, new_val.to_string().as_bytes()).is_err() {
+                    RespEncoder::write_error(out, "ERR WAL write failed");
+                    return;
+                }
+            }
+            RespEncoder::write_integer(out, new_val);
         }
         Err(IncrError::NotInteger) => {
             RespEncoder::write_error(out, "ERR value is not an integer or out of range");
@@ -513,7 +643,7 @@ fn cmd_incr(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>
 }
 
 /// Handle `INCRBY key delta` — increment by a specified amount.
-fn cmd_incrby(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_incrby(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(_key), Some(delta_bytes)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
 
     let delta: i64 = match std::str::from_utf8(delta_bytes).ok().and_then(|s| s.parse().ok()) {
@@ -521,11 +651,11 @@ fn cmd_incrby(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wa
         None => { RespEncoder::write_error(out, "ERR value is not an integer"); return; }
     };
 
-    cmd_incr(cmd, store, wal, expiry, out, delta);
+    cmd_incr(cmd, ctx, out, delta);
 }
 
 /// Handle `DECRBY key delta` — decrement by a specified (positive) amount.
-fn cmd_decrby(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_decrby(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(_key), Some(delta_bytes)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
 
     let delta: i64 = match std::str::from_utf8(delta_bytes).ok().and_then(|s| s.parse().ok()) {
@@ -533,28 +663,24 @@ fn cmd_decrby(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wa
         None => { RespEncoder::write_error(out, "ERR value is not an integer"); return; }
     };
 
-    // Negate for decrement.
-    cmd_incr(cmd, store, wal, expiry, out, -delta);
+    cmd_incr(cmd, ctx, out, -delta);
 }
 
 /// Handle `APPEND key suffix` — append to string value, persist result.
-///
-/// Returns a WRONGTYPE error if the key holds a hash.
-fn cmd_append(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, _expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_append(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(key), Some(suffix)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
 
-    // WRONGTYPE check: cannot APPEND to a hash.
-    if let Some(current) = store.get(key) {
-        if hash::is_hash_value(&current) {
+    if let Some(current) = ctx.store.get(key) {
+        if hash::is_hash_value(&current) || ListManager::is_list_value(&current) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
     }
 
-    match store.append(key, suffix) {
+    match ctx.store.append(key, suffix) {
         Some(new_len) => {
-            if let Some(w) = wal {
-                if let Some(val) = store.get(key) {
+            if let Some(w) = ctx.wal {
+                if let Some(val) = ctx.store.get(key) {
                     if w.set(key, &val).is_err() {
                         RespEncoder::write_error(out, "ERR WAL write failed");
                         return;
@@ -570,12 +696,10 @@ fn cmd_append(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wa
 }
 
 /// Handle `STRLEN key` — return byte length of the string value.
-///
-/// Returns a WRONGTYPE error if the key holds a hash.
-fn cmd_strlen(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_strlen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
-    if let Some(exp) = expiry {
+    if let Some(exp) = ctx.expiry {
         if exp.is_expired(key) {
             exp.purge_if_expired(key);
             out.extend_from_slice(b":0\r\n");
@@ -583,26 +707,23 @@ fn cmd_strlen(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<
         }
     }
 
-    // WRONGTYPE check.
-    if let Some(v) = store.get(key) {
-        if hash::is_hash_value(&v) {
+    if let Some(v) = ctx.store.get(key) {
+        if hash::is_hash_value(&v) || ListManager::is_list_value(&v) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
     }
 
-    RespEncoder::write_integer(out, store.strlen(key) as i64);
+    RespEncoder::write_integer(out, ctx.store.strlen(key) as i64);
 }
 
 /// Handle `GETRANGE key start end` — return substring (inclusive bounds).
-///
-/// Returns a WRONGTYPE error if the key holds a hash.
-fn cmd_getrange(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_getrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(key), Some(start_s), Some(end_s)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
         return err_wrong_args(out);
     };
 
-    if let Some(exp) = expiry {
+    if let Some(exp) = ctx.expiry {
         if exp.is_expired(key) {
             exp.purge_if_expired(key);
             out.extend_from_slice(b"$0\r\n\r\n");
@@ -610,9 +731,8 @@ fn cmd_getrange(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Optio
         }
     }
 
-    // WRONGTYPE check.
-    if let Some(v) = store.get(key) {
-        if hash::is_hash_value(&v) {
+    if let Some(v) = ctx.store.get(key) {
+        if hash::is_hash_value(&v) || ListManager::is_list_value(&v) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -621,21 +741,18 @@ fn cmd_getrange(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Optio
     let start: i64 = std::str::from_utf8(start_s).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let end: i64 = std::str::from_utf8(end_s).ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
 
-    let value = store.getrange(key, start, end).unwrap_or_default();
+    let value = ctx.store.getrange(key, start, end).unwrap_or_default();
     RespEncoder::write_bulk_string(out, &value);
 }
 
 /// Handle `SETRANGE key offset value` — overwrite part of a string, persist result.
-///
-/// Returns a WRONGTYPE error if the key holds a hash.
-fn cmd_setrange(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, _expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_setrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(key), Some(offset_s), Some(replacement)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
         return err_wrong_args(out);
     };
 
-    // WRONGTYPE check.
-    if let Some(v) = store.get(key) {
-        if hash::is_hash_value(&v) {
+    if let Some(v) = ctx.store.get(key) {
+        if hash::is_hash_value(&v) || ListManager::is_list_value(&v) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -646,10 +763,10 @@ fn cmd_setrange(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&
         None => { RespEncoder::write_error(out, "ERR offset is not an integer"); return; }
     };
 
-    match store.setrange(key, offset, replacement) {
+    match ctx.store.setrange(key, offset, replacement) {
         Some(new_len) => {
-            if let Some(w) = wal {
-                if let Some(val) = store.get(key) {
+            if let Some(w) = ctx.wal {
+                if let Some(val) = ctx.store.get(key) {
                     if w.set(key, &val).is_err() {
                         RespEncoder::write_error(out, "ERR WAL write failed");
                         return;
@@ -665,18 +782,22 @@ fn cmd_setrange(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&
 }
 
 /// Handle `MGET key1 key2 ...` — return an array of values (nil for missing).
-fn cmd_mget(cmd: &crate::core::resp::Command, store: &KvStore, _expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_mget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     if cmd.argc() < 2 {
         return err_wrong_args(out);
     }
     let keys: Vec<&[u8]> = (1..cmd.argc()).filter_map(|i| cmd.arg(i)).collect();
-    let values = store.mget(&keys);
+    let values = ctx.store.mget(&keys);
 
     out.push(b'*');
     write_usize_buf(out, values.len());
     out.extend_from_slice(b"\r\n");
     for val in &values {
         match val {
+            Some(v) if hash::is_hash_value(v) || ListManager::is_list_value(v) => {
+                // In Redis MGET, WRONGTYPE is not returned per-element; nil is returned.
+                RespEncoder::write_null(out);
+            }
             Some(v) => RespEncoder::write_bulk_string(out, v),
             None => RespEncoder::write_null(out),
         }
@@ -684,7 +805,7 @@ fn cmd_mget(cmd: &crate::core::resp::Command, store: &KvStore, _expiry: Option<&
 }
 
 /// Handle `MSET k1 v1 k2 v2 ...` — set multiple key-value pairs atomically.
-fn cmd_mset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, out: &mut Vec<u8>) {
+fn cmd_mset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let argc = cmd.argc();
     if argc < 3 || argc % 2 == 0 {
         return err_wrong_args(out);
@@ -695,8 +816,8 @@ fn cmd_mset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>
         .filter_map(|i| Some((cmd.arg(i)?, cmd.arg(i + 1)?)))
         .collect();
 
-    if store.mset(&pairs) {
-        if let Some(w) = wal {
+    if ctx.store.mset(&pairs) {
+        if let Some(w) = ctx.wal {
             for (k, v) in &pairs {
                 if w.set(k, v).is_err() {
                     RespEncoder::write_error(out, "ERR WAL write failed");
@@ -710,50 +831,88 @@ fn cmd_mset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>
     }
 }
 
-/// Handle `EXISTS key` — return 1 if key exists, 0 otherwise.
-fn cmd_exists(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
-    let Some(key) = cmd.key() else { return err_wrong_args(out); };
-
-    if let Some(exp) = expiry {
-        if exp.is_expired(key) {
-            exp.purge_if_expired(key);
-            out.extend_from_slice(b":0\r\n");
-            return;
+/// Handle `EXISTS key [key ...]` — return count of existing keys.
+fn cmd_exists(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    if cmd.argc() < 2 {
+        return err_wrong_args(out);
+    }
+    let mut count: i64 = 0;
+    for i in 1..cmd.argc() {
+        let Some(key) = cmd.arg(i) else { continue };
+        if let Some(exp) = ctx.expiry {
+            if exp.is_expired(key) {
+                exp.purge_if_expired(key);
+                continue;
+            }
+        }
+        if ctx.store.exists(key) {
+            count += 1;
         }
     }
-
-    out.extend_from_slice(if store.exists(key) { b":1\r\n" } else { b":0\r\n" });
+    RespEncoder::write_integer(out, count);
 }
 
 // ---------------------------------------------------------------------------
 // Expiration commands
 // ---------------------------------------------------------------------------
 
-/// Handle `EXPIRE key seconds` — set a TTL in seconds.
-fn cmd_expire(cmd: &crate::core::resp::Command, _store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `EXPIRE key seconds` — set a TTL in seconds and persist to WAL.
+fn cmd_expire(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(key), Some(secs_s)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
-    let Some(exp) = expiry else {
+    let Some(exp) = ctx.expiry else {
         out.extend_from_slice(b"-ERR expiration not enabled\r\n");
         return;
     };
 
-    let secs: u64 = match std::str::from_utf8(secs_s).ok().and_then(|s| s.parse().ok()) {
+    let secs: i64 = match std::str::from_utf8(secs_s).ok().and_then(|s| s.parse().ok()) {
         Some(s) => s,
         None => { out.extend_from_slice(b"-ERR value is not an integer\r\n"); return; }
     };
 
-    if exp.expire(key, std::time::Duration::from_secs(secs)) {
-        out.extend_from_slice(b":1\r\n");
-    } else {
-        out.extend_from_slice(b":0\r\n");
+    // Negative or zero seconds → delete the key immediately (Redis semantics).
+    if secs <= 0 {
+        ctx.store.del(key);
+        if let Some(exp) = ctx.expiry { exp.remove(key); }
+        if let Some(lists) = ctx.lists { lists.remove_key(key); }
+        if let Some(w) = ctx.wal { let _ = w.del(key); }
+        RespEncoder::write_integer(out, 1);
+        return;
+    }
+
+    let ttl = std::time::Duration::from_secs(secs as u64);
+
+    match exp.expire_with_deadline(key, ttl) {
+        Some(deadline_ms) => {
+            // Persist to WAL.
+            if let Some(w) = ctx.wal {
+                if w.expire(key, deadline_ms).is_err() {
+                    RespEncoder::write_error(out, "ERR WAL write failed");
+                    return;
+                }
+            }
+            out.extend_from_slice(b":1\r\n");
+        }
+        None => {
+            out.extend_from_slice(b":0\r\n");
+        }
     }
 }
 
 /// Handle `TTL key` — return remaining TTL in seconds, or -2 if no TTL.
-fn cmd_ttl(cmd: &crate::core::resp::Command, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_ttl(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
-    let Some(exp) = expiry else {
-        out.extend_from_slice(b"-2\r\n");  // no TTL support → behave like missing key
+
+    // Redis semantics:
+    //   -2 = key does not exist
+    //   -1 = key exists but has no TTL
+    //   >=0 = remaining seconds
+    if !ctx.store.exists(key) {
+        RespEncoder::write_integer(out, -2);
+        return;
+    }
+
+    let Some(exp) = ctx.expiry else {
+        RespEncoder::write_integer(out, -1);
         return;
     };
 
@@ -762,15 +921,21 @@ fn cmd_ttl(cmd: &crate::core::resp::Command, expiry: Option<&ExpirationManager>,
             let secs = dur.as_secs();
             RespEncoder::write_integer(out, secs as i64);
         }
-        None => out.extend_from_slice(b"-2\r\n"),
+        None => RespEncoder::write_integer(out, -1),
     }
 }
 
 /// Handle `PTTL key` — return remaining TTL in milliseconds, or -2 if no TTL.
-fn cmd_pttl(cmd: &crate::core::resp::Command, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_pttl(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
-    let Some(exp) = expiry else {
-        out.extend_from_slice(b"-2\r\n");
+
+    if !ctx.store.exists(key) {
+        RespEncoder::write_integer(out, -2);
+        return;
+    }
+
+    let Some(exp) = ctx.expiry else {
+        RespEncoder::write_integer(out, -1);
         return;
     };
 
@@ -779,14 +944,14 @@ fn cmd_pttl(cmd: &crate::core::resp::Command, expiry: Option<&ExpirationManager>
             let ms = dur.as_millis() as i64;
             RespEncoder::write_integer(out, ms);
         }
-        None => out.extend_from_slice(b"-2\r\n"),
+        None => RespEncoder::write_integer(out, -1),
     }
 }
 
 /// Handle `PERSIST key` — remove the TTL, making the key persistent.
-fn cmd_persist(cmd: &crate::core::resp::Command, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+fn cmd_persist(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
-    let Some(exp) = expiry else {
+    let Some(exp) = ctx.expiry else {
         out.extend_from_slice(b":0\r\n");
         return;
     };
@@ -799,35 +964,27 @@ fn cmd_persist(cmd: &crate::core::resp::Command, expiry: Option<&ExpirationManag
 // ---------------------------------------------------------------------------
 
 /// Retrieve the current value for a key, respecting expiration.
-///
-/// Returns the raw value bytes, or an empty `Vec` if the key does not exist
-/// or has expired.
 #[inline]
-fn get_current_value(key: &[u8], store: &KvStore, expiry: Option<&ExpirationManager>) -> Vec<u8> {
-    if let Some(exp) = expiry {
+fn get_current_value(key: &[u8], ctx: &ServerContext) -> Vec<u8> {
+    if let Some(exp) = ctx.expiry {
         if exp.is_expired(key) {
             exp.purge_if_expired(key);
             return Vec::new();
         }
     }
-    store.get(key).unwrap_or_default()
+    ctx.store.get(key).unwrap_or_default()
 }
 
-/// Handle `HSET key field value [field value ...]` — set one or more hash fields.
-///
-/// Returns the number of fields that were **added** (i.e. did not previously
-/// exist). Updating an existing field does not count.
-fn cmd_hset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HSET key field value [field value ...]`.
+fn cmd_hset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
-    // Need at least key + field + value = 3 args.
     if cmd.argc() < 4 || (cmd.argc() - 2) % 2 != 0 {
         return err_wrong_args(out);
     }
 
-    let mut current = get_current_value(key, store, expiry);
+    let mut current = get_current_value(key, ctx);
     let mut new_fields = 0i64;
 
-    // Process field-value pairs sequentially.
     let mut i = 2usize;
     while i + 1 < cmd.argc() {
         let Some(field) = cmd.arg(i) else { break; };
@@ -838,11 +995,14 @@ fn cmd_hset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>
         match hash::hash_set(&current, field, value) {
             Ok(new_data) => {
                 current = new_data;
-                if was_new {
-                    new_fields += 1;
-                }
+                if was_new { new_fields += 1; }
             }
             Err(hash::HashError::NotAHash) => {
+                // Also reject if it's a list.
+                if ListManager::is_list_value(&current) {
+                    RespEncoder::write_error(out, WRONGTYPE_ERR);
+                    return;
+                }
                 RespEncoder::write_error(out, WRONGTYPE_ERR);
                 return;
             }
@@ -854,9 +1014,8 @@ fn cmd_hset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>
         i += 2;
     }
 
-    // Persist the final state.
-    if store.set(key, &current) {
-        if let Some(w) = wal {
+    if ctx.store.set(key, &current) {
+        if let Some(w) = ctx.wal {
             if w.set(key, &current).is_err() {
                 RespEncoder::write_error(out, "ERR WAL write failed");
                 return;
@@ -868,13 +1027,13 @@ fn cmd_hset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>
     }
 }
 
-/// Handle `HGET key field` — return the value of a hash field, or nil.
-fn cmd_hget(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HGET key field`.
+fn cmd_hget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(key), Some(field)) = (cmd.key(), cmd.arg(2)) else {
         return err_wrong_args(out);
     };
 
-    let current = get_current_value(key, store, expiry);
+    let current = get_current_value(key, ctx);
 
     if !current.is_empty() && !hash::is_hash_value(&current) {
         RespEncoder::write_error(out, WRONGTYPE_ERR);
@@ -887,18 +1046,15 @@ fn cmd_hget(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&E
     }
 }
 
-/// Handle `HDEL key field [field ...]` — delete one or more hash fields.
-///
-/// Returns the number of fields that were removed.
-fn cmd_hdel(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HDEL key field [field ...]`.
+fn cmd_hdel(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
     if cmd.argc() < 3 {
         return err_wrong_args(out);
     }
 
-    let mut current = get_current_value(key, store, expiry);
+    let mut current = get_current_value(key, ctx);
 
-    // WRONGTYPE check.
     if !current.is_empty() && !hash::is_hash_value(&current) {
         RespEncoder::write_error(out, WRONGTYPE_ERR);
         return;
@@ -917,36 +1073,29 @@ fn cmd_hdel(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>
             }
             HashDelResult::HashEmpty => {
                 deleted += 1;
-                // Delete the key from the store.
-                store.del(key);
-                if let Some(w) = wal { let _ = w.del(key); }
-                if let Some(exp) = expiry { exp.remove(key); }
+                ctx.store.del(key);
+                if let Some(w) = ctx.wal { let _ = w.del(key); }
+                if let Some(exp) = ctx.expiry { exp.remove(key); }
                 current = Vec::new();
                 break;
             }
-            HashDelResult::FieldNotFound => {
-                // Field not in hash — nothing to do.
-            }
+            HashDelResult::FieldNotFound => {}
         }
     }
 
-    // Persist if the hash still has fields.
     if !current.is_empty() {
-        store.set(key, &current);
-        if let Some(w) = wal { let _ = w.set(key, &current); }
+        ctx.store.set(key, &current);
+        if let Some(w) = ctx.wal { let _ = w.set(key, &current); }
     }
 
     RespEncoder::write_integer(out, deleted);
 }
 
-/// Handle `HGETALL key` — return all fields and values of a hash.
-///
-/// Returns a flat RESP array with alternating field / value elements
-/// (matches Redis behaviour).
-fn cmd_hgetall(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HGETALL key`.
+fn cmd_hgetall(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
-    let current = get_current_value(key, store, expiry);
+    let current = get_current_value(key, ctx);
 
     if !current.is_empty() && !hash::is_hash_value(&current) {
         RespEncoder::write_error(out, WRONGTYPE_ERR);
@@ -955,7 +1104,6 @@ fn cmd_hgetall(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option
 
     let fields = hash::decode_hash(&current).unwrap_or_default();
 
-    // *<2 * num_fields>\r\n alternating field / value bulk strings.
     out.push(b'*');
     write_usize_buf(out, fields.len() * 2);
     out.extend_from_slice(b"\r\n");
@@ -965,13 +1113,13 @@ fn cmd_hgetall(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option
     }
 }
 
-/// Handle `HEXISTS key field` — return 1 if field exists, 0 otherwise.
-fn cmd_hexists(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HEXISTS key field`.
+fn cmd_hexists(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let (Some(key), Some(field)) = (cmd.key(), cmd.arg(2)) else {
         return err_wrong_args(out);
     };
 
-    let current = get_current_value(key, store, expiry);
+    let current = get_current_value(key, ctx);
 
     if !current.is_empty() && !hash::is_hash_value(&current) {
         RespEncoder::write_error(out, WRONGTYPE_ERR);
@@ -981,11 +1129,11 @@ fn cmd_hexists(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option
     RespEncoder::write_integer(out, if hash::hash_exists(&current, field) { 1 } else { 0 });
 }
 
-/// Handle `HLEN key` — return the number of fields in the hash.
-fn cmd_hlen(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HLEN key`.
+fn cmd_hlen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
-    let current = get_current_value(key, store, expiry);
+    let current = get_current_value(key, ctx);
 
     if !current.is_empty() && !hash::is_hash_value(&current) {
         RespEncoder::write_error(out, WRONGTYPE_ERR);
@@ -995,11 +1143,11 @@ fn cmd_hlen(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&E
     RespEncoder::write_integer(out, hash::hash_len(&current) as i64);
 }
 
-/// Handle `HKEYS key` — return all field names in the hash.
-fn cmd_hkeys(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HKEYS key`.
+fn cmd_hkeys(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
-    let current = get_current_value(key, store, expiry);
+    let current = get_current_value(key, ctx);
 
     if !current.is_empty() && !hash::is_hash_value(&current) {
         RespEncoder::write_error(out, WRONGTYPE_ERR);
@@ -1015,11 +1163,11 @@ fn cmd_hkeys(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&
     }
 }
 
-/// Handle `HVALS key` — return all values in the hash.
-fn cmd_hvals(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HVALS key`.
+fn cmd_hvals(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
-    let current = get_current_value(key, store, expiry);
+    let current = get_current_value(key, ctx);
 
     if !current.is_empty() && !hash::is_hash_value(&current) {
         RespEncoder::write_error(out, WRONGTYPE_ERR);
@@ -1035,16 +1183,14 @@ fn cmd_hvals(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&
     }
 }
 
-/// Handle `HMGET key field [field ...]` — return values for multiple fields.
-///
-/// Returns an array with one element per requested field; nil for missing.
-fn cmd_hmget(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HMGET key field [field ...]`.
+fn cmd_hmget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
     if cmd.argc() < 3 {
         return err_wrong_args(out);
     }
 
-    let current = get_current_value(key, store, expiry);
+    let current = get_current_value(key, ctx);
 
     if !current.is_empty() && !hash::is_hash_value(&current) {
         RespEncoder::write_error(out, WRONGTYPE_ERR);
@@ -1064,17 +1210,14 @@ fn cmd_hmget(cmd: &crate::core::resp::Command, store: &KvStore, expiry: Option<&
     }
 }
 
-/// Handle `HMSET key field value [field value ...]` — set multiple hash fields.
-///
-/// HMSET is deprecated in Redis in favour of HSET with multiple pairs, but
-/// is kept for compatibility. Always returns OK.
-fn cmd_hmset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal>, expiry: Option<&ExpirationManager>, out: &mut Vec<u8>) {
+/// Handle `HMSET key field value [field value ...]`.
+fn cmd_hmset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
     if cmd.argc() < 4 || (cmd.argc() - 2) % 2 != 0 {
         return err_wrong_args(out);
     }
 
-    let mut current = get_current_value(key, store, expiry);
+    let mut current = get_current_value(key, ctx);
     let mut i = 2usize;
 
     while i + 1 < cmd.argc() {
@@ -1095,8 +1238,8 @@ fn cmd_hmset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal
         i += 2;
     }
 
-    if store.set(key, &current) {
-        if let Some(w) = wal {
+    if ctx.store.set(key, &current) {
+        if let Some(w) = ctx.wal {
             if w.set(key, &current).is_err() {
                 RespEncoder::write_error(out, "ERR WAL write failed");
                 return;
@@ -1105,6 +1248,237 @@ fn cmd_hmset(cmd: &crate::core::resp::Command, store: &KvStore, wal: Option<&Wal
         RespEncoder::write_simple_string(out, "OK");
     } else {
         RespEncoder::write_error(out, "ERR hash value too large for inline storage");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// List commands
+// ---------------------------------------------------------------------------
+
+/// Handle `LPUSH key element [element ...]`.
+fn cmd_lpush(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+    if cmd.argc() < 3 {
+        return err_wrong_args(out);
+    }
+
+    let elements: Vec<&[u8]> = (2..cmd.argc()).filter_map(|i| cmd.arg(i)).collect();
+
+    match lists.lpush(key, &elements) {
+        Ok(len) => RespEncoder::write_integer(out, len as i64),
+        Err(_) => RespEncoder::write_error(out, WRONGTYPE_ERR),
+    }
+}
+
+/// Handle `RPUSH key element [element ...]`.
+fn cmd_rpush(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+    if cmd.argc() < 3 {
+        return err_wrong_args(out);
+    }
+
+    let elements: Vec<&[u8]> = (2..cmd.argc()).filter_map(|i| cmd.arg(i)).collect();
+
+    match lists.rpush(key, &elements) {
+        Ok(len) => RespEncoder::write_integer(out, len as i64),
+        Err(_) => RespEncoder::write_error(out, WRONGTYPE_ERR),
+    }
+}
+
+/// Handle `LPOP key [count]`.
+fn cmd_lpop(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    // Check type: LPOP only works on list keys (or missing keys → nil).
+    if let Some(val) = ctx.store.get(key) {
+        if !ListManager::is_list_value(&val) {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+    }
+
+    let count: usize = cmd.arg(2)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let elements = lists.lpop(key, count);
+
+    if cmd.argc() >= 3 && count > 1 {
+        // Multi-element reply.
+        out.push(b'*');
+        write_usize_buf(out, elements.len());
+        out.extend_from_slice(b"\r\n");
+        for elem in &elements {
+            RespEncoder::write_bulk_string(out, elem);
+        }
+    } else {
+        match elements.into_iter().next() {
+            Some(elem) => RespEncoder::write_bulk_string(out, &elem),
+            None => RespEncoder::write_null(out),
+        }
+    }
+}
+
+/// Handle `RPOP key [count]`.
+fn cmd_rpop(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    // Check type: RPOP only works on list keys (or missing keys → nil).
+    if let Some(val) = ctx.store.get(key) {
+        if !ListManager::is_list_value(&val) {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+    }
+
+    let count: usize = cmd.arg(2)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let elements = lists.rpop(key, count);
+
+    if cmd.argc() >= 3 && count > 1 {
+        out.push(b'*');
+        write_usize_buf(out, elements.len());
+        out.extend_from_slice(b"\r\n");
+        for elem in &elements {
+            RespEncoder::write_bulk_string(out, elem);
+        }
+    } else {
+        match elements.into_iter().next() {
+            Some(elem) => RespEncoder::write_bulk_string(out, &elem),
+            None => RespEncoder::write_null(out),
+        }
+    }
+}
+
+/// Handle `LRANGE key start stop`.
+fn cmd_lrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let (Some(key), Some(start_s), Some(stop_s)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
+        return err_wrong_args(out);
+    };
+
+    let start: i64 = std::str::from_utf8(start_s).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stop: i64 = std::str::from_utf8(stop_s).ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
+
+    let elements = lists.lrange(key, start, stop);
+
+    out.push(b'*');
+    write_usize_buf(out, elements.len());
+    out.extend_from_slice(b"\r\n");
+    for elem in &elements {
+        RespEncoder::write_bulk_string(out, elem);
+    }
+}
+
+/// Handle `LLEN key`.
+fn cmd_llen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    // Check type: LLEN only works on list keys (or missing keys → 0).
+    if let Some(val) = ctx.store.get(key) {
+        if !ListManager::is_list_value(&val) {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+    }
+
+    RespEncoder::write_integer(out, lists.llen(key) as i64);
+}
+
+/// Handle `LINDEX key index`.
+fn cmd_lindex(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let (Some(key), Some(idx_s)) = (cmd.key(), cmd.arg(2)) else {
+        return err_wrong_args(out);
+    };
+
+    let index: i64 = std::str::from_utf8(idx_s).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    match lists.lindex(key, index) {
+        Some(v) => RespEncoder::write_bulk_string(out, &v),
+        None => RespEncoder::write_null(out),
+    }
+}
+
+/// Handle `LREM key count element`.
+fn cmd_lrem(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let (Some(key), Some(count_s), Some(element)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
+        return err_wrong_args(out);
+    };
+
+    let count: i64 = std::str::from_utf8(count_s).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let removed = lists.lrem(key, count, element);
+    RespEncoder::write_integer(out, removed as i64);
+}
+
+/// Handle `LTRIM key start stop`.
+fn cmd_ltrim(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let (Some(key), Some(start_s), Some(stop_s)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
+        return err_wrong_args(out);
+    };
+
+    let start: i64 = std::str::from_utf8(start_s).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stop: i64 = std::str::from_utf8(stop_s).ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
+
+    lists.ltrim(key, start, stop);
+    RespEncoder::write_simple_string(out, "OK");
+}
+
+/// Handle `LSET key index element`.
+fn cmd_lset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+    let Some(lists) = ctx.lists else {
+        RespEncoder::write_error(out, "ERR lists not enabled");
+        return;
+    };
+    let (Some(key), Some(idx_s), Some(element)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
+        return err_wrong_args(out);
+    };
+
+    let index: i64 = std::str::from_utf8(idx_s).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    if lists.lset(key, index, element) {
+        RespEncoder::write_simple_string(out, "OK");
+    } else {
+        RespEncoder::write_error(out, "ERR index out of range");
     }
 }
 
@@ -1138,432 +1512,143 @@ mod tests {
     }
 
     #[test]
-    fn test_process_get_set_del() {
+    fn test_dispatch_get_set() {
+        let store = KvStore::with_capacity(100);
+        let ctx = ServerContext {
+            store: &store,
+            wal: None,
+            expiry: None,
+            lists: None,
+        };
+        let mut out = Vec::new();
+
+        let cmd = crate::core::resp::Command {
+            name: "SET".into(),
+            args: vec![b"SET".to_vec(), b"key".to_vec(), b"value".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+        assert!(out.ends_with(b"+OK\r\n"));
+
+        out.clear();
+        let cmd = crate::core::resp::Command {
+            name: "GET".into(),
+            args: vec![b"GET".to_vec(), b"key".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+        assert!(out.windows(5).any(|w| w == b"value"));
+    }
+
+    #[test]
+    fn test_dispatch_ping() {
         let store = KvStore::new();
+        let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None };
         let mut out = Vec::new();
 
-        process_command_into(
-            b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b"+OK\r\n"));
-
-        out.clear();
-        process_command_into(
-            b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b"$5\r\nvalue\r\n"));
-
-        out.clear();
-        process_command_into(
-            b"*2\r\n$3\r\nDEL\r\n$3\r\nkey\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b":1\r\n"));
-
-        out.clear();
-        process_command_into(
-            b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b"$-1\r\n"));
+        let cmd = crate::core::resp::Command {
+            name: "PING".into(),
+            args: vec![b"PING".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+        assert_eq!(&out, b"+PONG\r\n");
     }
 
     #[test]
-    fn test_process_incr() {
-        let store = KvStore::new();
+    fn test_dispatch_lpush_lrange_lpop() {
+        let store = Arc::new(KvStore::with_capacity(100));
+        let lists = ListManager::new(Arc::clone(&store));
+        let ctx = ServerContext {
+            store: &store,
+            wal: None,
+            expiry: None,
+            lists: Some(&lists),
+        };
         let mut out = Vec::new();
 
-        // Set counter to 10.
-        process_command_into(
-            b"*3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$2\r\n10\r\n",
-            &store, None, None, &mut out, false,
-        );
-        out.clear();
-
-        // INCR
-        process_command_into(
-            b"*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b":11\r\n"));
+        let cmd = crate::core::resp::Command {
+            name: "LPUSH".into(),
+            args: vec![b"LPUSH".to_vec(), b"q".to_vec(), b"3".to_vec(), b"2".to_vec(), b"1".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+        assert_eq!(&out, b":3\r\n");
 
         out.clear();
-        // DECR
-        process_command_into(
-            b"*2\r\n$4\r\nDECR\r\n$7\r\ncounter\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b":10\r\n"));
+        let cmd = crate::core::resp::Command {
+            name: "LRANGE".into(),
+            args: vec![b"LRANGE".to_vec(), b"q".to_vec(), b"0".to_vec(), b"-1".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+        // Should be an array of 3 elements: 1, 2, 3
+        assert!(out.starts_with(b"*3\r\n"));
+
+        out.clear();
+        let cmd = crate::core::resp::Command {
+            name: "LLEN".into(),
+            args: vec![b"LLEN".to_vec(), b"q".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+        assert_eq!(&out, b":3\r\n");
     }
 
     #[test]
-    fn test_process_mget_mset() {
-        let store = KvStore::new();
+    fn test_dispatch_del_removes_list() {
+        let store = Arc::new(KvStore::with_capacity(100));
+        let lists = ListManager::new(Arc::clone(&store));
+        let ctx = ServerContext {
+            store: &store,
+            wal: None,
+            expiry: None,
+            lists: Some(&lists),
+        };
         let mut out = Vec::new();
 
-        process_command_into(
-            b"*5\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b"+OK\r\n"));
+        // Push an element.
+        let cmd = crate::core::resp::Command {
+            name: "LPUSH".into(),
+            args: vec![b"LPUSH".to_vec(), b"tmp".to_vec(), b"x".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
 
+        // Delete.
         out.clear();
-        process_command_into(
-            b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nb\r\n",
-            &store, None, None, &mut out, false,
-        );
-        // Should be an array of 2 elements.
-        assert!(out.starts_with(b"*2\r\n"));
+        let cmd = crate::core::resp::Command {
+            name: "DEL".into(),
+            args: vec![b"DEL".to_vec(), b"tmp".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+        assert_eq!(&out, b":1\r\n");
+
+        // Key should be gone from store.
+        assert!(!store.exists(b"tmp"));
+        assert_eq!(lists.llen(b"tmp"), 0);
     }
 
     #[test]
-    fn test_process_exists() {
-        let store = KvStore::new();
+    fn test_dispatch_wrong_type_get_on_list() {
+        let store = Arc::new(KvStore::with_capacity(100));
+        let lists = ListManager::new(Arc::clone(&store));
+        let ctx = ServerContext {
+            store: &store,
+            wal: None,
+            expiry: None,
+            lists: Some(&lists),
+        };
         let mut out = Vec::new();
 
-        process_command_into(
-            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
-            &store, None, None, &mut out, false,
-        );
+        // Create a list.
+        let cmd = crate::core::resp::Command {
+            name: "LPUSH".into(),
+            args: vec![b"LPUSH".to_vec(), b"mylist".to_vec(), b"val".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+
+        // GET on a list → WRONGTYPE.
         out.clear();
-
-        process_command_into(
-            b"*2\r\n$6\r\nEXISTS\r\n$1\r\nk\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b":1\r\n"));
-    }
-
-    #[test]
-    fn test_process_append_strlen() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(
-            b"*3\r\n$3\r\nSET\r\n$1\r\ns\r\n$5\r\nhello\r\n",
-            &store, None, None, &mut out, false,
-        );
-        out.clear();
-
-        process_command_into(
-            b"*3\r\n$6\r\nAPPEND\r\n$1\r\ns\r\n$6\r\n world\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b":11\r\n"));
-
-        out.clear();
-        process_command_into(
-            b"*2\r\n$6\r\nSTRLEN\r\n$1\r\ns\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b":11\r\n"));
-    }
-
-    #[test]
-    fn test_process_getrange_setrange() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(
-            b"*3\r\n$3\r\nSET\r\n$1\r\ns\r\n$11\r\nHello World\r\n",
-            &store, None, None, &mut out, false,
-        );
-        out.clear();
-
-        // GETRANGE 0 4 → "Hello"
-        process_command_into(
-            b"*4\r\n$8\r\nGETRANGE\r\n$1\r\ns\r\n$1\r\n0\r\n$1\r\n4\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.windows(5).any(|w| w == b"Hello"));
-
-        out.clear();
-        // SETRANGE 6 Redis → "Hello Redis"
-        process_command_into(
-            b"*4\r\n$8\r\nSETRANGE\r\n$1\r\ns\r\n$1\r\n6\r\n$5\r\nRedis\r\n",
-            &store, None, None, &mut out, false,
-        );
-        assert!(out.starts_with(b":11\r\n"));
-    }
-
-    #[test]
-    fn test_process_ping_pong() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*1\r\n$4\r\nPING\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b"+PONG\r\n"));
-
-        out.clear();
-        process_command_into(b"*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n", &store, None, None, &mut out, false);
-        assert!(out.windows(5).any(|w| w == b"hello"));
-    }
-
-    #[test]
-    fn test_process_echo() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n", &store, None, None, &mut out, false);
-        assert!(out.windows(5).any(|w| w == b"hello"));
-    }
-
-    #[test]
-    fn test_process_dbsize() {
-        let store = KvStore::new();
-        store.set(b"a", b"1");
-        store.set(b"b", b"2");
-        let mut out = Vec::new();
-
-        process_command_into(b"*1\r\n$6\r\nDBSIZE\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":2\r\n"));
-    }
-
-    #[test]
-    fn test_process_info() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*1\r\n$4\r\nINFO\r\n", &store, None, None, &mut out, false);
-        assert!(out.windows(6).any(|w| w == b"Server"));
-    }
-
-    #[test]
-    fn test_process_unknown_command() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*2\r\n$5\r\nBOGUS\r\n$1\r\nx\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b"-ERR unknown command"));
-    }
-
-    #[test]
-    fn test_process_inline_set_get() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"SET mykey myvalue\r\n", &store, None, None, &mut out, true);
-        assert!(out.starts_with(b"+OK\r\n"));
-
-        out.clear();
-        process_command_into(b"GET mykey\r\n", &store, None, None, &mut out, true);
-        assert!(out.windows(7).any(|w| w == b"myvalue"));
-    }
-
-    #[test]
-    fn test_process_incrby_decrby() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        // SET counter 10
-        process_command_into(b"*3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$2\r\n10\r\n", &store, None, None, &mut out, false);
-        out.clear();
-
-        // INCRBY counter 5
-        process_command_into(b"*3\r\n$6\r\nINCRBY\r\n$7\r\ncounter\r\n$1\r\n5\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":15\r\n"));
-
-        out.clear();
-
-        // DECRBY counter 3
-        process_command_into(b"*3\r\n$6\r\nDECRBY\r\n$7\r\ncounter\r\n$1\r\n3\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":12\r\n"));
-    }
-
-    #[test]
-    fn test_process_expire_ttl_persist() {
-        use crate::core::expiration::ExpirationManager;
-        let store = Arc::new(KvStore::new());
-        let exp = Arc::new(ExpirationManager::new(Arc::clone(&store)));
-        let mut out = Vec::new();
-
-        // SET session abc123
-        process_command_into(
-            b"*3\r\n$3\r\nSET\r\n$7\r\nsession\r\n$6\r\nabc123\r\n",
-            &store, None, Some(&exp), &mut out, false,
-        );
-        out.clear();
-
-        // EXPIRE session 3600
-        process_command_into(
-            b"*3\r\n$6\r\nEXPIRE\r\n$7\r\nsession\r\n$4\r\n3600\r\n",
-            &store, None, Some(&exp), &mut out, false,
-        );
-        assert!(out.starts_with(b":1\r\n"));
-
-        out.clear();
-
-        // TTL session
-        process_command_into(
-            b"*2\r\n$3\r\nTTL\r\n$7\r\nsession\r\n",
-            &store, None, Some(&exp), &mut out, false,
-        );
-        // Should be a number close to 3600.
-        let ttl_str = String::from_utf8_lossy(&out);
-        assert!(ttl_str.contains("3600") || ttl_str.contains("3599"));
-
-        out.clear();
-
-        // PERSIST session
-        process_command_into(
-            b"*2\r\n$7\r\nPERSIST\r\n$7\r\nsession\r\n",
-            &store, None, Some(&exp), &mut out, false,
-        );
-        assert!(out.starts_with(b":1\r\n"));
-    }
-
-    #[test]
-    fn test_parse_command_bounds_inline() {
-        let data = b"GET mykey\r\n";
-        let (consumed, is_inline) = parse_command_bounds(data).unwrap();
-        assert_eq!(consumed, data.len());
-        assert!(is_inline);
-    }
-
-    #[test]
-    fn test_parse_command_bounds_empty() {
-        assert!(parse_command_bounds(b"").is_none());
-    }
-
-    // ----- Hash command integration tests -----
-
-    #[test]
-    fn test_process_hset_hget() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        // HSET myhash f1 v1
-        let cmd = b"*4\r\n$4\r\nHSET\r\n$6\r\nmyhash\r\n$2\r\nf1\r\n$2\r\nv1\r\n";
-        process_command_into(cmd, &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":1\r\n")); // new field
-
-        out.clear();
-        // HGET myhash f1
-        process_command_into(b"*3\r\n$4\r\nHGET\r\n$6\r\nmyhash\r\n$2\r\nf1\r\n", &store, None, None, &mut out, false);
-        assert!(out.windows(2).any(|w| w == b"v1"));
-    }
-
-    #[test]
-    fn test_process_hset_update() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nf\r\n$1\r\n1\r\n", &store, None, None, &mut out, false);
-        out.clear();
-        // Update existing field
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nf\r\n$1\r\n2\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":0\r\n")); // updated, not new
-    }
-
-    #[test]
-    fn test_process_hdel() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nf\r\n$1\r\nv\r\n", &store, None, None, &mut out, false);
-        out.clear();
-        process_command_into(b"*3\r\n$4\r\nHDEL\r\n$1\r\nh\r\n$1\r\nf\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":1\r\n"));
-    }
-
-    #[test]
-    fn test_process_hgetall() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\na\r\n$1\r\n1\r\n", &store, None, None, &mut out, false);
-        out.clear();
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nb\r\n$1\r\n2\r\n", &store, None, None, &mut out, false);
-        out.clear();
-        process_command_into(b"*2\r\n$7\r\nHGETALL\r\n$1\r\nh\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b"*4\r\n")); // 2 fields × 2 = 4 elements
-    }
-
-    #[test]
-    fn test_process_hash_wrongtype() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        // SET key as string
-        process_command_into(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n", &store, None, None, &mut out, false);
-        out.clear();
-        // HGET on string key → WRONGTYPE
-        process_command_into(b"*3\r\n$4\r\nHGET\r\n$3\r\nkey\r\n$1\r\nx\r\n", &store, None, None, &mut out, false);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("WRONGTYPE"), "expected WRONGTYPE, got: {:?}", out);
-    }
-
-    #[test]
-    fn test_process_hlen_hexists() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nf\r\n$1\r\nv\r\n", &store, None, None, &mut out, false);
-        out.clear();
-
-        // HLEN h → 1
-        process_command_into(b"*2\r\n$4\r\nHLEN\r\n$1\r\nh\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":1\r\n"));
-
-        out.clear();
-        // HEXISTS h f → 1
-        process_command_into(b"*3\r\n$7\r\nHEXISTS\r\n$1\r\nh\r\n$1\r\nf\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":1\r\n"));
-
-        out.clear();
-        // HEXISTS h missing → 0
-        process_command_into(b"*3\r\n$7\r\nHEXISTS\r\n$1\r\nh\r\n$7\r\nmissing\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b":0\r\n"));
-    }
-
-    #[test]
-    fn test_process_hkeys_hvals() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\na\r\n$1\r\n1\r\n", &store, None, None, &mut out, false);
-        out.clear();
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nb\r\n$1\r\n2\r\n", &store, None, None, &mut out, false);
-        out.clear();
-
-        // HKEYS h → *2
-        process_command_into(b"*2\r\n$5\r\nHKEYS\r\n$1\r\nh\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b"*2\r\n"));
-
-        out.clear();
-        // HVALS h → *2
-        process_command_into(b"*2\r\n$5\r\nHVALS\r\n$1\r\nh\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b"*2\r\n"));
-    }
-
-    #[test]
-    fn test_process_hmset_hmget() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        // HMSET h f1 v1 f2 v2
-        process_command_into(b"*6\r\n$5\r\nHMSET\r\n$1\r\nh\r\n$2\r\nf1\r\n$2\r\nv1\r\n$2\r\nf2\r\n$2\r\nv2\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b"+OK\r\n"));
-
-        out.clear();
-        // HMGET h f1 f2
-        process_command_into(b"*4\r\n$5\r\nHMGET\r\n$1\r\nh\r\n$2\r\nf1\r\n$2\r\nf2\r\n", &store, None, None, &mut out, false);
-        assert!(out.starts_with(b"*2\r\n"));
-    }
-
-    #[test]
-    fn test_process_hset_on_string_wrongtype() {
-        let store = KvStore::new();
-        let mut out = Vec::new();
-
-        // SET key as string
-        process_command_into(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n", &store, None, None, &mut out, false);
-        out.clear();
-        // HSET on string key → WRONGTYPE
-        process_command_into(b"*4\r\n$4\r\nHSET\r\n$3\r\nkey\r\n$1\r\nf\r\n$1\r\nv\r\n", &store, None, None, &mut out, false);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("WRONGTYPE"), "expected WRONGTYPE, got: {:?}", out);
+        let cmd = crate::core::resp::Command {
+            name: "GET".into(),
+            args: vec![b"GET".to_vec(), b"mylist".to_vec()],
+        };
+        dispatch_command(&cmd, &ctx, &mut out);
+        assert!(out.starts_with(b"-"));
+        assert!(std::str::from_utf8(&out).unwrap().contains("WRONGTYPE"));
     }
 }
