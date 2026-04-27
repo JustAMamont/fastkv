@@ -9,7 +9,7 @@ if (process.stdout && process.stdout._handle && typeof process.stdout._handle.se
  * FastKV Node.js client — integration tests.
  *
  * Run:  node test_integration.js [host] [port]
- * Defaults: host=127.0.0.1  port=8379
+ * Defaults: host=127.0.0.1  port=6379
  */
 
 const net = require('net');
@@ -20,8 +20,8 @@ async function makeClient() {
   return FastKVClient.create({ host: HOST, port: PORT });
 }
 
-const HOST = process.argv[2] || '127.0.0.1';
-const PORT = parseInt(process.argv[3] || '8379', 10);
+const HOST = process.env.FASTKV_HOST || process.argv[2] || '127.0.0.1';
+const PORT = parseInt(process.env.FASTKV_PORT || process.argv[3] || '6379', 10);
 
 let passed = 0;
 let failed = 0;

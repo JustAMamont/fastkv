@@ -2,7 +2,7 @@
 //!
 //! Run against a live FastKV server.
 //!
-//!   FASTKV_HOST=localhost FASTKV_PORT=8379 cargo test -- --test-threads=1
+//!   FASTKV_HOST=localhost FASTKV_PORT=6379 cargo test -- --test-threads=1
 
 use fastkv_client::Client;
 use std::env;
@@ -12,7 +12,7 @@ fn host() -> String {
 }
 
 fn port() -> u16 {
-    env::var("FASTKV_PORT").unwrap_or_else(|_| "8379".into()).parse().unwrap_or(8379)
+    env::var("FASTKV_PORT").unwrap_or_else(|_| "6379".into()).parse().unwrap_or(6379)
 }
 
 /// Connect, delete key, run body, delete key, close.
