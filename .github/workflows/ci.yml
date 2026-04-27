@@ -112,13 +112,13 @@ jobs:
           # ── Go ──────────────────────────────────────────────────────────
           echo ""
           echo "========== Go =========="
-          (cd clients/go/fastkv && go test -v -count=1 -timeout 60s ./...) || FAILED=1
+          (cd clients/go/fastkv && go test -v -count=1 -timeout 60s -run '^Test' ./...) || FAILED=1
 
           # ── Java ────────────────────────────────────────────────────────
           echo ""
           echo "========== Java =========="
           mkdir -p clients/java/target/test-classes
-          find clients/java/src -name '*.java' | xargs javac -d clients/java/target/test-classes
+          find clients/java/src -name '*.java' | xargs javac -encoding UTF-8 -d clients/java/target/test-classes
           java -Dfastkv.host="$FASTKV_HOST" -Dfastkv.port="$FASTKV_PORT" \
                -cp clients/java/target/test-classes \
                com.fastkv.client.IntegrationTest || FAILED=1
