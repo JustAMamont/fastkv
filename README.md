@@ -274,7 +274,7 @@ LockFreeEntry (64-byte cache-line aligned)
 │  hash: AtomicU64        — 0 = empty         │
 │  key_len: AtomicU32                         │
 │  value_len: AtomicU32                       │
-│  version: AtomicU64     — optimistic reads   │
+│  version: AtomicU64     — optimistic reads  │
 │  data: [AtomicU8; 128]  — inline key+value  │
 └─────────────────────────────────────────────┘
 
