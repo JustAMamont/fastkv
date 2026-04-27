@@ -19,24 +19,24 @@ jobs:
     name: ${{ matrix.label }}
     strategy:
       fail-fast: false
-    matrix:
-      include:
-        - os: ubuntu-latest
-          label: linux-amd64
-          artifact: fastkv-server-linux-amd64
-          binary: fast_kv
-        - os: windows-latest
-          label: windows-amd64
-          artifact: fastkv-server-windows-amd64.exe
-          binary: fast_kv.exe
-        - os: macos-latest
-          label: darwin-arm64
-          artifact: fastkv-server-darwin-arm64
-          binary: fast_kv
-        - os: macos-13
-          label: darwin-amd64
-          artifact: fastkv-server-darwin-amd64
-          binary: fast_kv
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-amd64
+            artifact: fastkv-server-linux-amd64
+            binary: fast_kv
+          - os: windows-latest
+            label: windows-amd64
+            artifact: fastkv-server-windows-amd64.exe
+            binary: fast_kv.exe
+          - os: macos-latest
+            label: darwin-arm64
+            artifact: fastkv-server-darwin-arm64
+            binary: fast_kv
+          - os: macos-13
+            label: darwin-amd64
+            artifact: fastkv-server-darwin-amd64
+            binary: fast_kv
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -120,7 +120,7 @@ jobs:
           python clients/python/tests/test_integration.py
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Python (async) — non-fatal on linux/macos ─────────────────
+          # ── Python (async) — non-fatal ────────────────────────────────
           echo ""
           echo "========== Python (async) =========="
           python clients/python/tests/test_async_integration.py 2>&1
@@ -196,12 +196,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Extract version from tag
+        id: ver
+        run: echo "VER=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
       - uses: actions/download-artifact@v4
         with:
           pattern: server-*
           path: release-assets
           merge-multiple: true
 
+      # ══════════════════════════════════════════════════════════════════
+      # Python client  →  pip install fastkv
+      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -211,8 +218,11 @@ jobs:
           pip install build
           cd clients/python
           python -m build
-          cp dist/fastkv-*.whl dist/fastkv-*.tar.gz ../../release-assets/ || true
+          cp dist/*.whl dist/*.tar.gz ../../release-assets/ || true
 
+      # ══════════════════════════════════════════════════════════════════
+      # Node.js client  →  npm install fastkv-client
+      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -223,6 +233,9 @@ jobs:
           npm pack
           cp *.tgz ../../../release-assets/
 
+      # ══════════════════════════════════════════════════════════════════
+      # Java client  →  fastkv-client-java.jar
+      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -241,22 +254,29 @@ jobs:
             clients/java/src/FastKVException.java \
             clients/java/src/FastKVConnectionException.java \
             clients/java/src/FastKVResponseException.java
-          jar cf release-assets/fastkv-client-java-0.1.0.jar \
+          jar cf release-assets/fastkv-client-java-${{ steps.ver.outputs.VER }}.jar \
             -C clients/java/target/classes .
 
+      # ══════════════════════════════════════════════════════════════════
+      # Go client  →  go get / vendor source
+      # ══════════════════════════════════════════════════════════════════
       - name: Package Go client source
         run: |
           cd clients/go
-          tar czf ../../release-assets/fastkv-client-go-v0.1.0.tar.gz fastkv/
+          tar czf ../../release-assets/fastkv-client-go-v${{ steps.ver.outputs.VER }}.tar.gz fastkv/
 
+      # ══════════════════════════════════════════════════════════════════
+      # Rust client  →  cargo add / path dependency
+      # ══════════════════════════════════════════════════════════════════
       - name: Package Rust client source
         run: |
           cd clients/rust
-          tar czf ../../release-assets/fastkv-client-rust-v0.1.0.tar.gz \
+          tar czf ../../release-assets/fastkv-client-rust-v${{ steps.ver.outputs.VER }}.tar.gz \
             --exclude='target' \
             --exclude='.git' \
             .
 
+      # ── Verify all assets ──────────────────────────────────────────────
       - name: List release assets
         run: |
           echo "=== Release assets ==="
@@ -268,14 +288,15 @@ jobs:
           echo "    fastkv-server-windows-amd64.exe"
           echo "    fastkv-server-darwin-arm64"
           echo "    fastkv-server-darwin-amd64"
-          echo "  Client libraries (7):"
-          echo "    fastkv-0.2.0-py3-none-any.whl"
-          echo "    fastkv-0.2.0.tar.gz"
-          echo "    fastkv-client-1.0.0.tgz"
-          echo "    fastkv-client-java-0.1.0.jar"
-          echo "    fastkv-client-go-v0.1.0.tar.gz"
-          echo "    fastkv-client-rust-v0.1.0.tar.gz"
+          echo "  Client libraries (6+):"
+          echo "    fastkv-*.whl"
+          echo "    fastkv-*.tar.gz"
+          echo "    fastkv-client-*.tgz"
+          echo "    fastkv-client-java-${{ steps.ver.outputs.VER }}.jar"
+          echo "    fastkv-client-go-v${{ steps.ver.outputs.VER }}.tar.gz"
+          echo "    fastkv-client-rust-v${{ steps.ver.outputs.VER }}.tar.gz"
 
+      # ── Create GitHub Release ──────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
