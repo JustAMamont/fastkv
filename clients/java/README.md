@@ -2,26 +2,51 @@
 
 Zero-dependency Java client for FastKV — a Redis-compatible key-value store speaking **RESP** over TCP.
 
-Uses only `java.net` and `java.io` from the JDK. No external libraries. Thread-safe (all commands are `synchronized`).
+Uses only `java.net` and `java.io` from the JDK. No external libraries. Available in sync and reactive variants.
 
 ## Quick Start
 
 ```bash
-javac -d target/classes src/main/java/com/fastkv/client/*.java
+javac -d target/classes src/*.java
 ```
+
+### Sync
 
 ```java
 import com.fastkv.client.FastKVClient;
 
-public class App {
-    public static void main(String[] args) throws Exception {
-        try (FastKVClient c = new FastKVClient("localhost", 6379)) {
-            c.set("hello", "world");
-            System.out.println(c.get("hello")); // world
-            System.out.println(c.ping());       // PONG
-        }
-    }
+try (FastKVClient c = new FastKVClient("localhost", 6379)) {
+    c.set("hello", "world");
+    System.out.println(c.get("hello")); // world
+    System.out.println(c.ping());       // PONG
 }
+```
+
+### Reactive
+
+```java
+import com.fastkv.client.FastKVReactiveClient;
+import java.util.concurrent.TimeUnit;
+
+try (FastKVReactiveClient c = new FastKVReactiveClient("localhost", 6379)) {
+    String pong = c.ping().get(5, TimeUnit.SECONDS);
+    c.set("key", "value")
+     .thenCompose(v -> c.get("key"))
+     .thenAccept(System.out::println)
+     .get(5, TimeUnit.SECONDS);
+}
+```
+
+Bridges to reactive frameworks:
+
+```java
+// Spring WebFlux / Project Reactor
+import reactor.core.publisher.Mono;
+Mono<String> pong = Mono.fromCompletionStage(client.ping());
+
+// RxJava 3
+import io.reactivex.rxjava3.core.Single;
+Single<String> pong = Single.fromFuture(client.ping());
 ```
 
 ## Constructor
@@ -148,14 +173,18 @@ try {
 
 | File | Description |
 |------|-------------|
-| `FastKVClient.java` | Main client |
+| `FastKVClient.java` | Synchronous client |
+| `FastKVReactiveClient.java` | Reactive client (CompletableFuture) |
 | `RespEncoder.java` | RESP encoder |
 | `RespDecoder.java` | RESP decoder |
-| `Pipeline.java` | Batched commands |
+| `Pipeline.java` | Sync pipeline |
+| `ReactivePipeline.java` | Reactive pipeline |
 | `FastKVException.java` | Base exception |
 | `FastKVConnectionException.java` | Connection error |
 | `FastKVResponseException.java` | Server error |
 | `Example.java` | Usage examples |
+| `IntegrationTest.java` | Sync tests (52) |
+| `IntegrationTestReactive.java` | Reactive tests (23) |
 
 ## Requirements
 

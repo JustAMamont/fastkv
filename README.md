@@ -64,13 +64,13 @@ PONG
 
 All clients speak RESP directly over TCP — no Redis SDK dependency required.
 
-| Language | Zero Dependencies | Pipeline | Directory |
-|----------|:-:|:-:|-----------|
-| **Rust** | tokio only | Yes | `clients/rust/` |
-| Go | stdlib only | Yes | `clients/go/fastkv/` |
-| Python | stdlib only | Yes | `clients/python/fastkv/` |
-| Java | JDK 8+ only | Yes | `clients/java/` |
-| Node.js | stdlib only | Yes | `clients/node/fastkv/` |
+| Language | Zero Dependencies | Pipeline | Async | Directory |
+|----------|:-:|:-:|:-:|-----------|
+| **Rust** | tokio only | Yes | native | `clients/rust/` |
+| Go | stdlib only | Yes | — | `clients/go/fastkv/` |
+| Python | stdlib only | Yes | asyncio | `clients/python/fastkv/` |
+| Java | JDK 8+ only | Yes | CompletableFuture | `clients/java/` |
+| Node.js | stdlib only | Yes | native | `clients/node/fastkv/` |
 
 See [`clients/README.md`](clients/README.md) for API reference and usage examples.
 
@@ -190,10 +190,12 @@ cargo test
 | Suite | Tests |
 |-------|------:|
 | Rust (server) | 122 |
-| Rust (client) | 25 |
-| Python | 27 |
-| Go | 37 |
-| Java | 52 |
+| Rust (client) | 23 |
+| Python sync | 27 |
+| Python async | 28 |
+| Go | 42 |
+| Java sync | 52 |
+| Java reactive | 23 |
 | Node.js | 51 |
 
 ## Benchmarks
@@ -238,12 +240,13 @@ fastkv/
 │   │   ├── integration_test.go       # Integration tests
 │   │   └── example_test.go           # Usage examples (go test)
 │   ├── python/
-│   │   ├── fastkv/                   # Package (client.py, resp.py, ...)
+│   │   ├── fastkv/                   # Package (client.py, async_client.py, ...)
 │   │   └── tests/
-│   │       ├── test_integration.py   # Integration tests
-│   │       └── example.py            # Usage example
+│   │       ├── test_integration.py       # Sync integration tests
+│   │       ├── test_async_integration.py # Async integration tests
+│   │       └── example.py                 # Usage example
 │   ├── java/
-│   │   └── src/*.java                 # Client + tests + examples
+│   │   └── src/*.java                 # Sync + reactive clients, pipelines, tests, examples
 │   └── node/fastkv/
 │       ├── client.js, resp.js, ...   # Client implementation
 │       └── tests/
@@ -271,7 +274,7 @@ LockFreeEntry (64-byte cache-line aligned)
 │  hash: AtomicU64        — 0 = empty         │
 │  key_len: AtomicU32                         │
 │  value_len: AtomicU32                       │
-│  version: AtomicU64     — optimistic reads  │
+│  version: AtomicU64     — optimistic reads   │
 │  data: [AtomicU8; 128]  — inline key+value  │
 └─────────────────────────────────────────────┘
 
@@ -285,10 +288,10 @@ Operations:
 ### WAL (Write-Ahead Log)
 
 ```
-┌─────────┬─────────┬─────────┬────────┬────┬──────┬────┬───────┐
-│ magic   │ version │ crc32c  │ op     │ kl │ key  │ vl │ value │
-│ 4 bytes │ 2 bytes │ 4 bytes │ 1 byte │ 2B │ kl B │ 2B │ vl B  │
-└─────────┴─────────┴─────────┴────────┴────┴──────┴────┴───────┘
+┌──────────┬──────────┬──────────┬────────┬────┬────────┬────┬────────┐
+│  magic   │  version │  crc32c  │  op    │ kl │  key   │ vl │  value │
+│  4 bytes │  2 bytes │  4 bytes │  1 byte│ 2B │ kl B   │ 2B │  vl B  │
+└──────────┴──────────┴──────────┴────────┴────┴────────┴────┴────────┘
 
 Fsync policies:  always (safest) | everysec (balanced) | never (fastest)
 
@@ -315,7 +318,7 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 - [x] Phase 4 — Expiration: EXPIRE/TTL/PTTL/PERSIST, lazy + active purging, WAL persistence
 - [x] Phase 5 — Hash: HSET/HGET/HDEL/HGETALL/HEXISTS/HLEN/HKEYS/HVALS/HMGET/HMSET
 - [x] Phase 6 — List: LPUSH/RPUSH, LPOP/RPOP, LRANGE/LLEN/LINDEX, LREM/LTRIM/LSET, WRONGTYPE
-- [x] Phase 7 — Client SDKs: Go, Python, Java, Node.js (zero-dependency, pipeline support)
+- [x] Phase 7 — Client SDKs: Go, Python (sync + async), Java (sync + reactive), Node.js, Rust (zero-dependency, pipeline support)
 - [ ] Phase 8 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
 - [ ] Phase 9 — Sorted Set: ZADD, ZREM, ZRANGE, ZSCORE, ZRANK, ZCARD
 - [ ] Phase 10 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), Lua scripting

@@ -51,7 +51,7 @@ func main() {
 }
 ```
 
-### Python
+### Python (sync)
 
 ```python
 from fastkv import FastKVClient
@@ -61,18 +61,42 @@ with FastKVClient("localhost", 6379) as c:
     print(c.get("greeting"))  # b"Hello, FastKV!"
 ```
 
-### Java
+### Python (async)
+
+```python
+import asyncio
+from fastkv import AsyncFastKVClient
+
+async def main():
+    async with AsyncFastKVClient("localhost", 6379) as c:
+        await c.set("greeting", "Hello, FastKV!")
+        print(await c.get("greeting"))  # b"Hello, FastKV!"
+
+asyncio.run(main())
+```
+
+### Java (sync)
 
 ```java
 import com.fastkv.client.FastKVClient;
 
-public class Example {
-    public static void main(String[] args) throws Exception {
-        try (FastKVClient c = new FastKVClient("localhost", 6379)) {
-            c.set("greeting", "Hello, FastKV!");
-            System.out.println(c.get("greeting")); // Hello, FastKV!
-        }
-    }
+try (FastKVClient c = new FastKVClient("localhost", 6379)) {
+    c.set("greeting", "Hello, FastKV!");
+    System.out.println(c.get("greeting")); // Hello, FastKV!
+}
+```
+
+### Java (reactive)
+
+```java
+import com.fastkv.client.FastKVReactiveClient;
+
+try (FastKVReactiveClient c = new FastKVReactiveClient("localhost", 6379)) {
+    String pong = c.ping().get(5, TimeUnit.SECONDS);
+    c.set("greeting", "Hello, FastKV!")
+     .thenCompose(v -> c.get("greeting"))
+     .thenAccept(System.out::println)
+     .get(5, TimeUnit.SECONDS);
 }
 ```
 
@@ -107,11 +131,21 @@ All clients support the same command set:
 
 **Pipeline:** Buffer multiple commands and execute in a single round-trip.
 
+## Async / Reactive Clients
+
+| Language | API Style | Class |
+|----------|-----------|-------|
+| Python | `async/await` + asyncio | `AsyncFastKVClient` |
+| Java | `CompletableFuture<T>` | `FastKVReactiveClient` |
+
+Both provide the same command set as their synchronous counterparts and support reactive pipelines. The Java reactive client bridges trivially to Project Reactor (`Mono.fromCompletionStage()`) and RxJava 3 (`Single.fromFuture()`).
+
 ## Design Principles
 
 - **No Redis dependency** — hand-rolled RESP protocol implementation
 - **Zero external deps** — only standard library
 - **Consistent API** — same method names across all languages
+- **Sync + Async** — blocking and non-blocking variants
 - **Pipeline support** — batch commands for maximum throughput
 
 ## Testing

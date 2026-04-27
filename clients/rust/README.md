@@ -15,7 +15,7 @@ use fastkv_client::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut c = Client::connect("127.0.0.1", 8379).await?;
+    let mut c = Client::connect("127.0.0.1", 6379).await?;
 
     c.set("hello", "world").await?;
     let val = c.get("hello").await?;
@@ -82,7 +82,7 @@ assert_eq!(res.string(3)?, Some("1".into()));
 ## Run Tests
 
 ```bash
-FASTKV_HOST=localhost FASTKV_PORT=8379 cargo test -- --test-threads=1
+FASTKV_HOST=localhost FASTKV_PORT=6379 cargo test -- --test-threads=1
 ```
 
 ## Run Example
@@ -90,3 +90,12 @@ FASTKV_HOST=localhost FASTKV_PORT=8379 cargo test -- --test-threads=1
 ```bash
 cargo run --example example
 ```
+
+## Requirements
+
+- Rust 1.85+
+- tokio
+
+## License
+
+MIT

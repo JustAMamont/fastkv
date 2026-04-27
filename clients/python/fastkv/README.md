@@ -101,6 +101,31 @@ with client.pipeline() as pipe:
     results = pipe.execute()  # [True, 2]
 ```
 
+## Async Client
+
+`AsyncFastKVClient` provides the same API over `asyncio`. All methods are `async` and return awaitables.
+
+```python
+import asyncio
+from fastkv import AsyncFastKVClient
+
+async def main():
+    async with AsyncFastKVClient("localhost", 6379) as c:
+        await c.set("greeting", "Hello, FastKV!")
+        print(await c.get("greeting"))  # b"Hello, FastKV!"
+
+        # Pipeline
+        async with c.pipeline() as pipe:
+            pipe.set("k1", "v1")
+            pipe.set("k2", "v2")
+            pipe.get("k1")
+            results = await pipe.execute()  # [True, True, b"v1"]
+
+asyncio.run(main())
+```
+
+The async client has the same method names and return types as the sync client, with all methods being `async`.
+
 ## Exceptions
 
 | Exception | Description |

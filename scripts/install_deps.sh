@@ -107,10 +107,10 @@ dl() {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 echo "╔═══════════════════════════════════════════════════════╗"
-echo "║  FastKV — Dependency Installer                        ║"
-echo "║  Package manager: ${PKG}                              ║"
-echo "║  User home: ${REAL_HOME}                              ║"
-echo "║  OS/Arch: ${OS}/${ARCH}                               ║"
+echo "║  FastKV — Dependency Installer                       ║"
+echo "║  Package manager: ${PKG}                               ║"
+echo "║  User home: ${REAL_HOME}                               ║"
+echo "║  OS/Arch: ${OS}/${ARCH}                              ║"
 echo "╚═══════════════════════════════════════════════════════╝"
 
 # ═══════════════════════════════════════════════════════════════════════════════
