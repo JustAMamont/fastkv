@@ -38,12 +38,29 @@ cargo build --release
 ### Run Server
 
 ```bash
-# Default (Tokio, cross-platform) — WAL + TTL + Lists enabled by default
-cargo run --release -- server 6379
+# Default — 0.0.0.0:6379, WAL in ./fastkv_data, fsync everysec
+fast_kv server
 
-# With io_uring (Linux only)
-cargo run --release --features io-uring -- server 6379 io_uring
+# Custom host, port, data dir, fsync policy
+fast_kv server --host 127.0.0.1 --port 6380 --dir /var/lib/fastkv --fsync always
+
+# With io_uring (Linux only, maximum throughput)
+cargo build --release --features io-uring
+fast_kv server --mode io_uring
+
+# Via environment variables
+FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_FSYNC=always fast_kv server
 ```
+
+#### Server Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host <addr>` | `0.0.0.0` | Bind address |
+| `--port <port>` | `6379` | Listen port |
+| `--dir <path>` | `./fastkv_data` | Data directory for WAL |
+| `--fsync <policy>` | `everysec` | WAL fsync: `always`, `everysec`, `never` |
+| `--mode <backend>` | `tokio` | Server backend: `tokio` or `io_uring` (Linux only) |
 
 ### Connect with redis-cli
 
@@ -60,34 +77,50 @@ OK
 PONG
 ```
 
-## Client Libraries
+## Installation
 
-All clients speak RESP directly over TCP — no Redis SDK dependency required.
+### Server Binaries
 
-| Language | Zero Dependencies | Pipeline | Async | Directory |
-|----------|:-:|:-:|:-:|-----------|
-| **Rust** | tokio only | Yes | native | `clients/rust/` |
-| Go | stdlib only | Yes | — | `clients/go/fastkv/` |
-| Python | stdlib only | Yes | asyncio | `clients/python/fastkv/` |
-| Java | JDK 8+ only | Yes | CompletableFuture | `clients/java/` |
-| Node.js | stdlib only | Yes | native | `clients/node/fastkv/` |
+Download from [GitHub Releases](https://github.com/fastkv/fastkv/releases):
 
-See [`clients/README.md`](clients/README.md) for API reference and usage examples.
+| File | Platform |
+|------|----------|
+| `fastkv-server-linux-amd64` | Linux x86_64 |
+| `fastkv-server-windows-amd64.exe` | Windows x86_64 |
+| `fastkv-server-darwin-arm64` | macOS Apple Silicon |
+| `fastkv-server-darwin-amd64` | macOS Intel |
+
+```bash
+# Linux / macOS
+chmod +x fastkv-server-linux-amd64
+./fastkv-server-linux-amd64 server --port 6379
+
+# Windows
+fastkv-server-windows-amd64.exe server --port 6379
+```
+
+### Client Libraries
+
+All clients are **libraries** that you import into your own project — they connect to a running FastKV server over TCP.
+
+| Language | Zero Dependencies | Pipeline | Async | Install |
+|----------|:-:|:-:|:-:|--------|
+| **Python** | stdlib only | Yes | asyncio | `pip install fastkv` or from `.whl` |
+| **Node.js** | stdlib only | Yes | native | `npm install fastkv-client-1.0.0.tgz` |
+| **Java** | JDK 8+ only | Yes | CompletableFuture | add `.jar` to classpath |
+| **Go** | stdlib only | Yes | — | `go get` or source tar.gz |
+| **Rust** | tokio only | Yes | native | `cargo add --path` or source tar.gz |
+
+See [`clients/README.md`](clients/README.md) for full API reference and usage examples.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `FASTKV_HOST` | `0.0.0.0` | Bind address (overridden by `--host`) |
+| `FASTKV_PORT` | `6379` | Listen port (overridden by `--port`) |
 | `FASTKV_DIR` | `./fastkv_data` | Directory for WAL file |
 | `FASTKV_FSYNC` | `everysec` | WAL fsync policy: `always`, `everysec`, or `never` |
-
-```bash
-# Strongest durability (fsync after every write)
-FASTKV_FSYNC=always cargo run --release -- server 6379
-
-# Maximum throughput (rely on OS page cache)
-FASTKV_FSYNC=never cargo run --release -- server 6379
-```
 
 ## Supported Commands
 

@@ -27,6 +27,7 @@ pub struct IoUringServer {
     wal: Option<Arc<Wal>>,
     expiry: Option<Arc<ExpirationManager>>,
     lists: Option<Arc<ListManager>>,
+    host: String,
     pub port: u16,
 }
 
@@ -38,6 +39,7 @@ impl IoUringServer {
             wal: None,
             expiry: None,
             lists: None,
+            host: "0.0.0.0".into(),
             port: DEFAULT_PORT,
         }
     }
@@ -49,6 +51,7 @@ impl IoUringServer {
             wal: None,
             expiry: None,
             lists: None,
+            host: "0.0.0.0".into(),
             port,
         }
     }
@@ -56,12 +59,13 @@ impl IoUringServer {
     /// Create a fully configured server.
     pub fn with_components(
         port: u16,
+        host: String,
         store: Arc<KvStore>,
         wal: Option<Arc<Wal>>,
         expiry: Option<Arc<ExpirationManager>>,
         lists: Option<Arc<ListManager>>,
     ) -> Self {
-        Self { store, wal, expiry, lists, port }
+        Self { store, wal, expiry, lists, host, port }
     }
 
     /// Block the calling thread running the io_uring event loop.
@@ -72,7 +76,7 @@ impl IoUringServer {
     async fn run_inner(&self) {
         use tokio_uring::net::TcpListener;
 
-        let addr: SocketAddr = format!("0.0.0.0:{}", self.port)
+        let addr: SocketAddr = format!("{}:{}", self.host, self.port)
             .parse()
             .expect("invalid address");
 

@@ -62,6 +62,8 @@ pub struct TokioServer {
     expiry: Option<Arc<ExpirationManager>>,
     /// Optional list manager.
     lists: Option<Arc<ListManager>>,
+    /// Host to bind to.
+    host: String,
     /// Port to listen on.
     pub port: u16,
 }
@@ -74,6 +76,7 @@ impl TokioServer {
             wal: None,
             expiry: None,
             lists: None,
+            host: "0.0.0.0".into(),
             port: DEFAULT_PORT,
         }
     }
@@ -85,6 +88,7 @@ impl TokioServer {
             wal: None,
             expiry: None,
             lists: None,
+            host: "0.0.0.0".into(),
             port,
         }
     }
@@ -92,12 +96,13 @@ impl TokioServer {
     /// Create a fully configured server.
     pub fn with_components(
         port: u16,
+        host: String,
         store: Arc<KvStore>,
         wal: Option<Arc<Wal>>,
         expiry: Option<Arc<ExpirationManager>>,
         lists: Option<Arc<ListManager>>,
     ) -> Self {
-        Self { store, wal, expiry, lists, port }
+        Self { store, wal, expiry, lists, host, port }
     }
 
     /// Clone the shared store reference.
@@ -107,7 +112,7 @@ impl TokioServer {
 
     /// Run the accept loop (async — call inside a Tokio runtime).
     pub async fn run(&self) {
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("{}:{}", self.host, self.port);
 
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,

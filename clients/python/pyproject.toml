@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastkv"
+version = "0.2.0"
+description = "Lightweight Python client for FastKV — a Redis-compatible KV store speaking RESP over TCP"
+readme = "fastkv/README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+keywords = ["fastkv", "redis", "resp", "kv", "client", "database"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/fastkv/fastkv"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fastkv*"]

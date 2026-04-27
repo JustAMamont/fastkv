@@ -16,95 +16,135 @@ use std::time::Instant;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    println!("FastKV v{} (Lock-Free Edition)", VERSION);
-    println!("==================================\n");
+    // No args or "help" — print usage
+    if args.len() < 2 || args[1] == "help" || args[1] == "--help" || args[1] == "-h" {
+        print_usage();
+        return;
+    }
 
-    if args.len() > 1 {
-        match args[1].as_str() {
-            "server" => run_server(&args[2..]),
-            "bench" => run_benchmark(),
-            "bench-threads" => run_threaded_benchmark(),
-            "test" => run_tests(),
-            "help" => print_help(),
-            _ => {
-                eprintln!("Unknown command: {}", args[1]);
-                print_help();
-            }
+    match args[1].as_str() {
+        "server" => run_server(&args[2..]),
+        "bench" => run_benchmark(),
+        "bench-threads" => run_threaded_benchmark(),
+        "test" => run_tests(),
+        _ => {
+            eprintln!("Unknown command: {}\n", args[1]);
+            print_usage();
         }
-    } else {
-        print_help();
     }
 }
 
-fn print_help() {
-    println!("Usage: fast_kv <command> [args]");
+fn print_usage() {
+    println!("FastKV v{} (Lock-Free Edition)", VERSION);
+    println!();
+    println!("Usage: fast_kv <command> [options]");
     println!();
     println!("Commands:");
-    println!("  server [port] [mode]       Start TCP server (default: 6379, tokio)");
-    println!("  bench                      Run single-threaded benchmark");
-    println!("  bench-threads              Run multi-threaded benchmark");
-    println!("  test                       Run quick smoke tests");
-    println!("  help                       Show this help");
+    println!("  server              Start FastKV server (default command if only flags given)");
+    println!("  bench                Run single-threaded benchmark");
+    println!("  bench-threads        Run multi-threaded benchmark");
+    println!("  test                 Run quick smoke tests");
+    println!("  help                 Show this help");
     println!();
-    println!("Server modes:");
-    println!("  tokio    - Cross-platform async (default)");
+    println!("Server options:");
+    println!("  --host <addr>        Bind address (default: 0.0.0.0)");
+    println!("  --port <port>        Listen port (default: 6379)");
+    println!("  --dir <path>         Data directory for WAL (default: ./fastkv_data)");
+    println!("  --fsync <policy>     fsync policy: always | everysec | never (default: everysec)");
+    println!("  --mode <backend>     Server backend: tokio (default)");
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    println!("  io_uring - Linux only, maximum performance");
+    println!("                       io_uring (Linux only, maximum performance)");
     println!();
-    println!("Environment variables:");
-    println!("  FASTKV_DIR       - Data directory for WAL (default: ./fastkv_data)");
-    println!("  FASTKV_FSYNC     - fsync policy: always | everysec | never (default: everysec)");
+    println!("Environment variables (override defaults):");
+    println!("  FASTKV_HOST          Bind address");
+    println!("  FASTKV_PORT          Listen port");
+    println!("  FASTKV_DIR           Data directory for WAL");
+    println!("  FASTKV_FSYNC         fsync policy: always | everysec | never");
     println!();
     println!("Examples:");
-    println!("  fast_kv server 6379                  # Tokio server with WAL + TTL");
-    println!("  FASTKV_FSYNC=always fast_kv server   # Strongest durability");
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    println!("  fast_kv server 6379 io_uring          # io_uring server");
+    println!("  fast_kv server                        # 0.0.0.0:6379, WAL in ./fastkv_data");
+    println!("  fast_kv server --port 6380             # custom port");
+    println!("  fast_kv server --host 127.0.0.1 --port 6380");
+    println!("  fast_kv server --dir /var/lib/fastkv --fsync always");
+    println!("  docker run -p 6379:6379 -v fastkv_data:/data ghcr.io/<user>/fastkv:latest");
     println!();
     println!("Features:");
     println!("  + Lock-free hash table");
     println!("  + Thread-safe (Send + Sync)");
     println!("  + Redis-compatible protocol (RESP)");
     println!("  + Pipeline support");
-    println!("  + WAL persistence (Phase 2)");
-    println!("  + String commands: INCR, MGET, APPEND, ... (Phase 3)");
-    println!("  + TTL / Expiration with active purging (Phase 4)");
+    println!("  + WAL persistence");
+    println!("  + String commands: INCR, MGET, APPEND, ...");
+    println!("  + TTL / Expiration with active purging");
 }
 
-/// Parse server arguments: `[port] [mode]`
+// ---------------------------------------------------------------------------
+// Flag parsing (zero external dependencies)
+// ---------------------------------------------------------------------------
+
+fn get_flag(args: &[String], name: &str) -> Option<String> {
+    let long = format!("--{}", name);
+    for i in 0..args.len() {
+        if args[i] == long {
+            return args.get(i + 1).cloned();
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
 fn run_server(args: &[String]) {
-    let port: u16 = args
-        .first()
+    // --- Parse flags, fall back to env vars, then defaults ---
+    let host = get_flag(args, "host")
+        .or_else(|| env::var("FASTKV_HOST").ok())
+        .unwrap_or_else(|| "0.0.0.0".into());
+
+    let port: u16 = get_flag(args, "port")
+        .or_else(|| env::var("FASTKV_PORT").ok())
         .and_then(|s| s.parse().ok())
         .unwrap_or(6379);
 
-    let mode = args
-        .get(1)
-        .map(|s| s.as_str())
-        .unwrap_or("tokio");
+    let data_dir = get_flag(args, "dir")
+        .or_else(|| env::var("FASTKV_DIR").ok())
+        .unwrap_or_else(|| "./fastkv_data".into());
 
-    // --- Data directory ---
-    let data_dir = env::var("FASTKV_DIR").unwrap_or_else(|_| "./fastkv_data".into());
-    std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
-        eprintln!("Warning: could not create data dir '{}': {}", data_dir, e);
-    });
+    let fsync_str = get_flag(args, "fsync")
+        .or_else(|| env::var("FASTKV_FSYNC").ok())
+        .unwrap_or_else(|| "everysec".into());
 
-    // --- WAL ---
-    let fsync_str = env::var("FASTKV_FSYNC").unwrap_or_else(|_| "everysec".into());
+    let mode = get_flag(args, "mode")
+        .unwrap_or_else(|| "tokio".into());
+
     let fsync_policy = match fsync_str.as_str() {
         "always" => FsyncPolicy::Always,
         "never" => FsyncPolicy::Never,
         _ => FsyncPolicy::EverySec,
     };
 
+    println!("FastKV v{} (Lock-Free Edition)", VERSION);
+    println!("  host:   {}", host);
+    println!("  port:   {}", port);
+    println!("  dir:    {}", data_dir);
+    println!("  fsync:  {:?}", fsync_policy);
+    println!("  mode:   {}", mode);
+
+    // --- Data directory ---
+    std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
+        eprintln!("Warning: could not create data dir '{}': {}", data_dir, e);
+    });
+
+    // --- WAL ---
     let wal_path = format!("{}/fastkv.wal", data_dir);
     let wal = match Wal::open(&wal_path, fsync_policy) {
         Ok(w) => {
-            println!("WAL: {} (fsync: {:?})", wal_path, fsync_policy);
+            println!("  WAL:    {} (fsync: {:?})", wal_path, fsync_policy);
             Some(Arc::new(w))
         }
         Err(e) => {
-            eprintln!("Warning: WAL disabled (open failed: {})", e);
+            eprintln!("  WAL:    disabled (open failed: {})", e);
             None
         }
     };
@@ -125,12 +165,8 @@ fn run_server(args: &[String]) {
         },
     )));
     let _expiry_handle = spawn_active_expiration(expiry.as_ref().unwrap().clone());
-    println!("Expiration: enabled (active purging)");
-    println!("Lists: enabled");
 
     // --- WAL recovery ---
-    // Recover and replay WAL entries exactly once.
-    // Phase 1: replay SET and DEL.
     if let Some(ref wal_arc) = wal {
         let entries = match Wal::recover(wal_arc.path()) {
             Ok(e) => e,
@@ -148,7 +184,7 @@ fn run_server(args: &[String]) {
         }
         if !entries.is_empty() {
             let set_del_count = entries.iter().filter(|e| e.op != WalOp::Expire).count();
-            println!("Replayed {} WAL entries (SET/DEL). Current DBSIZE: {}", set_del_count, store.len());
+            println!("  Recovered {} entries from WAL (DBSIZE: {})", set_del_count, store.len());
         }
 
         // Phase 2: replay EXPIRE entries (after all keys exist).
@@ -161,40 +197,42 @@ fn run_server(args: &[String]) {
                 exp.expire_at_deadline_ms(&entry.key, deadline_ms);
             }
             if !expire_entries.is_empty() {
-                println!("Restored {} TTL entries from WAL.", expire_entries.len());
+                println!("  Restored {} TTL entries from WAL", expire_entries.len());
             }
         }
     }
 
     println!();
 
-    match mode {
+    match mode.as_str() {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         "io_uring" => {
             use fast_kv::core::server::IoUringServer;
-            println!("Starting FastKV io_uring server on port {}...", port);
-            let server = IoUringServer::with_components(port, store, wal, expiry, lists);
+            println!("Starting FastKV io_uring server on {}:{}...", host, port);
+            let server = IoUringServer::with_components(port, host.clone(), store, wal, expiry, lists);
             server.run();
         }
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
         "io_uring" => {
             eprintln!("io_uring support not compiled in!");
-            eprintln!("Build with: cargo run --release --features io-uring -- server {} io_uring", port);
+            eprintln!("Build with: cargo run --release --features io-uring -- server --mode io_uring");
         }
         _ => {
             use fast_kv::core::server::TokioServer;
-            println!("Starting FastKV Tokio server on port {}...", port);
-            let server = TokioServer::with_components(port, store, wal, expiry, lists);
+            println!("Starting FastKV server on {}:{}...", host, port);
+            let server = TokioServer::with_components(port, host, store, wal, expiry, lists);
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(server.run());
         }
     }
 }
 
-/// Run a suite of smoke tests covering core operations, string commands,
-/// expiration, and multi-threaded correctness.
+// ---------------------------------------------------------------------------
+// Benchmarks & tests (unchanged)
+// ---------------------------------------------------------------------------
+
 fn run_tests() {
-    println!("Running smoke tests...\n");
+    println!("FastKV v{} — Running smoke tests...\n", VERSION);
 
     println!("Test 1: Basic operations (GET/SET/DEL)");
     let store = KvStore::new();
@@ -284,8 +322,6 @@ fn run_tests() {
     println!("\nAll tests passed!");
 }
 
-/// Run a single-threaded performance benchmark (SET, GET, INCR, EXISTS)
-/// and print throughput in ops/sec.
 fn run_benchmark() {
     println!("Running single-threaded benchmark...\n");
 
@@ -343,8 +379,6 @@ fn run_benchmark() {
         set_ops, get_ops, incr_ops, exists_ops);
 }
 
-/// Run a multi-threaded performance benchmark with varying thread counts
-/// (1, 2, 4, 8) and print SET/GET throughput in ops/sec.
 fn run_threaded_benchmark() {
     println!("Running multi-threaded benchmark...\n");
 
