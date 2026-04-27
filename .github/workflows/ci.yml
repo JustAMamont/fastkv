@@ -36,6 +36,14 @@ jobs:
         run: cargo build --release --features io-uring
       - name: Unit tests
         run: cargo test
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.os }}
+          path: |
+            target/release/fast_kv
+            target/release/fast_kv.exe
+          if-no-files-found: ignore
 
   # ──────────────────────────────────────
   # 2. Rust client
@@ -54,10 +62,19 @@ jobs:
         with:
           toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
+      - name: Download server
+        uses: actions/download-artifact@v4
+        with:
+          name: server-${{ matrix.os }}
+          path: target/release/
       - shell: bash
         run: |
-          cargo run --release -- server 6379 &
-          sleep 5
+          chmod +x target/release/fast_kv* 2>/dev/null || true
+          target/release/fast_kv server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 1
+          done
           cd clients/rust && cargo test -- --test-threads=1
 
   # ──────────────────────────────────────
@@ -72,10 +89,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.21"
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download server
+        uses: actions/download-artifact@v4
         with:
-          toolchain: "1.85"
-      - uses: Swatinem/rust-cache@v2
+          name: server-ubuntu-latest
+          path: target/release/
       - name: Cross-compile
         working-directory: clients/go/fastkv
         env:
@@ -93,8 +111,12 @@ jobs:
       - name: Test
         shell: bash
         run: |
-          cargo run --release -- server 6379 &
-          sleep 5
+          chmod +x target/release/fast_kv
+          target/release/fast_kv server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 1
+          done
           cd clients/go/fastkv && go test -v -count=1 -timeout 30s ./...
       - uses: actions/upload-artifact@v4
         with:
@@ -119,16 +141,21 @@ jobs:
         with:
           distribution: temurin
           java-version: "11"
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download server
+        uses: actions/download-artifact@v4
         with:
-          toolchain: "1.85"
-      - uses: Swatinem/rust-cache@v2
+          name: server-${{ matrix.os }}
+          path: target/release/
       - shell: bash
         run: |
           mkdir -p clients/java/target/classes
           javac -d clients/java/target/classes clients/java/src/*.java
-          cargo run --release -- server 6379 &
-          sleep 5
+          chmod +x target/release/fast_kv* 2>/dev/null || true
+          target/release/fast_kv server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 1
+          done
           java -Dfastkv.host=localhost -Dfastkv.port=6379 -cp clients/java/target/classes com.fastkv.client.IntegrationTest
           java -Dfastkv.host=localhost -Dfastkv.port=6379 -cp clients/java/target/classes com.fastkv.client.IntegrationTestReactive
 
@@ -148,14 +175,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download server
+        uses: actions/download-artifact@v4
         with:
-          toolchain: "1.85"
-      - uses: Swatinem/rust-cache@v2
+          name: server-${{ matrix.os }}
+          path: target/release/
       - shell: bash
         run: |
-          cargo run --release -- server 6379 &
-          sleep 5
+          chmod +x target/release/fast_kv* 2>/dev/null || true
+          target/release/fast_kv server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 1
+          done
           node clients/node/fastkv/tests/test_integration.js localhost 6379
 
   # ──────────────────────────────────────
@@ -175,17 +207,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download server
+        uses: actions/download-artifact@v4
         with:
-          toolchain: "1.85"
-      - uses: Swatinem/rust-cache@v2
+          name: server-${{ matrix.os }}
+          path: target/release/
       - shell: bash
         env:
           FASTKV_HOST: localhost
           FASTKV_PORT: "6379"
         run: |
-          cargo run --release -- server 6379 &
-          sleep 5
+          chmod +x target/release/fast_kv* 2>/dev/null || true
+          target/release/fast_kv server 6379 &
+          for i in $(seq 1 60); do
+            node -e "const s=require('net').createConnection(6379,'localhost',()=>{process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null && break
+            sleep 1
+          done
           python clients/python/tests/test_integration.py
           python clients/python/tests/test_async_integration.py
 
@@ -201,7 +238,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
