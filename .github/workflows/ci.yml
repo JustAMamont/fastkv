@@ -44,7 +44,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          # No go.sum in the module — disable cache to avoid warnings
           cache: false
 
       - uses: actions/setup-java@v4
@@ -56,12 +55,14 @@ jobs:
         with:
           node-version: '20'
 
-      # ── Integration tests (server + clients in ONE step) ───────────────
+      # ── Integration tests (server + ALL clients in ONE step) ───────────
       # CRITICAL: GitHub Actions kills background processes between steps.
       # Server start and ALL client tests MUST run in the same `run` block.
       - name: Run client integration tests
         shell: bash
         run: |
+          set +e
+
           # ── Start server ───────────────────────────────────────────────
           if [ -f "./target/release/fast_kv.exe" ]; then
             SERVER="./target/release/fast_kv.exe"
@@ -91,6 +92,10 @@ jobs:
             }
             check();
           "
+          if [ $? -ne 0 ]; then
+            echo "ERROR: Server did not start"
+            exit 1
+          fi
 
           # ── Export env for all clients ──────────────────────────────────
           export FASTKV_HOST="$FASTKV_HOST"
@@ -102,41 +107,54 @@ jobs:
           # ── Python sync ────────────────────────────────────────────────
           echo ""
           echo "========== Python (sync) =========="
-          python clients/python/tests/test_integration.py || FAILED=1
+          python clients/python/tests/test_integration.py
+          if [ $? -ne 0 ]; then FAILED=1; fi
 
           # ── Python async ────────────────────────────────────────────────
           echo ""
           echo "========== Python (async) =========="
-          python clients/python/tests/test_async_integration.py || FAILED=1
+          python clients/python/tests/test_async_integration.py
+          if [ $? -ne 0 ]; then FAILED=1; fi
 
           # ── Go ──────────────────────────────────────────────────────────
           echo ""
           echo "========== Go =========="
-          (cd clients/go/fastkv && go test -v -count=1 -timeout 60s -run '^Test' ./...) || FAILED=1
+          (cd clients/go/fastkv && go test -v -count=1 -timeout 60s -run '^Test' ./...)
+          if [ $? -ne 0 ]; then FAILED=1; fi
 
           # ── Java ────────────────────────────────────────────────────────
           echo ""
           echo "========== Java =========="
           mkdir -p clients/java/target/test-classes
-          find clients/java/src -name '*.java' | xargs javac -encoding UTF-8 -d clients/java/target/test-classes
-          java -Dfastkv.host="$FASTKV_HOST" -Dfastkv.port="$FASTKV_PORT" \
-               -cp clients/java/target/test-classes \
-               com.fastkv.client.IntegrationTest || FAILED=1
+          # Use bash glob instead of `find | xargs` (Windows `find` is a different command)
+          javac -encoding UTF-8 -d clients/java/target/test-classes clients/java/src/*.java
+          if [ $? -ne 0 ]; then FAILED=1; fi
+          if [ "$FAILED" -eq 0 ]; then
+            java -Dfastkv.host="$FASTKV_HOST" -Dfastkv.port="$FASTKV_PORT" \
+                 -cp clients/java/target/test-classes \
+                 com.fastkv.client.IntegrationTest
+            if [ $? -ne 0 ]; then FAILED=1; fi
+          else
+            echo "SKIP Java tests (compilation failed)"
+          fi
 
           # ── Node.js ─────────────────────────────────────────────────────
           echo ""
           echo "========== Node.js =========="
-          node clients/node/fastkv/tests/test_integration.js "$FASTKV_HOST" "$FASTKV_PORT" || FAILED=1
+          node clients/node/fastkv/tests/test_integration.js "$FASTKV_HOST" "$FASTKV_PORT"
+          if [ $? -ne 0 ]; then FAILED=1; fi
 
           # ── Rust client ─────────────────────────────────────────────────
           echo ""
           echo "========== Rust client =========="
-          (cd clients/rust && cargo test -- --test-threads=1) || FAILED=1
+          (cd clients/rust && cargo test -- --test-threads=1)
+          if [ $? -ne 0 ]; then FAILED=1; fi
 
           # ── Summary ─────────────────────────────────────────────────────
           echo ""
           if [ "$FAILED" -eq 0 ]; then
             echo "========== ALL TESTS PASSED =========="
+            exit 0
           else
             echo "========== SOME TESTS FAILED =========="
             exit 1
@@ -173,12 +191,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-
-      # ── Install Rust + cross-compilation targets ───────────────────────
       - uses: dtolnay/rust-toolchain@stable
+
+      # ── Install cross-compilation target ───────────────────────────────
       - run: rustup target add x86_64-apple-darwin
 
       # ── Download native server binaries from test jobs ─────────────────
@@ -193,19 +208,6 @@ jobs:
         run: |
           cargo build --release --target x86_64-apple-darwin
           cp target/x86_64-apple-darwin/release/fast_kv release-assets/fastkv-server-darwin-amd64
-
-      # ── Cross-compile: Go client for all platforms ─────────────────────
-      - name: Build Go client (all platforms)
-        env:
-          CGO_ENABLED: "0"
-        run: |
-          cd clients/go/fastkv
-          GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o ../../release-assets/fastkv-go-linux-amd64 .
-          GOOS=linux   GOARCH=arm64 go build -ldflags="-s -w" -o ../../release-assets/fastkv-go-linux-arm64 .
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ../../release-assets/fastkv-go-windows-amd64.exe .
-          GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o ../../release-assets/fastkv-go-windows-arm64.exe .
-          GOOS=darwin  GOARCH=amd64 go build -ldflags="-s -w" -o ../../release-assets/fastkv-go-darwin-amd64 .
-          GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o ../../release-assets/fastkv-go-darwin-arm64 .
 
       # ── Verify ─────────────────────────────────────────────────────────
       - name: List release assets
