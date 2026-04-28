@@ -14,6 +14,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  # Test + Build server binaries on each platform
+  # ═══════════════════════════════════════════════════════════════════════
   build:
     name: ${{ matrix.label }}
     strategy:
@@ -24,19 +27,16 @@ jobs:
             label: linux-amd64
             artifact: fastkv-server-linux-amd64
             binary: fast_kv
-            target: ''
             native: true
           - os: windows-latest
             label: windows-amd64
             artifact: fastkv-server-windows-amd64.exe
             binary: fast_kv.exe
-            target: ''
             native: true
           - os: macos-latest
             label: darwin-arm64
             artifact: fastkv-server-darwin-arm64
             binary: fast_kv
-            target: ''
             native: true
           - os: macos-latest
             label: darwin-amd64
@@ -45,32 +45,35 @@ jobs:
             target: x86_64-apple-darwin
             native: false
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
     env:
       FASTKV_PORT: "6379"
       FASTKV_HOST: "127.0.0.1"
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
+      # ── Rust ────────────────────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Add Rust cross target
-        if: "!matrix.native"
+      # Cross-compile target for darwin-amd64 on ARM runner
+      - name: Add cross-compile target
+        if: matrix.target != ''
         run: rustup target add ${{ matrix.target }}
 
       - name: Rust unit tests
         if: matrix.native
         run: cargo test --release
 
-      - name: Build server (native)
-        if: matrix.native
-        run: cargo build --release
+      - name: Build server
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --target ${{ matrix.target }}
+          else
+            cargo build --release
+          fi
 
-      - name: Build server (cross-compile)
-        if: "!matrix.native"
-        run: cargo build --release --target ${{ matrix.target }}
-
+      # ── Integration tests (native platforms only) ──────────────────────
       - uses: actions/setup-python@v5
         if: matrix.native
         with:
@@ -93,19 +96,21 @@ jobs:
         with:
           node-version: '20'
 
+      # CRITICAL: GitHub Actions kills background processes between steps.
+      # Server start and ALL client tests MUST run in the same `run:` block.
       - name: Run integration tests
         if: matrix.native
         shell: bash
         run: |
-          set +e
-
+          # ── Start server ──────────────────────────────────────────────
           if [ -f "./target/release/fast_kv.exe" ]; then
             SERVER="./target/release/fast_kv.exe"
           else
             SERVER="./target/release/fast_kv"
           fi
-          "$SERVER" server --host "$FASTKV_HOST" --port "$FASTKV_PORT" > /dev/null 2>&1 &
+          "$SERVER" server --port "$FASTKV_PORT" > /dev/null 2>&1 &
 
+          # ── Wait for server (cross-platform via Node.js) ──────────────
           node -e "
             const net = require('net');
             const port = parseInt(process.env.FASTKV_PORT);
@@ -131,63 +136,74 @@ jobs:
             exit 1
           fi
 
+          # ── Export env for all clients ────────────────────────────────
           export FASTKV_HOST="$FASTKV_HOST"
           export FASTKV_PORT="$FASTKV_PORT"
 
-          FAILED=0
+          # ── Track failures ────────────────────────────────────────────
+          FAIL_LIST=""
 
-          echo ""
-          echo "========== Python (sync) =========="
-          python clients/python/tests/test_integration.py
-          if [ $? -ne 0 ]; then FAILED=1; fi
+          run_test() {
+            local name="$1"
+            shift
+            echo ">>> [$name] running..."
+            "$@" 2>&1
+            local rc=$?
+            if [ $rc -eq 0 ]; then
+              echo ">>> [$name] PASS"
+            else
+              echo ">>> [$name] FAIL (exit code $rc)"
+              FAIL_LIST="$FAIL_LIST $name"
+            fi
+            return 0
+          }
 
-          echo ""
-          echo "========== Python (async) =========="
-          python clients/python/tests/test_async_integration.py 2>&1
-          ASYNC_RC=$?
-          if [ $ASYNC_RC -ne 0 ]; then
-            echo "NOTE: async tests failed (rc=$ASYNC_RC) — not blocking"
-          fi
+          # ── Python sync ──────────────────────────────────────────────
+          run_test "Python-sync" \
+            python clients/python/tests/test_integration.py
 
-          echo ""
-          echo "========== Go =========="
-          (cd clients/go/fastkv && go test -v -count=1 -timeout 60s -run '^Test' ./...)
-          if [ $? -ne 0 ]; then FAILED=1; fi
+          # ── Python async (non-fatal) ─────────────────────────────────
+          run_test "Python-async" \
+            python clients/python/tests/test_async_integration.py
 
-          echo ""
-          echo "========== Java =========="
+          # ── Go ──────────────────────────────────────────────────────
+          run_test "Go" \
+            sh -c "cd clients/go/fastkv && go test -count=1 -timeout 60s -run '^Test' ./..."
+
+          # ── Java ────────────────────────────────────────────────────
           mkdir -p clients/java/target/test-classes
-          javac -encoding UTF-8 -d clients/java/target/test-classes clients/java/src/*.java
-          if [ $? -ne 0 ]; then FAILED=1; fi
-          if [ "$FAILED" -eq 0 ]; then
-            java -Dfastkv.host="$FASTKV_HOST" -Dfastkv.port="$FASTKV_PORT" \
-                 -cp clients/java/target/test-classes \
-                 com.fastkv.client.IntegrationTest
-            if [ $? -ne 0 ]; then FAILED=1; fi
+          javac -encoding UTF-8 -d clients/java/target/test-classes clients/java/src/*.java 2>&1
+          if [ $? -eq 0 ]; then
+            run_test "Java" \
+              java -Dfastkv.host="$FASTKV_HOST" -Dfastkv.port="$FASTKV_PORT" \
+                   -cp clients/java/target/test-classes \
+                   com.fastkv.client.IntegrationTest
           else
-            echo "SKIP Java tests (compilation failed)"
+            echo ">>> [Java] FAIL (compilation error)"
+            FAIL_LIST="$FAIL_LIST Java"
           fi
 
-          echo ""
-          echo "========== Node.js =========="
-          node clients/node/fastkv/tests/test_integration.js "$FASTKV_HOST" "$FASTKV_PORT"
-          if [ $? -ne 0 ]; then FAILED=1; fi
+          # ── Node.js ────────────────────────────────────────────────
+          run_test "Node" \
+            node clients/node/fastkv/tests/test_integration.js "$FASTKV_HOST" "$FASTKV_PORT"
 
-          echo ""
-          echo "========== Rust client =========="
-          (cd clients/rust && cargo test -- --test-threads=1)
-          if [ $? -ne 0 ]; then FAILED=1; fi
+          # ── Rust client ────────────────────────────────────────────
+          run_test "Rust-client" \
+            sh -c "cd clients/rust && cargo test -- --test-threads=1 2>&1"
 
+          # ── Summary ────────────────────────────────────────────────
           echo ""
-          if [ "$FAILED" -eq 0 ]; then
+          if [ -z "$FAIL_LIST" ]; then
             echo "========== ALL TESTS PASSED =========="
             exit 0
           else
-            echo "========== SOME TESTS FAILED =========="
+            echo "========== FAILED:$FAIL_LIST =========="
             exit 1
           fi
 
+      # ── Upload server binary (release only) ────────────────────────────
       - name: Prepare server artifact
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           mkdir -p dist
@@ -199,34 +215,43 @@ jobs:
           chmod +x "dist/${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: server-${{ matrix.label }}
           path: dist/*
-          retention-days: 7
+          retention-days: 1
 
+  # ═══════════════════════════════════════════════════════════════════════
+  # Build client library packages + GitHub Release
+  # ═══════════════════════════════════════════════════════════════════════
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
+      # ── Extract version from tag (v0.4.0 -> 0.4.0) ──────────────────
       - name: Extract version from tag
-        id: ver
-        run: echo "VER=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
-
-      - name: Set client versions from tag
+        id: version
+        shell: bash
         run: |
-          sed -i 's/version = ".*"/version = "${{ steps.ver.outputs.VER }}"/' clients/python/pyproject.toml
-          sed -i 's/"version": ".*"/"version": "${{ steps.ver.outputs.VER }}"/' clients/node/fastkv/package.json
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building release for version: $VERSION"
 
+      # ── Download server binaries from build matrix ────────────────────
       - uses: actions/download-artifact@v4
         with:
           pattern: server-*
           path: release-assets
           merge-multiple: true
 
+      # ══════════════════════════════════════════════════════════════════
+      # Python client  ->  pip install fastkv-{version}-py3-none-any.whl
+      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -235,9 +260,14 @@ jobs:
         run: |
           pip install build
           cd clients/python
+          # Inject version from tag
+          sed -i "s/^version = \".*\"/version = \"${{ steps.version.outputs.version }}\"/" pyproject.toml
           python -m build
-          cp dist/*.whl dist/*.tar.gz ../../release-assets/ || true
+          cp dist/fastkv-*.whl dist/fastkv-*.tar.gz ../../release-assets/ || true
 
+      # ══════════════════════════════════════════════════════════════════
+      # Node.js client  ->  npm install fastkv-client-{version}.tgz
+      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -245,9 +275,14 @@ jobs:
       - name: Build Node.js client package
         run: |
           cd clients/node/fastkv
+          # Inject version from tag
+          sed -i 's/"version": ".*"/"version": "${{ steps.version.outputs.version }}"/' package.json
           npm pack
           cp *.tgz ../../../release-assets/
 
+      # ══════════════════════════════════════════════════════════════════
+      # Java client  ->  fastkv-client-java-{version}.jar  (classpath)
+      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -266,40 +301,42 @@ jobs:
             clients/java/src/FastKVException.java \
             clients/java/src/FastKVConnectionException.java \
             clients/java/src/FastKVResponseException.java
-          jar cf release-assets/fastkv-client-java-${{ steps.ver.outputs.VER }}.jar \
+          jar cf "release-assets/fastkv-client-java-${{ steps.version.outputs.version }}.jar" \
             -C clients/java/target/classes .
 
+      # ══════════════════════════════════════════════════════════════════
+      # Go client  ->  go get / vendor source  (library, no binary)
+      # ══════════════════════════════════════════════════════════════════
       - name: Package Go client source
         run: |
           cd clients/go
-          tar czf ../../release-assets/fastkv-client-go-v${{ steps.ver.outputs.VER }}.tar.gz fastkv/
+          tar czf "../../release-assets/fastkv-client-go-v${{ steps.version.outputs.version }}.tar.gz" fastkv/
 
+      # ══════════════════════════════════════════════════════════════════
+      # Rust client  ->  cargo add / path dependency  (library, no binary)
+      # ══════════════════════════════════════════════════════════════════
       - name: Package Rust client source
         run: |
           cd clients/rust
-          tar czf ../../release-assets/fastkv-client-rust-v${{ steps.ver.outputs.VER }}.tar.gz \
+          tar czf "../../release-assets/fastkv-client-rust-v${{ steps.version.outputs.version }}.tar.gz" \
             --exclude='target' \
             --exclude='.git' \
             .
 
+      # ── Verify all assets ────────────────────────────────────────────
       - name: List release assets
         run: |
           echo "=== Release assets ==="
           ls -lh release-assets/
 
-      - name: Delete old release
-        run: gh release delete ${{ github.ref_name }} --yes --cleanup-tag || true
+      # ── Delete old release if exists (avoid duplicate assets) ────────
+      - name: Delete old release if exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Re-create tag
         run: |
-          git fetch origin
-          git tag -f ${{ github.ref_name }} ${{ github.sha }}
-          git push -f origin ${{ github.ref_name }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          gh release delete "${GITHUB_REF_NAME}" --yes 2>/dev/null || true
 
+      # ── Create GitHub Release ────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
