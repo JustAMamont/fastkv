@@ -15,9 +15,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ═══════════════════════════════════════════════════════════════════════
-  # Test + Build server binaries on each platform
-  # ═══════════════════════════════════════════════════════════════════════
   build:
     name: ${{ matrix.label }}
     strategy:
@@ -28,18 +25,26 @@ jobs:
             label: linux-amd64
             artifact: fastkv-server-linux-amd64
             binary: fast_kv
+            target: ''
+            native: true
           - os: windows-latest
             label: windows-amd64
             artifact: fastkv-server-windows-amd64.exe
             binary: fast_kv.exe
+            target: ''
+            native: true
           - os: macos-latest
             label: darwin-arm64
             artifact: fastkv-server-darwin-arm64
             binary: fast_kv
-          - os: macos-13
+            target: ''
+            native: true
+          - os: macos-latest
             label: darwin-amd64
             artifact: fastkv-server-darwin-amd64
             binary: fast_kv
+            target: x86_64-apple-darwin
+            native: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -48,44 +53,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── Rust ────────────────────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Add Rust cross target
+        if: "!matrix.native"
+        run: rustup target add ${{ matrix.target }}
+
       - name: Rust unit tests
+        if: matrix.native
         run: cargo test --release
 
-      - name: Build server
+      - name: Build server (native)
+        if: matrix.native
         run: cargo build --release
 
-      # ── Language runtimes for integration tests ─────────────────────────
+      - name: Build server (cross-compile)
+        if: "!matrix.native"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ── Integration tests — native builds only ──────────────────────
       - uses: actions/setup-python@v5
+        if: matrix.native
         with:
           python-version: '3.12'
 
       - uses: actions/setup-go@v5
+        if: matrix.native
         with:
           go-version: '1.21'
           cache: false
 
       - uses: actions/setup-java@v4
+        if: matrix.native
         with:
           distribution: temurin
           java-version: '17'
 
       - uses: actions/setup-node@v4
+        if: matrix.native
         with:
           node-version: '20'
 
-      # ── Integration tests (server + ALL clients in ONE step) ────────────
-      # CRITICAL: GitHub Actions kills background processes between steps.
-      # Server start and ALL client tests MUST run in the same `run:` block.
       - name: Run integration tests
+        if: matrix.native
         shell: bash
         run: |
           set +e
 
-          # ── Start server using --host / --port flags ────────────────────
           if [ -f "./target/release/fast_kv.exe" ]; then
             SERVER="./target/release/fast_kv.exe"
           else
@@ -93,7 +108,6 @@ jobs:
           fi
           "$SERVER" server --host "$FASTKV_HOST" --port "$FASTKV_PORT" > /dev/null 2>&1 &
 
-          # ── Wait for server (cross-platform via Node.js) ─────────────────
           node -e "
             const net = require('net');
             const port = parseInt(process.env.FASTKV_PORT);
@@ -119,19 +133,18 @@ jobs:
             exit 1
           fi
 
-          # ── Export env for all clients ──────────────────────────────────
           export FASTKV_HOST="$FASTKV_HOST"
           export FASTKV_PORT="$FASTKV_PORT"
 
           FAILED=0
 
-          # ── Python (sync) ───────────────────────────────────────────────
+          # ── Python (sync) ─────────────────────────────────────────────
           echo ""
           echo "========== Python (sync) =========="
           python clients/python/tests/test_integration.py
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Python (async) — non-fatal on some platforms ────────────────
+          # ── Python (async) — non-fatal ────────────────────────────────
           echo ""
           echo "========== Python (async) =========="
           python clients/python/tests/test_async_integration.py 2>&1
@@ -140,13 +153,13 @@ jobs:
             echo "NOTE: async tests failed (rc=$ASYNC_RC) — not blocking"
           fi
 
-          # ── Go ──────────────────────────────────────────────────────────
+          # ── Go ────────────────────────────────────────────────────────
           echo ""
           echo "========== Go =========="
           (cd clients/go/fastkv && go test -v -count=1 -timeout 60s -run '^Test' ./...)
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Java ────────────────────────────────────────────────────────
+          # ── Java ──────────────────────────────────────────────────────
           echo ""
           echo "========== Java =========="
           mkdir -p clients/java/target/test-classes
@@ -161,19 +174,19 @@ jobs:
             echo "SKIP Java tests (compilation failed)"
           fi
 
-          # ── Node.js ─────────────────────────────────────────────────────
+          # ── Node.js ───────────────────────────────────────────────────
           echo ""
           echo "========== Node.js =========="
           node clients/node/fastkv/tests/test_integration.js "$FASTKV_HOST" "$FASTKV_PORT"
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Rust client ─────────────────────────────────────────────────
+          # ── Rust client ───────────────────────────────────────────────
           echo ""
           echo "========== Rust client =========="
           (cd clients/rust && cargo test -- --test-threads=1)
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Summary ─────────────────────────────────────────────────────
+          # ── Summary ───────────────────────────────────────────────────
           echo ""
           if [ "$FAILED" -eq 0 ]; then
             echo "========== ALL TESTS PASSED =========="
@@ -183,13 +196,17 @@ jobs:
             exit 1
           fi
 
-      # ── Upload server binary (release only) ────────────────────────────
+      # ── Upload server binary (release only) ──────────────────────────
       - name: Prepare server artifact
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.artifact }}"
+          if [ -n "${{ matrix.target }}" ]; then
+            cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.artifact }}"
+          else
+            cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.artifact }}"
+          fi
           chmod +x "dist/${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
@@ -215,7 +232,6 @@ jobs:
         id: ver
         run: echo "VER=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
-      # ── Download server binaries from build matrix ─────────────────────
       - uses: actions/download-artifact@v4
         with:
           pattern: server-*
