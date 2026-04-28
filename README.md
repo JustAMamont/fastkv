@@ -105,7 +105,7 @@ All clients are **libraries** that you import into your own project — they con
 
 | Language | Zero Dependencies | Pipeline | Async | Install |
 |----------|:-:|:-:|:-:|--------|
-| **Python** | stdlib only | Yes | asyncio | `pip install fastkv-{version}-py3-none-any.whl` |
+| **Python** | stdlib only | Yes | asyncio | `pip install git+https://github.com/JustAMamont/fastkv.git#subdirectory=clients/python` |
 | **Node.js** | stdlib only | Yes | native | `npm install fastkv-client-{version}.tgz` |
 | **Java** | JDK 8+ only | Yes | CompletableFuture | add `fastkv-client-java-{version}.jar` to classpath |
 | **Go** | stdlib only | Yes | — | download & vendor `fastkv-client-go-v{version}.tar.gz` |

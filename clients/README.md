@@ -10,7 +10,7 @@ All clients implement the RESP protocol from scratch over TCP. **No Redis SDK de
 
 | Language | Dependencies | Pipeline | Async | Install from Release |
 |----------|:------------:|:--------:|:-----:|---------------------|
-| **Python** | stdlib only | Yes | asyncio | `pip install fastkv-{version}-py3-none-any.whl` |
+| **Python** | stdlib only | Yes | asyncio | `pip install git+https://...fastkv.git#subdirectory=clients/python` |
 | **Node.js** | stdlib only | Yes | native | `npm install fastkv-client-{version}.tgz` |
 | **Java** | JDK 8+ only | Yes | CompletableFuture | add `fastkv-client-java-{version}.jar` to classpath |
 | **Go** | stdlib only | Yes | — | vendor `fastkv-client-go-v{version}.tar.gz` |
@@ -25,13 +25,10 @@ All clients are **libraries** — you import them into your project, they connec
 ### Installation
 
 ```bash
-# Option 1: from GitHub Release
-pip install fastkv-{version}-py3-none-any.whl
+# From GitHub
+pip install git+https://github.com/JustAMamont/fastkv.git#subdirectory=clients/python
 
-# Option 2: download from releases page
-# https://github.com/JustAMamont/fastkv/releases
-
-# Option 3: from source
+# Or from source
 cd clients/python
 pip install .
 ```

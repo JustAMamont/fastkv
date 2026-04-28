@@ -7,10 +7,7 @@ Implements the RESP protocol from scratch using only Python's built-in `socket` 
 ## Installation
 
 ```bash
-# From GitHub Release
-pip install fastkv-{version}-py3-none-any.whl
-
-# Or download from https://github.com/JustAMamont/fastkv/releases
+pip install git+https://github.com/JustAMamont/fastkv.git#subdirectory=clients/python
 ```
 
 ## Quick Start
