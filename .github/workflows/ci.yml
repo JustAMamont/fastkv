@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
     tags: ['v*']
   pull_request:
     branches: [main, master]
@@ -207,7 +206,6 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
