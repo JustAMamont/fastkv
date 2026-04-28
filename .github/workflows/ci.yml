@@ -289,6 +289,19 @@ jobs:
           echo "=== Release assets ==="
           ls -lh release-assets/
 
+      - name: Delete old release
+        run: gh release delete ${{ github.ref_name }} --yes --cleanup-tag || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-create tag
+        run: |
+          git fetch origin
+          git tag -f ${{ github.ref_name }} ${{ github.sha }}
+          git push -f origin ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
