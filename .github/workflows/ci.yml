@@ -66,6 +66,7 @@ jobs:
         run: cargo test --release
 
       - name: Build server
+        shell: bash
         run: |
           if [ -n "${{ matrix.target }}" ]; then
             cargo build --release --target ${{ matrix.target }}
@@ -342,4 +343,3 @@ jobs:
         with:
           files: release-assets/*
           generate_release_notes: true
-
