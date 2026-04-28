@@ -342,3 +342,4 @@ jobs:
         with:
           files: release-assets/*
           generate_release_notes: true
+
