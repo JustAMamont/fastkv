@@ -72,7 +72,6 @@ jobs:
         if: "!matrix.native"
         run: cargo build --release --target ${{ matrix.target }}
 
-      # ── Integration tests — native builds only ──────────────────────
       - uses: actions/setup-python@v5
         if: matrix.native
         with:
@@ -138,13 +137,11 @@ jobs:
 
           FAILED=0
 
-          # ── Python (sync) ─────────────────────────────────────────────
           echo ""
           echo "========== Python (sync) =========="
           python clients/python/tests/test_integration.py
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Python (async) — non-fatal ────────────────────────────────
           echo ""
           echo "========== Python (async) =========="
           python clients/python/tests/test_async_integration.py 2>&1
@@ -153,13 +150,11 @@ jobs:
             echo "NOTE: async tests failed (rc=$ASYNC_RC) — not blocking"
           fi
 
-          # ── Go ────────────────────────────────────────────────────────
           echo ""
           echo "========== Go =========="
           (cd clients/go/fastkv && go test -v -count=1 -timeout 60s -run '^Test' ./...)
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Java ──────────────────────────────────────────────────────
           echo ""
           echo "========== Java =========="
           mkdir -p clients/java/target/test-classes
@@ -174,19 +169,16 @@ jobs:
             echo "SKIP Java tests (compilation failed)"
           fi
 
-          # ── Node.js ───────────────────────────────────────────────────
           echo ""
           echo "========== Node.js =========="
           node clients/node/fastkv/tests/test_integration.js "$FASTKV_HOST" "$FASTKV_PORT"
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Rust client ───────────────────────────────────────────────
           echo ""
           echo "========== Rust client =========="
           (cd clients/rust && cargo test -- --test-threads=1)
           if [ $? -ne 0 ]; then FAILED=1; fi
 
-          # ── Summary ───────────────────────────────────────────────────
           echo ""
           if [ "$FAILED" -eq 0 ]; then
             echo "========== ALL TESTS PASSED =========="
@@ -196,9 +188,7 @@ jobs:
             exit 1
           fi
 
-      # ── Upload server binary (release only) ──────────────────────────
       - name: Prepare server artifact
-        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           mkdir -p dist
@@ -210,15 +200,11 @@ jobs:
           chmod +x "dist/${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
-        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: server-${{ matrix.label }}
           path: dist/*
-          retention-days: 1
+          retention-days: 7
 
-  # ═══════════════════════════════════════════════════════════════════════
-  # Build client library packages + GitHub Release
-  # ═══════════════════════════════════════════════════════════════════════
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
@@ -238,9 +224,6 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      # ══════════════════════════════════════════════════════════════════
-      # Python client  ->  pip install fastkv
-      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -252,9 +235,6 @@ jobs:
           python -m build
           cp dist/*.whl dist/*.tar.gz ../../release-assets/ || true
 
-      # ══════════════════════════════════════════════════════════════════
-      # Node.js client  ->  npm install fastkv-client
-      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -265,9 +245,6 @@ jobs:
           npm pack
           cp *.tgz ../../../release-assets/
 
-      # ══════════════════════════════════════════════════════════════════
-      # Java client  ->  fastkv-client-java.jar
-      # ══════════════════════════════════════════════════════════════════
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -289,17 +266,11 @@ jobs:
           jar cf release-assets/fastkv-client-java-${{ steps.ver.outputs.VER }}.jar \
             -C clients/java/target/classes .
 
-      # ══════════════════════════════════════════════════════════════════
-      # Go client  ->  go get / vendor source
-      # ══════════════════════════════════════════════════════════════════
       - name: Package Go client source
         run: |
           cd clients/go
           tar czf ../../release-assets/fastkv-client-go-v${{ steps.ver.outputs.VER }}.tar.gz fastkv/
 
-      # ══════════════════════════════════════════════════════════════════
-      # Rust client  ->  cargo add / path dependency
-      # ══════════════════════════════════════════════════════════════════
       - name: Package Rust client source
         run: |
           cd clients/rust
@@ -308,27 +279,11 @@ jobs:
             --exclude='.git' \
             .
 
-      # ── Verify all assets ──────────────────────────────────────────────
       - name: List release assets
         run: |
           echo "=== Release assets ==="
           ls -lh release-assets/
-          echo ""
-          echo "=== Expected files ==="
-          echo "  Server binaries (4):"
-          echo "    fastkv-server-linux-amd64"
-          echo "    fastkv-server-windows-amd64.exe"
-          echo "    fastkv-server-darwin-arm64"
-          echo "    fastkv-server-darwin-amd64"
-          echo "  Client libraries (6+):"
-          echo "    fastkv-*.whl"
-          echo "    fastkv-*.tar.gz"
-          echo "    fastkv-client-*.tgz"
-          echo "    fastkv-client-java-${{ steps.ver.outputs.VER }}.jar"
-          echo "    fastkv-client-go-v${{ steps.ver.outputs.VER }}.tar.gz"
-          echo "    fastkv-client-rust-v${{ steps.ver.outputs.VER }}.tar.gz"
 
-      # ── Create GitHub Release ──────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
