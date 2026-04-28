@@ -7,7 +7,13 @@ Built entirely on `net` and `events` from the Node.js standard library. No iored
 ## Install
 
 ```bash
-npm install fastkv-client
+npm install https://github.com/JustAMamont/fastkv/releases/download/v{version}/fastkv-client-{version}.tgz
+```
+
+Or download `fastkv-client-{version}.tgz` from [GitHub Releases](https://github.com/JustAMamont/fastkv/releases) and install locally:
+
+```bash
+npm install ./fastkv-client-{version}.tgz
 ```
 
 ## Quick Start

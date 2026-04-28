@@ -4,7 +4,7 @@ import (
         "fmt"
         "log"
 
-        "github.com/fastkv/fastkv"
+        "github.com/JustAMamont/fastkv"
 )
 // Example_basicSetGet demonstrates basic SET and GET operations.
 func Example_basicSetGet() {

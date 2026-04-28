@@ -15,7 +15,15 @@ Implements the full RESP protocol using only Go standard library packages. No th
 ## Installation
 
 ```bash
-go get github.com/fastkv/fastkv
+# From GitHub Release — vendor in your project
+mkdir -p vendor/github.com/JustAMamont/fastkv
+tar xzf fastkv-client-go-v{version}.tar.gz -C vendor/github.com/JustAMamont/fastkv --strip-components=1
+
+# Download from https://github.com/JustAMamont/fastkv/releases
+```
+
+```go
+import "github.com/JustAMamont/fastkv"
 ```
 
 ## Quick Start
@@ -26,7 +34,7 @@ package main
 import (
     "fmt"
     "log"
-    "github.com/fastkv/fastkv"
+    "github.com/JustAMamont/fastkv"
 )
 
 func main() {

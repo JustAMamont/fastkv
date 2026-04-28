@@ -6,8 +6,23 @@ Uses only `java.net` and `java.io` from the JDK. No external libraries. Availabl
 
 ## Quick Start
 
+### Installation
+
 ```bash
-javac -d target/classes src/*.java
+# Download fastkv-client-java-{version}.jar from GitHub Releases
+# https://github.com/JustAMamont/fastkv/releases
+
+# Compile & run with jar on classpath
+javac -cp fastkv-client-java-{version}.jar:. MyApp.java
+java -cp fastkv-client-java-{version}.jar:. MyApp
+
+# Or install to local Maven repo
+mvn install:install-file \
+    -Dfile=fastkv-client-java-{version}.jar \
+    -DgroupId=com.fastkv \
+    -DartifactId=fastkv-client \
+    -Dversion={version} \
+    -Dpackaging=jar
 ```
 
 ### Sync

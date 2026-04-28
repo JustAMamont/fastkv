@@ -81,7 +81,7 @@ PONG
 
 ### Server Binaries
 
-Download from [GitHub Releases](https://github.com/fastkv/fastkv/releases):
+Download from [GitHub Releases](https://github.com/JustAMamont/fastkv/releases):
 
 | File | Platform |
 |------|----------|
@@ -105,11 +105,11 @@ All clients are **libraries** that you import into your own project — they con
 
 | Language | Zero Dependencies | Pipeline | Async | Install |
 |----------|:-:|:-:|:-:|--------|
-| **Python** | stdlib only | Yes | asyncio | `pip install fastkv` or from `.whl` |
-| **Node.js** | stdlib only | Yes | native | `npm install fastkv-client-1.0.0.tgz` |
-| **Java** | JDK 8+ only | Yes | CompletableFuture | add `.jar` to classpath |
-| **Go** | stdlib only | Yes | — | `go get` or source tar.gz |
-| **Rust** | tokio only | Yes | native | `cargo add --path` or source tar.gz |
+| **Python** | stdlib only | Yes | asyncio | `pip install fastkv-{version}-py3-none-any.whl` |
+| **Node.js** | stdlib only | Yes | native | `npm install fastkv-client-{version}.tgz` |
+| **Java** | JDK 8+ only | Yes | CompletableFuture | add `fastkv-client-java-{version}.jar` to classpath |
+| **Go** | stdlib only | Yes | — | download & vendor `fastkv-client-go-v{version}.tar.gz` |
+| **Rust** | tokio only | Yes | native | download & add `fastkv-client-rust-v{version}.tar.gz` |
 
 See [`clients/README.md`](clients/README.md) for full API reference and usage examples.
 

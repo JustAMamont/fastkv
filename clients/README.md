@@ -10,11 +10,11 @@ All clients implement the RESP protocol from scratch over TCP. **No Redis SDK de
 
 | Language | Dependencies | Pipeline | Async | Install from Release |
 |----------|:------------:|:--------:|:-----:|---------------------|
-| **Python** | stdlib only | Yes | asyncio | `pip install fastkv-0.2.0-py3-none-any.whl` |
-| **Node.js** | stdlib only | Yes | native | `npm install fastkv-client-1.0.0.tgz` |
-| **Java** | JDK 8+ only | Yes | CompletableFuture | add `fastkv-client-java-0.1.0.jar` to classpath |
-| **Go** | stdlib only | Yes | — | extract `fastkv-client-go-v0.1.0.tar.gz` |
-| **Rust** | tokio only | Yes | native | extract `fastkv-client-rust-v0.1.0.tar.gz` |
+| **Python** | stdlib only | Yes | asyncio | `pip install fastkv-{version}-py3-none-any.whl` |
+| **Node.js** | stdlib only | Yes | native | `npm install fastkv-client-{version}.tgz` |
+| **Java** | JDK 8+ only | Yes | CompletableFuture | add `fastkv-client-java-{version}.jar` to classpath |
+| **Go** | stdlib only | Yes | — | vendor `fastkv-client-go-v{version}.tar.gz` |
+| **Rust** | tokio only | Yes | native | extract `fastkv-client-rust-v{version}.tar.gz` |
 
 All clients are **libraries** — you import them into your project, they connect to a running FastKV server over TCP.
 
@@ -25,11 +25,11 @@ All clients are **libraries** — you import them into your project, they connec
 ### Installation
 
 ```bash
-# Option 1: from PyPI (when published)
-pip install fastkv
+# Option 1: from GitHub Release
+pip install fastkv-{version}-py3-none-any.whl
 
-# Option 2: from release .whl file
-pip install fastkv-0.2.0-py3-none-any.whl
+# Option 2: download from releases page
+# https://github.com/JustAMamont/fastkv/releases
 
 # Option 3: from source
 cd clients/python
@@ -118,10 +118,13 @@ def get_user(request, user_id):
 ### Installation
 
 ```bash
-# Option 1: from release tarball
-npm install fastkv-client-1.0.0.tgz
+# Option 1: from GitHub Release
+npm install fastkv-client-{version}.tgz
 
-# Option 2: from local source
+# Option 2: download from releases page
+# https://github.com/JustAMamont/fastkv/releases
+
+# Option 3: from local source
 npm install ./clients/node/fastkv
 ```
 
@@ -201,11 +204,14 @@ start();
 ### Installation
 
 ```bash
-# Option 1: from release jar — add to classpath
-javac -cp fastkv-client-java-0.1.0.jar:. MyApp.java
-java -cp fastkv-client-java-0.1.0.jar:. MyApp
+# Option 1: from GitHub Release — add to classpath
+javac -cp fastkv-client-java-{version}.jar:. MyApp.java
+java -cp fastkv-client-java-{version}.jar:. MyApp
 
-# Option 2: from source
+# Option 2: download from releases page
+# https://github.com/JustAMamont/fastkv/releases
+
+# Option 3: from source
 cd clients/java
 javac -encoding UTF-8 -d out src/FastKVClient.java src/Pipeline.java \
     src/RespEncoder.java src/RespDecoder.java src/FastKV*.java
@@ -216,10 +222,10 @@ jar cf fastkv-client.jar -C out .
 
 ```bash
 mvn install:install-file \
-    -Dfile=fastkv-client-java-0.1.0.jar \
+    -Dfile=fastkv-client-java-{version}.jar \
     -DgroupId=com.fastkv \
     -DartifactId=fastkv-client \
-    -Dversion=0.1.0 \
+    -Dversion={version} \
     -Dpackaging=jar
 ```
 
@@ -228,7 +234,7 @@ mvn install:install-file \
 <dependency>
     <groupId>com.fastkv</groupId>
     <artifactId>fastkv-client</artifactId>
-    <version>0.1.0</version>
+    <version>{version}</version>
 </dependency>
 ```
 
@@ -303,16 +309,15 @@ try (FastKVReactiveClient c = new FastKVReactiveClient("localhost", 6379)) {
 ### Installation
 
 ```bash
-# Option 1: go get (when published)
-go get github.com/fastkv/fastkv
+# Option 1: from GitHub Release — vendor in your project
+mkdir -p vendor/github.com/JustAMamont/fastkv
+tar xzf fastkv-client-go-v{version}.tar.gz -C vendor/github.com/JustAMamont/fastkv --strip-components=1
 
-# Option 2: from release tarball
-tar xzf fastkv-client-go-v0.1.0.tar.gz
-cp -r fastkv/ $GOPATH/src/github.com/fastkv/fastkv/
+# Option 2: download from releases page
+# https://github.com/JustAMamont/fastkv/releases
 
-# Option 3: vendor in your project
-mkdir -p vendor/github.com/fastkv/fastkv
-tar xzf fastkv-client-go-v0.1.0.tar.gz -C vendor/github.com/fastkv/fastkv --strip-components=1
+# Option 3: from source (clone repo)
+cp -r clients/go/fastkv/ vendor/github.com/JustAMamont/fastkv/
 ```
 
 ### Basic Usage
@@ -324,7 +329,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/fastkv/fastkv"
+    "github.com/JustAMamont/fastkv"
 )
 
 func main() {
@@ -376,7 +381,7 @@ package main
 
 import (
     "net/http"
-    "github.com/fastkv/fastkv"
+    "github.com/JustAMamont/fastkv"
 )
 
 var kv *fastkv.Client
@@ -406,14 +411,16 @@ func main() {
 ### Installation
 
 ```bash
-# Option 1: from release tarball
-tar xzf fastkv-client-rust-v0.1.0.tar.gz
-cd fastkv-client-rust
-# Add as path dependency in your Cargo.toml:
+# Option 1: from GitHub Release
+mkdir -p fastkv-client && tar xzf fastkv-client-rust-v{version}.tar.gz -C fastkv-client
+# Then add as path dependency in Cargo.toml:
 # [dependencies]
-# fastkv-client = { path = "../fastkv-client-rust" }
+# fastkv-client = { path = "../fastkv-client" }
 
-# Option 2: from source
+# Option 2: download from releases page
+# https://github.com/JustAMamont/fastkv/releases
+
+# Option 3: from source (clone repo)
 cd clients/rust
 # In your project: cargo add --path ../clients/rust
 ```
@@ -422,7 +429,7 @@ cd clients/rust
 
 ```toml
 [dependencies]
-fastkv-client = { path = "../fastkv-client-rust" }
+fastkv-client = { path = "../fastkv-client" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

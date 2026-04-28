@@ -2,12 +2,21 @@
 
 Async FastKV client built on tokio.
 
+## Installation
+
+```bash
+# From GitHub Release
+mkdir -p fastkv-client && tar xzf fastkv-client-rust-v{version}.tar.gz -C fastkv-client
+
+# Download from https://github.com/JustAMamont/fastkv/releases
+```
+
 ## Usage
 
 ```toml
 # Cargo.toml
 [dependencies]
-fastkv-client = { path = "../clients/rust" }
+fastkv-client = { path = "../fastkv-client" }
 ```
 
 ```rust

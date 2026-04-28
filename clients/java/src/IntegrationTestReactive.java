@@ -13,15 +13,12 @@ import java.util.concurrent.TimeoutException;
  * Same coverage as {@link IntegrationTest} but exercises the
  * {@link FastKVReactiveClient} (CompletableFuture-based) API.
  * <p>
- * Run:  java -Dfastkv.host=127.0.0.1 -Dfastkv.port=6379 com.fastkv.client.IntegrationTestReactive
+ * Run:  java -Dfastkv.host=localhost -Dfastkv.port=8379 com.fastkv.client.IntegrationTestReactive
  */
 public class IntegrationTestReactive {
 
-    private static final String HOST = System.getProperty("fastkv.host",
-            System.getenv().getOrDefault("FASTKV_HOST", "127.0.0.1"));
-    private static final int    PORT = Integer.parseInt(System.getProperty("fastkv.port",
-            System.getenv().getOrDefault("FASTKV_PORT", "6379")));
-
+    private static final String HOST = System.getProperty("fastkv.host", "localhost");
+    private static final int    PORT = Integer.getInteger("fastkv.port", 8379);
     private static final long   TIMEOUT_MS = 5_000;
 
     private static int passed = 0;

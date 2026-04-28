@@ -24,7 +24,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/fastkv/fastkv"
+Homepage = "https://github.com/JustAMamont/fastkv"
 
 [tool.setuptools.packages.find]
 where = ["."]

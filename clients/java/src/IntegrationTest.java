@@ -15,10 +15,8 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class IntegrationTest {
 
-    private static final String HOST = System.getProperty("fastkv.host",
-            System.getenv().getOrDefault("FASTKV_HOST", "127.0.0.1"));
-    private static final int PORT = Integer.parseInt(System.getProperty("fastkv.port",
-            System.getenv().getOrDefault("FASTKV_PORT", "6379")));
+    private static final String HOST = System.getProperty("fastkv.host", "localhost");
+    private static final int PORT = Integer.parseInt(System.getProperty("fastkv.port", "8379"));
 
     private static int passed = 0;
     private static int failed = 0;

@@ -19,7 +19,7 @@ from fastkv.async_client import FastKVAsyncClient
 from fastkv.exceptions import FastKVResponseError
 
 HOST = os.environ.get("FASTKV_HOST", "localhost")
-PORT = int(os.environ.get("FASTKV_PORT", "6379"))
+PORT = int(os.environ.get("FASTKV_PORT", "8379"))
 
 passed = 0
 failed = 0
