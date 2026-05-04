@@ -167,7 +167,8 @@ jobs:
           run_test "Python-async" \
             python clients/python/tests/test_async_integration.py
 
-          # ── Go ──────────────────────────────────────────────────────
+          # ── Go (needs FASTKV_ADDR, not FASTKV_HOST/PORT) ───────────
+          export FASTKV_ADDR="${FASTKV_HOST}:${FASTKV_PORT}"
           run_test "Go" \
             sh -c "cd clients/go/fastkv && go test -count=1 -timeout 60s -run '^Test' ./..."
 
