@@ -1,9 +1,9 @@
 //! List data type operations.
 //!
 //! Lists are stored in a separate `HashMap` (protected by `Mutex`) since they
-//! can grow beyond the KV store's `INLINE_SIZE` (64 bytes). A sentinel value
-//! (`0xFE` magic byte) is stored in the KV store to mark list-type keys so
-//! that `GET` / `SET` on a list key returns `WRONGTYPE`.
+//! can grow beyond the KV store's inline size. A sentinel value (`0xFE` magic
+//! byte) is stored in the KV store to mark list-type keys so that `GET` /
+//! `SET` on a list key returns `WRONGTYPE`.
 //!
 //! Lists are **not** persisted to WAL — they are purely in-memory. This is
 //! suitable for ephemeral data such as matchmaking queues.
@@ -16,7 +16,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use crate::core::kv::KvStore;
+use crate::core::kv::{DEFAULT_INLINE_SIZE, KvStoreLockFree};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -24,6 +24,19 @@ use crate::core::kv::KvStore;
 
 /// Magic byte prefix identifying a list-type value in the KV store.
 pub const LIST_MAGIC: u8 = 0xFE;
+
+// ---------------------------------------------------------------------------
+// Free helpers (not on ListManager — avoids turbofish issues)
+// ---------------------------------------------------------------------------
+
+/// Check whether a raw KV-store value is a list sentinel.
+///
+/// This is a **free function** rather than a method on [`ListManager`] so that
+/// callers do not need to spell out the const-generic parameter `N`.
+#[inline]
+pub fn is_list_value(data: &[u8]) -> bool {
+    data.len() == 1 && data[0] == LIST_MAGIC
+}
 
 // ---------------------------------------------------------------------------
 // ListManager
@@ -38,18 +51,18 @@ pub const LIST_MAGIC: u8 = 0xFE;
 /// Thread safety is provided by a `Mutex` around the inner `HashMap`.  List
 /// operations are orders of magnitude less frequent than raw `GET`/`SET`, so
 /// contention is negligible.
-pub struct ListManager {
+pub struct ListManager<const N: usize = DEFAULT_INLINE_SIZE> {
     lists: Mutex<HashMap<Vec<u8>, VecDeque<Vec<u8>>>>,
-    store: Arc<KvStore>,
+    store: Arc<KvStoreLockFree<N>>,
 }
 
 // SAFETY: all fields are `Send + Sync`.
-unsafe impl Send for ListManager {}
-unsafe impl Sync for ListManager {}
+unsafe impl<const N: usize> Send for ListManager<N> {}
+unsafe impl<const N: usize> Sync for ListManager<N> {}
 
-impl ListManager {
+impl<const N: usize> ListManager<N> {
     /// Create a new list manager backed by *store*.
-    pub fn new(store: Arc<KvStore>) -> Self {
+    pub fn new(store: Arc<KvStoreLockFree<N>>) -> Self {
         Self {
             lists: Mutex::new(HashMap::new()),
             store,
@@ -59,12 +72,6 @@ impl ListManager {
     // -----------------------------------------------------------------------
     // Query helpers
     // -----------------------------------------------------------------------
-
-    /// Check whether a raw KV-store value is a list sentinel.
-    #[inline]
-    pub fn is_list_value(data: &[u8]) -> bool {
-        data.len() == 1 && data[0] == LIST_MAGIC
-    }
 
     /// Return the number of keys that currently hold a list.
     pub fn len(&self) -> usize {
@@ -322,7 +329,7 @@ impl ListManager {
     /// Check that *key* either doesn't exist or already holds a list.
     fn check_type(&self, key: &[u8]) -> Result<(), ListError> {
         if let Some(val) = self.store.get(key) {
-            if !Self::is_list_value(&val) {
+            if !is_list_value(&val) {
                 return Err(ListError::WrongType);
             }
         }
@@ -407,17 +414,18 @@ fn normalize_index(idx: i64, len: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::kv::DEFAULT_INLINE_SIZE;
 
-    fn make_manager() -> ListManager {
-        ListManager::new(Arc::new(KvStore::with_capacity(100)))
+    fn make_manager() -> ListManager<DEFAULT_INLINE_SIZE> {
+        ListManager::new(Arc::new(KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100)))
     }
 
     #[test]
     fn test_is_list_value() {
-        assert!(ListManager::is_list_value(&[0xFE]));
-        assert!(!ListManager::is_list_value(&[0xFF]));
-        assert!(!ListManager::is_list_value(b"hello"));
-        assert!(!ListManager::is_list_value(b""));
+        assert!(is_list_value(&[0xFE]));
+        assert!(!is_list_value(&[0xFF]));
+        assert!(!is_list_value(b"hello"));
+        assert!(!is_list_value(b""));
     }
 
     #[test]

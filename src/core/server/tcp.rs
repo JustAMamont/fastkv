@@ -14,7 +14,7 @@
 use crate::core::hash::{self, HashDelResult, WRONGTYPE_ERR};
 use crate::core::kv::{IncrError, KvStore};
 use crate::core::expiration::ExpirationManager;
-use crate::core::list::ListManager;
+use crate::core::list::{self, ListManager};
 use crate::core::resp::{write_usize_buf, RespEncoder, RespParser};
 use crate::core::wal::Wal;
 use std::sync::Arc;
@@ -451,7 +451,7 @@ fn cmd_get(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<
     }
 
     match ctx.store.get(key) {
-        Some(v) if hash::is_hash_value(&v) || ListManager::is_list_value(&v) => {
+        Some(v) if hash::is_hash_value(&v) || list::is_list_value(&v) => {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
         }
         Some(v) => RespEncoder::write_bulk_string(out, &v),
@@ -508,7 +508,7 @@ fn cmd_set(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<
 
     // If the key held a list, clean up the list data.
     if let Some(lists) = ctx.lists {
-        if ListManager::is_list_value(&ctx.store.get(key).unwrap_or_default()) {
+        if list::is_list_value(&ctx.store.get(key).unwrap_or_default()) {
             lists.remove_key(key);
         }
     }
@@ -606,7 +606,7 @@ fn cmd_incr(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 
     // Check type: INCR only works on plain string keys.
     if let Some(val) = ctx.store.get(key) {
-        if hash::is_hash_value(&val) || ListManager::is_list_value(&val) {
+        if hash::is_hash_value(&val) || list::is_list_value(&val) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -675,7 +675,7 @@ fn cmd_append(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
     let (Some(key), Some(suffix)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
 
     if let Some(current) = ctx.store.get(key) {
-        if hash::is_hash_value(&current) || ListManager::is_list_value(&current) {
+        if hash::is_hash_value(&current) || list::is_list_value(&current) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -711,7 +711,7 @@ fn cmd_strlen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
     }
 
     if let Some(v) = ctx.store.get(key) {
-        if hash::is_hash_value(&v) || ListManager::is_list_value(&v) {
+        if hash::is_hash_value(&v) || list::is_list_value(&v) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -734,7 +734,7 @@ fn cmd_getrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut
     }
 
     if let Some(v) = ctx.store.get(key) {
-        if hash::is_hash_value(&v) || ListManager::is_list_value(&v) {
+        if hash::is_hash_value(&v) || list::is_list_value(&v) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -754,7 +754,7 @@ fn cmd_setrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut
     };
 
     if let Some(v) = ctx.store.get(key) {
-        if hash::is_hash_value(&v) || ListManager::is_list_value(&v) {
+        if hash::is_hash_value(&v) || list::is_list_value(&v) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -796,7 +796,7 @@ fn cmd_mget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
     out.extend_from_slice(b"\r\n");
     for val in &values {
         match val {
-            Some(v) if hash::is_hash_value(v) || ListManager::is_list_value(v) => {
+            Some(v) if hash::is_hash_value(v) || list::is_list_value(v) => {
                 // In Redis MGET, WRONGTYPE is not returned per-element; nil is returned.
                 RespEncoder::write_null(out);
             }
@@ -999,7 +999,7 @@ fn cmd_hset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
             }
             Err(hash::HashError::NotAHash) => {
                 // Also reject if it's a list.
-                if ListManager::is_list_value(&current) {
+                if list::is_list_value(&current) {
                     RespEncoder::write_error(out, WRONGTYPE_ERR);
                     return;
                 }
@@ -1303,7 +1303,7 @@ fn cmd_lpop(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 
     // Check type: LPOP only works on list keys (or missing keys → nil).
     if let Some(val) = ctx.store.get(key) {
-        if !ListManager::is_list_value(&val) {
+        if !list::is_list_value(&val) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -1342,7 +1342,7 @@ fn cmd_rpop(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 
     // Check type: RPOP only works on list keys (or missing keys → nil).
     if let Some(val) = ctx.store.get(key) {
-        if !ListManager::is_list_value(&val) {
+        if !list::is_list_value(&val) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }
@@ -1403,7 +1403,7 @@ fn cmd_llen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 
     // Check type: LLEN only works on list keys (or missing keys → 0).
     if let Some(val) = ctx.store.get(key) {
-        if !ListManager::is_list_value(&val) {
+        if !list::is_list_value(&val) {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
             return;
         }

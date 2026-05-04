@@ -5,6 +5,7 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 ## Features
 
 - **Lock-free hash table** — thread-safe without mutexes; uses atomic CAS and optimistic version reads
+- **Configurable inline size** — const-generic `KvStoreLockFree<N>` (default 64 bytes per side); use `KvStoreLockFree<128>` for larger keys/values
 - **Redis-compatible RESP protocol** — works with `redis-cli` and any Redis-compatible tooling
 - **Pipeline support** — batch multiple commands in a single round-trip for higher throughput
 - **WAL persistence** — crash-consistent write-ahead log with configurable fsync policy and TTL recovery
@@ -78,6 +79,28 @@ PONG
 ```
 
 ## Installation
+
+### As a Library
+
+```toml
+# Cargo.toml
+[dependencies]
+fast_kv = "0.4"
+```
+
+```rust
+use fast_kv::KvStore;
+
+// Default: 64-byte inline storage per side (key + value independently)
+let store = KvStore::new();
+store.set(b"hello", b"world");
+assert_eq!(store.get(b"hello"), Some(b"world".to_vec()));
+
+// Custom inline size for larger keys/values (no heap allocation)
+use fast_kv::KvStoreLockFree;
+let store: KvStoreLockFree<128> = KvStoreLockFree::new();
+store.set(&[0u8; 100], &[0u8; 100]); // up to 128 bytes each
+```
 
 ### Server Binaries
 
@@ -302,18 +325,27 @@ fastkv/
 ### Lock-free Hash Table
 
 ```
-LockFreeEntry (64-byte cache-line aligned)
-┌─────────────────────────────────────────────┐
-│  hash: AtomicU64        — 0 = empty         │
-│  key_len: AtomicU32                         │
-│  value_len: AtomicU32                       │
-│  version: AtomicU64     — optimistic reads  │
-│  data: [AtomicU8; 128]  — inline key+value  │
-└─────────────────────────────────────────────┘
+LockFreeEntry<const N: usize>  (cache-line aligned, 64 B)
+┌──────────────────────────────────────────────┐
+│  hash: AtomicU64         — 0 = empty        │
+│  key_len: AtomicU32                          │
+│  value_len: AtomicU32                        │
+│  version: AtomicU64      — optimistic reads  │
+│  data: [[AtomicU8; N]; 2]                    │
+│         ↑ keys         ↑ values             │
+│         └──── N bytes each ────┘             │
+└──────────────────────────────────────────────┘
+
+  Default N = 64  (DEFAULT_INLINE_SIZE)
+  Both key and value may be up to N bytes.
+  Keys/values exceeding N are rejected — no heap fallback.
+
+  KvStore = KvStoreLockFree<64>   (type alias)
+  Custom:  KvStoreLockFree<128>, KvStoreLockFree<256>, etc.
 
 Operations:
   SET  — CAS (Compare-And-Swap) for lock-free insertion
-  GET  — Optimistic read with version check
+  GET  — Optimistic read with version check (retry up to 3x)
   DEL  — Atomic hash reset
   INCR — CAS loop on version for atomic read-modify-write
 ```

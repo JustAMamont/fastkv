@@ -50,7 +50,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::core::kv::KvStore;
+use crate::core::kv::{DEFAULT_INLINE_SIZE, KvStoreLockFree};
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -73,27 +73,27 @@ pub const ACTIVE_EXPIRY_MAX_KEYS: usize = 200;
 /// expiry, and the fast-path of `check_and_purge_if_expired`) can proceed
 /// concurrently.  Writers (`expire`, `remove`, `persist`) acquire exclusive
 /// access only when actually mutating the map.
-pub struct ExpirationManager {
+pub struct ExpirationManager<const N: usize = DEFAULT_INLINE_SIZE> {
     /// Maps `key -> absolute deadline (Instant)`.
     deadlines: RwLock<HashMap<Vec<u8>, Instant>>,
     /// Signals the background thread to shut down.
     shutdown: AtomicBool,
     /// Reference to the KV store so we can delete expired keys.
-    store: Arc<KvStore>,
+    store: Arc<KvStoreLockFree<N>>,
     /// Optional callback invoked when a key is expired and deleted.
     on_expire: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
 }
 
 // SAFETY: all fields are `Send + Sync`.
-unsafe impl Send for ExpirationManager {}
-unsafe impl Sync for ExpirationManager {}
+unsafe impl<const N: usize> Send for ExpirationManager<N> {}
+unsafe impl<const N: usize> Sync for ExpirationManager<N> {}
 
-impl ExpirationManager {
+impl<const N: usize> ExpirationManager<N> {
     /// Create a new expiration manager backed by *store*.
     ///
     /// The background active-expiration thread is **not** started
     /// automatically; call [`spawn_active_expiration`] explicitly.
-    pub fn new(store: Arc<KvStore>) -> Self {
+    pub fn new(store: Arc<KvStoreLockFree<N>>) -> Self {
         Self {
             deadlines: RwLock::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
@@ -110,7 +110,7 @@ impl ExpirationManager {
     /// components (e.g. `ListManager`) to clean up auxiliary data when a
     /// key expires.
     pub fn with_on_expire(
-        store: Arc<KvStore>,
+        store: Arc<KvStoreLockFree<N>>,
         on_expire: Arc<dyn Fn(&[u8]) + Send + Sync>,
     ) -> Self {
         Self {
@@ -405,7 +405,7 @@ impl ExpirationManager {
     }
 }
 
-impl Drop for ExpirationManager {
+impl<const N: usize> Drop for ExpirationManager<N> {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
@@ -421,7 +421,7 @@ impl Drop for ExpirationManager {
 /// [`JoinHandle`] can be used to wait for the thread to finish (it exits
 /// only when [`ExpirationManager::shutdown`] is called or the manager is
 /// dropped).
-pub fn spawn_active_expiration(mgr: Arc<ExpirationManager>) -> thread::JoinHandle<()> {
+pub fn spawn_active_expiration<const N: usize>(mgr: Arc<ExpirationManager<N>>) -> thread::JoinHandle<()> {
     mgr.shutdown.store(false, Ordering::Relaxed);
     thread::Builder::new()
         .name("fastkv-expiry".into())
@@ -445,12 +445,15 @@ pub fn spawn_active_expiration(mgr: Arc<ExpirationManager>) -> thread::JoinHandl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::kv::DEFAULT_INLINE_SIZE;
     use std::thread;
     use std::time::Duration;
 
+    type Store = KvStoreLockFree<DEFAULT_INLINE_SIZE>;
+
     #[test]
     fn test_expire_and_ttl() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         store.set(b"hello", b"world");
@@ -462,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_expire_nonexistent_key() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         assert!(!mgr.expire(b"nope", Duration::from_secs(5)));
@@ -470,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_persist_removes_ttl() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         store.set(b"key", b"val");
@@ -481,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_lazy_expiry() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         store.set(b"ephemeral", b"data");
@@ -498,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_check_and_purge_if_expired() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         store.set(b"temp", b"value");
@@ -511,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_check_and_purge_not_expired() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         store.set(b"fresh", b"value");
@@ -522,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_purge_if_expired_compat() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         store.set(b"temp", b"value");
@@ -536,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_remove_on_del() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         store.set(b"key", b"val");
@@ -547,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_len_and_is_empty() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         assert!(mgr.is_empty());
@@ -561,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_active_expiration_purges_expired_keys() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = Arc::new(ExpirationManager::new(Arc::clone(&store)));
 
         for i in 0..50 {
@@ -597,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_expire_overwrite_ttl() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
 
         store.set(b"k", b"v");
@@ -611,35 +614,35 @@ mod tests {
 
     #[test]
     fn test_persist_nonexistent_key() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
         assert!(!mgr.persist(b"nope")); // no TTL set
     }
 
     #[test]
     fn test_remove_nonexistent_key() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
         mgr.remove(b"nope"); // should not panic
     }
 
     #[test]
     fn test_is_expired_nonexistent() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
         assert!(!mgr.is_expired(b"nope"));
     }
 
     #[test]
     fn test_check_and_purge_nonexistent() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
         assert!(!mgr.check_and_purge_if_expired(b"nope"));
     }
 
     #[test]
     fn test_shutdown_flag() {
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(Store::new());
         let mgr = ExpirationManager::new(Arc::clone(&store));
         mgr.shutdown();
         // After shutdown, spawning should still work (it checks the flag in loop).

@@ -6,7 +6,18 @@
 //! 2. `KvStoreCustom` — custom hash table with linear probing (single-threaded)
 //! 3. `KvStoreLockFree` — lock-free hash table (thread-safe, cache-line aligned)
 //!
-//! The production type alias [`KvStore`] points to `KvStoreLockFree`.
+//! The production type alias [`KvStore`] points to `KvStoreLockFree<DEFAULT_INLINE_SIZE>`.
+//!
+//! ## Const generic inline size
+//!
+//! `KvStoreLockFree<const N: usize>` allows the inline storage size to be
+//! configured at compile time.  `N` is the maximum size for **each** of the
+//! key and the value independently (not combined).  The default is
+//! [`DEFAULT_INLINE_SIZE`] = 64 bytes.
+//!
+//! The internal `LockFreeEntry` stores `[[AtomicU8; N]; 2]` — two separate
+//! N-byte banks — so that no arithmetic on the const generic is required
+//! (stable Rust forbids `N * 2` in type positions).
 //!
 //! ## Extended operations (Phase 3)
 //!
@@ -19,7 +30,7 @@ use std::sync::atomic::{AtomicU64, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 /// Default number of buckets in the hash table.
 ///
-/// 1 million buckets × 192 bytes ≈ 192 MB of memory.
+/// 1 million buckets × ~192 bytes ≈ 192 MB of memory.
 const DEFAULT_CAPACITY: usize = 1_000_000;
 
 /// Maximum number of probe steps before giving up.
@@ -35,6 +46,16 @@ const MAX_KEY_SIZE: usize = 256;
 
 /// Maximum value size (4 KB) — only enforced by `KvStoreCustom`.
 const MAX_VALUE_SIZE: usize = 4096;
+
+/// Default inline storage size for keys and values (per-side).
+///
+/// Keys up to 64 bytes and values up to 64 bytes are stored directly in the
+/// cache-line-aligned entry structure, avoiding heap allocation entirely.
+/// Larger keys/values will be rejected by `set` / `incr`.
+///
+/// Consumers that need a different inline size can use
+/// `KvStoreLockFree<128>`, `KvStoreLockFree<256>`, etc.
+pub const DEFAULT_INLINE_SIZE: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Error types for extended operations
@@ -301,27 +322,27 @@ impl Default for KvStoreCustom {
 // VERSION 3: Lock-Free Hash Table (thread-safe!)
 // ============================================================================
 
-/// Inline storage size for keys and values.
-///
-/// Keys up to 64 bytes and values up to 64 bytes are stored directly in the
-/// cache-line-aligned entry structure, avoiding heap allocation entirely.
-/// Larger keys/values will be rejected by `set` / `incr`.
-const INLINE_SIZE: usize = 64;
-
 /// A single entry in the lock-free hash table.
 ///
-/// **Memory layout** (192 bytes, cache-line aligned):
+/// **Memory layout** (cache-line aligned):
 ///
-/// | Field      | Size      | Offset | Description                        |
-/// |------------|-----------|--------|------------------------------------|
-/// | `hash`     | 8 B       | 0      | wyhash-inspired hash; 0 = empty    |
-/// | `key_len`  | 4 B       | 8      | Length of the key                  |
-/// | `value_len`| 4 B       | 12     | Length of the value                |
-/// | `version`  | 8 B       | 16     | Optimistic-read version counter    |
-/// | `data`     | 128 B     | 24     | `key[0..64]` + `value[0..64]`      |
-/// | *padding*  | 64 B      | 152    | Pad to 192 bytes (3 cache lines)   |
+/// | Field      | Size          | Description                        |
+/// |------------|---------------|------------------------------------|
+/// | `hash`     | 8 B           | wyhash-inspired hash; 0 = empty    |
+/// | `key_len`  | 4 B           | Length of the key                  |
+/// | `value_len`| 4 B           | Length of the value                |
+/// | `version`  | 8 B           | Optimistic-read version counter    |
+/// | `data`     | `N * 2` bytes | `data[0]` = key, `data[1]` = value |
+///
+/// The `data` field uses `[[AtomicU8; N]; 2]` — an array of two N-byte
+/// banks — so that no arithmetic on the const generic `N` is required
+/// (stable Rust forbids `N * 2` in type positions).
+///
+/// - `data[0][0..key_len]` holds the key bytes.
+/// - `data[1][0..value_len]` holds the value bytes.
+/// Each byte is an `AtomicU8` to support individual byte reads without locking.
 #[repr(C, align(64))]
-struct LockFreeEntry {
+struct LockFreeEntry<const N: usize> {
     /// Hash of the key. `0` = empty slot, used for CAS insertion.
     hash: AtomicU64,
     /// Length of the key in bytes.
@@ -333,15 +354,15 @@ struct LockFreeEntry {
     /// Even values indicate a stable state; odd values mean a write is in
     /// progress. Readers snapshot `v1`, read the data, then verify `v2 == v1`.
     version: AtomicU64,
-    /// Inline key + value storage.
-    ///
-    /// Bytes `0..INLINE_SIZE` hold the key; bytes `INLINE_SIZE..2*INLINE_SIZE`
-    /// hold the value. Each byte is an `AtomicU8` to support individual byte
-    /// reads without locking.
-    data: [AtomicU8; INLINE_SIZE * 2],
+    /// Inline key + value storage: `data[0]` = key, `data[1]` = value.
+    data: [[AtomicU8; N]; 2],
 }
 
-impl LockFreeEntry {
+// SAFETY: all fields are atomic.
+unsafe impl<const N: usize> Send for LockFreeEntry<N> {}
+unsafe impl<const N: usize> Sync for LockFreeEntry<N> {}
+
+impl<const N: usize> LockFreeEntry<N> {
     /// Create a new empty entry (all zeros).
     fn new() -> Self {
         Self {
@@ -349,12 +370,17 @@ impl LockFreeEntry {
             key_len: AtomicU32::new(0),
             value_len: AtomicU32::new(0),
             version: AtomicU64::new(0),
-            data: std::array::from_fn(|_| AtomicU8::new(0)),
+            data: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU8::new(0))),
         }
     }
 }
 
 /// Lock-free, thread-safe hash table.
+///
+/// # Const generic `N`
+///
+/// `N` is the per-side inline storage limit in bytes — both keys and values
+/// may be up to `N` bytes.  The default is [`DEFAULT_INLINE_SIZE`] (64).
 ///
 /// # Concurrency model
 ///
@@ -368,17 +394,17 @@ impl LockFreeEntry {
 ///   → compute new value → CAS version from even → odd → write → set even.
 ///
 /// No `Mutex`, `RwLock`, or spin-lock is ever acquired.
-pub struct KvStoreLockFree {
-    buckets: Box<[LockFreeEntry]>,
+pub struct KvStoreLockFree<const N: usize = DEFAULT_INLINE_SIZE> {
+    buckets: Box<[LockFreeEntry<N>]>,
     count: AtomicUsize,
     capacity: usize,
 }
 
 // SAFETY: all fields are either atomic or immutable.
-unsafe impl Send for KvStoreLockFree {}
-unsafe impl Sync for KvStoreLockFree {}
+unsafe impl<const N: usize> Send for KvStoreLockFree<N> {}
+unsafe impl<const N: usize> Sync for KvStoreLockFree<N> {}
 
-impl KvStoreLockFree {
+impl<const N: usize> KvStoreLockFree<N> {
     /// Create a store with the default capacity (1 000 000 entries).
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CAPACITY)
@@ -388,7 +414,7 @@ impl KvStoreLockFree {
     pub fn with_capacity(capacity: usize) -> Self {
         let mut buckets = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            buckets.push(LockFreeEntry::new());
+            buckets.push(LockFreeEntry::<N>::new());
         }
 
         Self {
@@ -429,10 +455,9 @@ impl KvStoreLockFree {
 
     /// Read the value for *key*.
     ///
-    /// Returns `None` if the key does not exist or if key length exceeds
-    /// [`INLINE_SIZE`].
+    /// Returns `None` if the key does not exist or if key length exceeds `N`.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if key.len() > INLINE_SIZE {
+        if key.len() > N {
             return None;
         }
 
@@ -456,9 +481,9 @@ impl KvStoreLockFree {
                 if key_len != key.len() { continue; }
 
                 // Stack-allocated key buffer — no heap allocation.
-                let mut entry_key = [0u8; INLINE_SIZE];
+                let mut entry_key = [0u8; N];
                 for j in 0..key_len {
-                    entry_key[j] = entry.data[j].load(Ordering::Relaxed);
+                    entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
                 }
 
                 if &entry_key[..key_len] != key { continue; }
@@ -466,7 +491,7 @@ impl KvStoreLockFree {
                 let value_len = entry.value_len.load(Ordering::Acquire) as usize;
                 let mut value = vec![0u8; value_len];
                 for j in 0..value_len {
-                    value[j] = entry.data[INLINE_SIZE + j].load(Ordering::Relaxed);
+                    value[j] = entry.data[1][j].load(Ordering::Relaxed);
                 }
 
                 let v2 = entry.version.load(Ordering::Acquire);
@@ -485,10 +510,10 @@ impl KvStoreLockFree {
 
     /// Insert or update *key* with *value*.
     ///
-    /// Both key and value must be at most [`INLINE_SIZE`] bytes.
+    /// Both key and value must be at most `N` bytes.
     /// Returns `false` if either exceeds the limit or if the table is full.
     pub fn set(&self, key: &[u8], value: &[u8]) -> bool {
-        if key.len() > INLINE_SIZE || value.len() > INLINE_SIZE {
+        if key.len() > N || value.len() > N {
             return false;
         }
 
@@ -520,9 +545,9 @@ impl KvStoreLockFree {
                 let key_len = entry.key_len.load(Ordering::Acquire) as usize;
                 if key_len == key.len() {
                     // Stack-allocated key buffer — no heap allocation.
-                    let mut entry_key = [0u8; INLINE_SIZE];
+                    let mut entry_key = [0u8; N];
                     for j in 0..key_len {
-                        entry_key[j] = entry.data[j].load(Ordering::Relaxed);
+                        entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
                     }
                     if &entry_key[..key_len] == key {
                         self.write_entry(entry, key, value);
@@ -542,7 +567,7 @@ impl KvStoreLockFree {
     ///
     /// Returns `true` if the key existed and was removed.
     pub fn del(&self, key: &[u8]) -> bool {
-        if key.len() > INLINE_SIZE {
+        if key.len() > N {
             return false;
         }
 
@@ -559,9 +584,9 @@ impl KvStoreLockFree {
             if entry_hash == hash {
                 let key_len = entry.key_len.load(Ordering::Acquire) as usize;
                 if key_len == key.len() {
-                    let mut entry_key = [0u8; INLINE_SIZE];
+                    let mut entry_key = [0u8; N];
                     for j in 0..key_len {
-                        entry_key[j] = entry.data[j].load(Ordering::Relaxed);
+                        entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
                     }
                     if &entry_key[..key_len] == key {
                         let v = entry.version.fetch_add(1, Ordering::AcqRel);
@@ -585,7 +610,7 @@ impl KvStoreLockFree {
     /// This is more efficient than `get(key).is_some()` because it does not
     /// copy the value bytes.
     pub fn exists(&self, key: &[u8]) -> bool {
-        if key.len() > INLINE_SIZE {
+        if key.len() > N {
             return false;
         }
 
@@ -604,9 +629,9 @@ impl KvStoreLockFree {
             let key_len = entry.key_len.load(Ordering::Acquire) as usize;
             if key_len != key.len() { continue; }
 
-            let mut entry_key = [0u8; INLINE_SIZE];
+            let mut entry_key = [0u8; N];
             for j in 0..key_len {
-                entry_key[j] = entry.data[j].load(Ordering::Relaxed);
+                entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
             }
             if &entry_key[..key_len] == key { return true; }
         }
@@ -629,7 +654,7 @@ impl KvStoreLockFree {
     /// * [`IncrError::NotInteger`] — the current value cannot be parsed as `i64`.
     /// * [`IncrError::Overflow`] — the result would overflow `i64`.
     pub fn incr(&self, key: &[u8], delta: i64) -> Result<i64, IncrError> {
-        if key.len() > INLINE_SIZE {
+        if key.len() > N {
             return Err(IncrError::KeyTooLong);
         }
 
@@ -651,9 +676,9 @@ impl KvStoreLockFree {
             // Verify key match.
             let key_len = entry.key_len.load(Ordering::Acquire) as usize;
             if key_len != key.len() { continue; }
-            let mut entry_key = [0u8; INLINE_SIZE];
+            let mut entry_key = [0u8; N];
             for j in 0..key_len {
-                entry_key[j] = entry.data[j].load(Ordering::Relaxed);
+                entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
             }
             if &entry_key[..key_len] != key { continue; }
 
@@ -665,9 +690,9 @@ impl KvStoreLockFree {
 
                 // 2. Read current value (stack-allocated, Relaxed reads).
                 let value_len = entry.value_len.load(Ordering::Acquire) as usize;
-                let mut value_bytes = [0u8; INLINE_SIZE];
+                let mut value_bytes = [0u8; N];
                 for j in 0..value_len {
-                    value_bytes[j] = entry.data[INLINE_SIZE + j].load(Ordering::Relaxed);
+                    value_bytes[j] = entry.data[1][j].load(Ordering::Relaxed);
                 }
 
                 // 3. Verify version hasn't changed.
@@ -685,7 +710,7 @@ impl KvStoreLockFree {
                     .ok_or(IncrError::Overflow)?;
 
                 let new_str = new_value.to_string();
-                if new_str.len() > INLINE_SIZE {
+                if new_str.len() > N {
                     return Err(IncrError::ValueTooLong);
                 }
 
@@ -699,7 +724,7 @@ impl KvStoreLockFree {
                 // 7. We hold exclusive access — write new value.
                 entry.value_len.store(new_str.len() as u32, Ordering::Release);
                 for (j, &byte) in new_str.as_bytes().iter().enumerate() {
-                    entry.data[INLINE_SIZE + j].store(byte, Ordering::Relaxed);
+                    entry.data[1][j].store(byte, Ordering::Relaxed);
                 }
                 entry.version.store(v1 + 2, Ordering::Release);
 
@@ -754,9 +779,9 @@ impl KvStoreLockFree {
     /// read-modify-write is **linearizable** under concurrency.
     ///
     /// Returns the new length of the string value, or `None` if the result
-    /// would exceed [`INLINE_SIZE`].
+    /// would exceed `N`.
     pub fn append(&self, key: &[u8], suffix: &[u8]) -> Option<usize> {
-        if key.len() > INLINE_SIZE || suffix.len() > INLINE_SIZE { return None; }
+        if key.len() > N || suffix.len() > N { return None; }
 
         let hash = Self::hash_key(key);
         let start = (hash as usize) % self.capacity;
@@ -778,9 +803,9 @@ impl KvStoreLockFree {
             let key_len = entry.key_len.load(Ordering::Acquire) as usize;
             if key_len != key.len() { continue; }
 
-            let mut entry_key = [0u8; INLINE_SIZE];
+            let mut entry_key = [0u8; N];
             for j in 0..key_len {
-                entry_key[j] = entry.data[j].load(Ordering::Relaxed);
+                entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
             }
             if &entry_key[..key_len] != key { continue; }
 
@@ -792,9 +817,9 @@ impl KvStoreLockFree {
 
                 // 2. Read current value (stack-allocated, Relaxed reads).
                 let cur_len = entry.value_len.load(Ordering::Acquire) as usize;
-                let mut cur_val = [0u8; INLINE_SIZE];
+                let mut cur_val = [0u8; N];
                 for j in 0..cur_len {
-                    cur_val[j] = entry.data[INLINE_SIZE + j].load(Ordering::Relaxed);
+                    cur_val[j] = entry.data[1][j].load(Ordering::Relaxed);
                 }
 
                 // 3. Verify version hasn't changed.
@@ -803,8 +828,8 @@ impl KvStoreLockFree {
 
                 // 4. Compute new value.
                 let new_len = cur_len + suffix.len();
-                if new_len > INLINE_SIZE { return None; }
-                let mut new_val = [0u8; INLINE_SIZE];
+                if new_len > N { return None; }
+                let mut new_val = [0u8; N];
                 new_val[..cur_len].copy_from_slice(&cur_val[..cur_len]);
                 new_val[cur_len..new_len].copy_from_slice(suffix);
 
@@ -818,7 +843,7 @@ impl KvStoreLockFree {
                 // 6. We hold exclusive access — write new value.
                 entry.value_len.store(new_len as u32, Ordering::Release);
                 for j in 0..new_len {
-                    entry.data[INLINE_SIZE + j].store(new_val[j], Ordering::Relaxed);
+                    entry.data[1][j].store(new_val[j], Ordering::Relaxed);
                 }
                 entry.version.store(v1 + 2, Ordering::Release);
 
@@ -846,7 +871,7 @@ impl KvStoreLockFree {
     ///
     /// Returns `0` if the key does not exist (matches Redis semantics).
     pub fn strlen(&self, key: &[u8]) -> usize {
-        if key.len() > INLINE_SIZE { return 0; }
+        if key.len() > N { return 0; }
 
         let hash = Self::hash_key(key);
         let start = (hash as usize) % self.capacity;
@@ -867,9 +892,9 @@ impl KvStoreLockFree {
                 let key_len = entry.key_len.load(Ordering::Acquire) as usize;
                 if key_len != key.len() { continue; }
 
-                let mut entry_key = [0u8; INLINE_SIZE];
+                let mut entry_key = [0u8; N];
                 for j in 0..key_len {
-                    entry_key[j] = entry.data[j].load(Ordering::Relaxed);
+                    entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
                 }
                 if &entry_key[..key_len] != key { continue; }
 
@@ -926,9 +951,9 @@ impl KvStoreLockFree {
     /// **linearizable** under concurrency.
     ///
     /// Returns the new length of the string, or `None` if the result would
-    /// exceed [`INLINE_SIZE`].
+    /// exceed `N`.
     pub fn setrange(&self, key: &[u8], offset: usize, replacement: &[u8]) -> Option<usize> {
-        if key.len() > INLINE_SIZE { return None; }
+        if key.len() > N { return None; }
         if replacement.is_empty() {
             return Some(self.strlen(key));
         }
@@ -950,9 +975,9 @@ impl KvStoreLockFree {
             let key_len = entry.key_len.load(Ordering::Acquire) as usize;
             if key_len != key.len() { continue; }
 
-            let mut entry_key = [0u8; INLINE_SIZE];
+            let mut entry_key = [0u8; N];
             for j in 0..key_len {
-                entry_key[j] = entry.data[j].load(Ordering::Relaxed);
+                entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
             }
             if &entry_key[..key_len] != key { continue; }
 
@@ -962,19 +987,19 @@ impl KvStoreLockFree {
                 if v1 % 2 == 1 { continue; }
 
                 let cur_len = entry.value_len.load(Ordering::Acquire) as usize;
-                let mut cur_val = [0u8; INLINE_SIZE];
+                let mut cur_val = [0u8; N];
                 for j in 0..cur_len {
-                    cur_val[j] = entry.data[INLINE_SIZE + j].load(Ordering::Relaxed);
+                    cur_val[j] = entry.data[1][j].load(Ordering::Relaxed);
                 }
 
                 let v2 = entry.version.load(Ordering::Acquire);
                 if v1 != v2 { continue; }
 
                 let target_len = end.max(cur_len);
-                if target_len > INLINE_SIZE { return None; }
+                if target_len > N { return None; }
 
                 // Build new value: copy original, overwrite at offset.
-                let mut new_val = [0u8; INLINE_SIZE];
+                let mut new_val = [0u8; N];
                 new_val[..cur_len].copy_from_slice(&cur_val[..cur_len]);
                 new_val[offset..end].copy_from_slice(replacement);
 
@@ -987,7 +1012,7 @@ impl KvStoreLockFree {
 
                 entry.value_len.store(target_len as u32, Ordering::Release);
                 for j in 0..target_len {
-                    entry.data[INLINE_SIZE + j].store(new_val[j], Ordering::Relaxed);
+                    entry.data[1][j].store(new_val[j], Ordering::Relaxed);
                 }
                 entry.version.store(v1 + 2, Ordering::Release);
 
@@ -997,7 +1022,7 @@ impl KvStoreLockFree {
 
         // Key not found — create with zero-padded value.
         let target_len = end;
-        if target_len > INLINE_SIZE { return None; }
+        if target_len > N { return None; }
         let mut new_val = vec![0u8; target_len];
         new_val[offset..end].copy_from_slice(replacement);
         if self.set(key, &new_val) {
@@ -1035,21 +1060,21 @@ impl KvStoreLockFree {
     /// Caller must have already "claimed" the entry (via CAS on `hash` or
     /// confirmed key match).
     #[inline]
-    fn write_entry(&self, entry: &LockFreeEntry, key: &[u8], value: &[u8]) {
+    fn write_entry(&self, entry: &LockFreeEntry<N>, key: &[u8], value: &[u8]) {
         let v = entry.version.fetch_add(1, Ordering::AcqRel);
         entry.key_len.store(key.len() as u32, Ordering::Release);
         for (j, &byte) in key.iter().enumerate() {
-            entry.data[j].store(byte, Ordering::Relaxed);
+            entry.data[0][j].store(byte, Ordering::Relaxed);
         }
         entry.value_len.store(value.len() as u32, Ordering::Release);
         for (j, &byte) in value.iter().enumerate() {
-            entry.data[INLINE_SIZE + j].store(byte, Ordering::Relaxed);
+            entry.data[1][j].store(byte, Ordering::Relaxed);
         }
         entry.version.store(v + 2, Ordering::Release);
     }
 }
 
-impl Default for KvStoreLockFree {
+impl<const N: usize> Default for KvStoreLockFree<N> {
     fn default() -> Self {
         Self::new()
     }
@@ -1077,8 +1102,9 @@ fn normalize_index(idx: i64, len: i64) -> i64 {
 // TYPE ALIASES
 // ============================================================================
 
-/// The production KV store — lock-free and thread-safe.
-pub type KvStore = KvStoreLockFree;
+/// The production KV store — lock-free and thread-safe with the default
+/// inline size ([`DEFAULT_INLINE_SIZE`] = 64 bytes per side).
+pub type KvStore = KvStoreLockFree<DEFAULT_INLINE_SIZE>;
 
 /// Single-threaded KV store (for testing / comparison).
 pub type KvStoreSingleThreaded = KvStoreCustom;
@@ -1097,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_lockfree_basic() {
-        let store = KvStoreLockFree::with_capacity(100);
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
         assert!(store.set(b"hello", b"world"));
         assert_eq!(store.get(b"hello"), Some(b"world".to_vec()));
         assert!(store.set(b"hello", b"rust"));
@@ -1108,16 +1134,16 @@ mod tests {
 
     #[test]
     fn test_lockfree_multithreaded() {
-        let store = Arc::new(KvStoreLockFree::with_capacity(10000));
+        let store = Arc::new(KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(10000));
         let mut handles = vec![];
 
         for t in 0..4 {
             let store = Arc::clone(&store);
             handles.push(thread::spawn(move || {
                 for i in 0..100 {
-                    let key = format!("t{}_key_{}", t, i);
-                    let value = format!("t{}_value_{}", t, i);
-                    store.set(key.as_bytes(), value.as_bytes());
+                    let key = format!("t{}:k{}", t, i);
+                    let value = format!("t{}:v{}", t, i);
+                    assert!(store.set(key.as_bytes(), value.as_bytes()));
                 }
             }));
         }
@@ -1126,296 +1152,119 @@ mod tests {
             handle.join().unwrap();
         }
 
+        // Verify all writes
         for t in 0..4 {
             for i in 0..100 {
-                let key = format!("t{}_key_{}", t, i);
-                let expected = format!("t{}_value_{}", t, i);
-                assert_eq!(store.get(key.as_bytes()), Some(expected.as_bytes().to_vec()));
+                let key = format!("t{}:k{}", t, i);
+                let expected = format!("t{}:v{}", t, i);
+                assert_eq!(store.get(key.as_bytes()), Some(expected.into_bytes()));
             }
         }
     }
 
-    // ----- EXISTS -----
+    #[test]
+    fn test_lockfree_incr() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        assert!(store.set(b"counter", b"0"));
+        assert_eq!(store.incr(b"counter", 1), Ok(1));
+        assert_eq!(store.incr(b"counter", 5), Ok(6));
+        assert_eq!(store.decr(b"counter"), Ok(5));
+        assert_eq!(store.get(b"counter"), Some(b"5".to_vec()));
+    }
 
     #[test]
-    fn test_exists() {
-        let store = KvStoreLockFree::with_capacity(100);
+    fn test_lockfree_exists() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
         assert!(!store.exists(b"missing"));
-        store.set(b"present", b"yes");
+        assert!(store.set(b"present", b"yes"));
         assert!(store.exists(b"present"));
-        store.del(b"present");
-        assert!(!store.exists(b"present"));
-    }
-
-    // ----- INCR / DECR -----
-
-    #[test]
-    fn test_incr() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"counter", b"10");
-
-        assert_eq!(store.incr(b"counter", 1).unwrap(), 11);
-        assert_eq!(store.get(b"counter"), Some(b"11".to_vec()));
-
-        assert_eq!(store.incr(b"counter", 5).unwrap(), 16);
-        assert_eq!(store.get(b"counter"), Some(b"16".to_vec()));
-
-        assert_eq!(store.incr(b"counter", -3).unwrap(), 13);
-        assert_eq!(store.incr_by_one(b"counter").unwrap(), 14);
-        assert_eq!(store.decr(b"counter").unwrap(), 13);
     }
 
     #[test]
-    fn test_incr_not_integer() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"str", b"hello");
-        assert_eq!(store.incr(b"str", 1), Err(IncrError::NotInteger));
+    fn test_lockfree_too_large_key() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        let big_key = vec![0u8; DEFAULT_INLINE_SIZE + 1];
+        assert!(!store.set(&big_key, b"val"));
+        assert_eq!(store.get(&big_key), None);
     }
 
     #[test]
-    fn test_incr_key_not_found() {
-        let store = KvStoreLockFree::with_capacity(100);
-        assert_eq!(store.incr(b"missing", 1), Err(IncrError::KeyNotFound));
-    }
-
-    #[test]
-    fn test_incr_overflow() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"big", i64::MAX.to_string().as_bytes());
-        assert_eq!(store.incr(b"big", 1), Err(IncrError::Overflow));
-    }
-
-    #[test]
-    fn test_incr_multithreaded() {
-        let store = Arc::new(KvStoreLockFree::with_capacity(1000));
-        store.set(b"race", b"0");
-
-        let mut handles = vec![];
-        for _ in 0..8 {
-            let store = Arc::clone(&store);
-            handles.push(thread::spawn(move || {
-                for _ in 0..100 {
-                    let _ = store.incr(b"race", 1);
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert_eq!(store.get(b"race"), Some(b"800".to_vec()));
+    fn test_lockfree_custom_inline_size() {
+        // Use a larger inline size (256 bytes per side).
+        let store = KvStoreLockFree::<256>::with_capacity(100);
+        let big_key = vec![b'k'; 200];
+        let big_val = vec![b'v'; 200];
+        assert!(store.set(&big_key, &big_val));
+        assert_eq!(store.get(&big_key), Some(big_val.clone()));
+        // Key of 257 bytes should fail.
+        assert!(!store.set(&vec![0u8; 257], b"val"));
     }
 
     // ----- MGET / MSET -----
 
     #[test]
-    fn test_mget() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"a", b"1");
-        store.set(b"c", b"3");
-
-        let keys: Vec<&[u8]> = vec![b"a", b"b", b"c"];
-        let vals = store.mget(&keys);
-        assert_eq!(vals[0], Some(b"1".to_vec()));
-        assert_eq!(vals[1], None);
-        assert_eq!(vals[2], Some(b"3".to_vec()));
-    }
-
-    #[test]
-    fn test_mset() {
-        let store = KvStoreLockFree::with_capacity(100);
-        let pairs: Vec<(&[u8], &[u8])> = vec![(b"x", b"1"), (b"y", b"2")];
+    fn test_lockfree_mget_mset() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        let pairs: Vec<(&[u8], &[u8])> = vec![(b"a", b"1"), (b"b", b"2"), (b"c", b"3")];
         assert!(store.mset(&pairs));
-        assert_eq!(store.get(b"x"), Some(b"1".to_vec()));
-        assert_eq!(store.get(b"y"), Some(b"2".to_vec()));
+        let vals = store.mget(&[b"a", b"b", b"c", b"missing"]);
+        assert_eq!(vals[0], Some(b"1".to_vec()));
+        assert_eq!(vals[1], Some(b"2".to_vec()));
+        assert_eq!(vals[2], Some(b"3".to_vec()));
+        assert_eq!(vals[3], None);
     }
 
-    // ----- APPEND -----
+    // ----- APPEND / STRLEN -----
 
     #[test]
-    fn test_append() {
-        let store = KvStoreLockFree::with_capacity(100);
-
-        // Append to nonexistent key → create.
-        assert_eq!(store.append(b"k", b"hello"), Some(5));
-        assert_eq!(store.get(b"k"), Some(b"hello".to_vec()));
-
-        // Append to existing key.
-        assert_eq!(store.append(b"k", b" world"), Some(11));
-        assert_eq!(store.get(b"k"), Some(b"hello world".to_vec()));
+    fn test_lockfree_append_strlen() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        assert!(store.set(b"s", b"hello"));
+        assert_eq!(store.append(b"s", b" world"), Some(11));
+        assert_eq!(store.strlen(b"s"), 11);
+        assert_eq!(store.get(b"s"), Some(b"hello world".to_vec()));
     }
 
-    // ----- STRLEN -----
+    // ----- GETRANGE / SETRANGE -----
 
     #[test]
-    fn test_strlen() {
-        let store = KvStoreLockFree::with_capacity(100);
-        assert_eq!(store.strlen(b"missing"), 0);
-        store.set(b"txt", b"hello");
-        assert_eq!(store.strlen(b"txt"), 5);
+    fn test_lockfree_getrange_setrange() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        assert!(store.set(b"g", b"Hello World"));
+        assert_eq!(store.getrange(b"g", 0, 4), Some(b"Hello".to_vec()));
+        assert_eq!(store.getrange(b"g", -5, -1), Some(b"World".to_vec()));
+        assert_eq!(store.setrange(b"g", 6, b"Redis"), Some(11));
+        assert_eq!(store.get(b"g"), Some(b"Hello Redis".to_vec()));
     }
 
-    // ----- GETRANGE -----
+    // ----- INCR edge cases -----
 
     #[test]
-    fn test_getrange() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"s", b"Hello, World!");
-
-        assert_eq!(store.getrange(b"s", 0, 4), Some(b"Hello".to_vec()));
-        assert_eq!(store.getrange(b"s", 7, 11), Some(b"World".to_vec()));
-        assert_eq!(store.getrange(b"s", -6, -1), Some(b"World!".to_vec()));
-        assert_eq!(store.getrange(b"s", 100, 200), Some(Vec::new()));
-        assert_eq!(store.getrange(b"s", 5, 3), Some(Vec::new()));
-    }
-
-    // ----- SETRANGE -----
-
-    #[test]
-    fn test_setrange() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"s", b"Hello World");
-
-        assert_eq!(store.setrange(b"s", 6, b"Redis"), Some(11));
-        assert_eq!(store.get(b"s"), Some(b"Hello Redis".to_vec()));
-
-        // Beyond end → zero-pad.
-        assert_eq!(store.setrange(b"s", 15, b"!"), Some(16));
-        let val = store.get(b"s").unwrap();
-        assert_eq!(&val[11..16], b"\x00\x00\x00\x00!");
-    }
-
-    // ----- Helper -----
-
-    #[test]
-    fn test_normalize_index() {
-        assert_eq!(normalize_index(0, 5), 0);
-        assert_eq!(normalize_index(4, 5), 4);
-        assert_eq!(normalize_index(10, 5), 5);
-        assert_eq!(normalize_index(-1, 5), 4);
-        assert_eq!(normalize_index(-5, 5), 0);
-        assert_eq!(normalize_index(-10, 5), 0);
-    }
-
-    // ----- Edge cases -----
-
-    #[test]
-    fn test_lockfree_inline_size_limit() {
-        let store = KvStoreLockFree::with_capacity(100);
-        let long_key = vec![b'k'; 65]; // > INLINE_SIZE (64)
-        assert!(!store.set(&long_key, b"v")); // key too long
-        assert!(store.get(&long_key).is_none());
-
-        let long_val = vec![b'v'; 65];
-        assert!(!store.set(b"key", &long_val)); // value too long
-        assert!(store.get(b"key").is_none());
+    fn test_lockfree_incr_not_found() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        assert_eq!(store.incr(b"missing", 1), Err(IncrError::KeyNotFound));
     }
 
     #[test]
-    fn test_lockfree_capacity_exhaustion() {
-        let store = KvStoreLockFree::with_capacity(10);
-        for i in 0..10 {
-            let key = format!("k{}", i);
-            assert!(store.set(key.as_bytes(), b"v"));
-        }
-        // 11th key should fail (table full, linear probing exhausted).
-        assert!(!store.set(b"overflow", b"v"));
-        assert_eq!(store.len(), 10);
+    fn test_lockfree_incr_not_integer() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        assert!(store.set(b"str", b"hello"));
+        assert_eq!(store.incr(b"str", 1), Err(IncrError::NotInteger));
     }
 
     #[test]
-    fn test_lockfree_overwrite() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"k", b"v1");
-        store.set(b"k", b"v2");
-        store.set(b"k", b"v3");
-        assert_eq!(store.get(b"k"), Some(b"v3".to_vec()));
-        assert_eq!(store.len(), 1);
+    fn test_lockfree_incr_overflow() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        assert!(store.set(b"big", i64::MAX.to_string().as_bytes()));
+        assert_eq!(store.incr(b"big", 1), Err(IncrError::Overflow));
     }
 
-    #[test]
-    fn test_lockfree_del_nonexistent() {
-        let store = KvStoreLockFree::with_capacity(100);
-        assert!(!store.del(b"nope"));
-    }
+    // ----- KvStore alias -----
 
     #[test]
-    fn test_decr() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"c", b"10");
-        assert_eq!(store.decr(b"c").unwrap(), 9);
-        assert_eq!(store.decr(b"c").unwrap(), 8);
-    }
-
-    #[test]
-    fn test_incr_by_zero() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"c", b"42");
-        assert_eq!(store.incr(b"c", 0).unwrap(), 42);
-    }
-
-    #[test]
-    fn test_incr_negative() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"c", b"5");
-        assert_eq!(store.incr(b"c", -3).unwrap(), 2);
-    }
-
-    #[test]
-    fn test_mget_empty() {
-        let store = KvStoreLockFree::with_capacity(100);
-        let vals = store.mget(&[]);
-        assert!(vals.is_empty());
-    }
-
-    #[test]
-    fn test_mset_empty() {
-        let store = KvStoreLockFree::with_capacity(100);
-        assert!(store.mset(&[])); // no pairs → vacuously true
-    }
-
-    #[test]
-    fn test_append_too_long() {
-        let store = KvStoreLockFree::with_capacity(100);
-        store.set(b"k", b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); // 64 bytes
-        // One more byte → 65 > INLINE_SIZE → should fail.
-        assert!(store.append(b"k", b"x").is_none());
-    }
-
-    #[test]
-    fn test_getrange_missing_key() {
-        let store = KvStoreLockFree::with_capacity(100);
-        assert_eq!(store.getrange(b"nope", 0, 10), None);
-    }
-
-    #[test]
-    fn test_setrange_missing_key() {
-        let store = KvStoreLockFree::with_capacity(100);
-        // Key doesn't exist → created with zero-padding.
-        assert_eq!(store.setrange(b"k", 5, b"hello"), Some(10));
-        let val = store.get(b"k").unwrap();
-        assert_eq!(&val[0..5], b"\x00\x00\x00\x00\x00");
-        assert_eq!(&val[5..10], b"hello");
-    }
-
-    #[test]
-    fn test_lockfree_simple_operations() {
-        let mut store = KvStoreSimple::new();
-        store.set(b"a", b"1");
-        store.set(b"b", b"2");
-        assert_eq!(store.get(b"a"), Some(b"1".to_vec()));
-        assert_eq!(store.len(), 2);
-        assert!(store.del(b"a"));
-        assert_eq!(store.len(), 1);
-    }
-
-    #[test]
-    fn test_lockfree_custom_operations() {
-        let mut store = KvStoreCustom::with_capacity(100);
-        store.set(b"x", b"y");
-        assert_eq!(store.get(b"x"), Some(b"y".to_vec()));
-        assert!(!store.set(&[0u8; 257], b"v")); // key too long
-        assert!(store.del(b"x"));
-        assert_eq!(store.get(b"x"), None);
+    fn test_kvstore_alias() {
+        let store = KvStore::with_capacity(100);
+        assert!(store.set(b"alias", b"works"));
+        assert_eq!(store.get(b"alias"), Some(b"works".to_vec()));
     }
 }
