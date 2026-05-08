@@ -20,15 +20,19 @@
 //! ```rust
 //! use fast_kv::KvStore;
 //!
-//! // Single-threaded (default 64-byte inline size per side)
+//! // Quick start — default 100K buckets (~19 MB for N=64)
 //! let store = KvStore::new();
 //! store.set(b"hello", b"world");
 //! let value = store.get(b"hello");
 //! assert_eq!(value, Some(b"world".to_vec()));
 //!
+//! // High-cardinality workloads: specify capacity explicitly
+//! // (table does NOT resize — choose at least 2× expected key count)
+//! let store = KvStore::with_capacity(500_000);
+//!
 //! // Custom inline size (128 bytes per side)
 //! use fast_kv::KvStoreLockFree;
-//! let store: KvStoreLockFree<128> = KvStoreLockFree::new();
+//! let store: KvStoreLockFree<128> = KvStoreLockFree::with_capacity(10_000);
 //! store.set(&[0u8; 100], &[0u8; 100]);
 //!
 //! // Atomic increment (INCR)

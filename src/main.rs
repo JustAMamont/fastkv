@@ -49,6 +49,7 @@ fn print_usage() {
     println!("Server options:");
     println!("  --host <addr>        Bind address (default: 0.0.0.0)");
     println!("  --port <port>        Listen port (default: 6379)");
+    println!("  --capacity <num>     Hash table buckets (default: 100000)");
     println!("  --dir <path>         Data directory for WAL (default: ./fastkv_data)");
     println!("  --fsync <policy>     fsync policy: always | everysec | never (default: everysec)");
     println!("  --mode <backend>     Server backend: tokio (default)");
@@ -58,6 +59,7 @@ fn print_usage() {
     println!("Environment variables (override defaults):");
     println!("  FASTKV_HOST          Bind address");
     println!("  FASTKV_PORT          Listen port");
+    println!("  FASTKV_CAPACITY      Hash table buckets");
     println!("  FASTKV_DIR           Data directory for WAL");
     println!("  FASTKV_FSYNC         fsync policy: always | everysec | never");
     println!();
@@ -66,6 +68,7 @@ fn print_usage() {
     println!("  fast_kv server --port 6380             # custom port");
     println!("  fast_kv server --host 127.0.0.1 --port 6380");
     println!("  fast_kv server --dir /var/lib/fastkv --fsync always");
+    println!("  fast_kv server --capacity 1000000      # 1M buckets for high-cardinality workloads");
     println!("  docker run -p 6379:6379 -v fastkv_data:/data ghcr.io/<user>/fastkv:latest");
     println!();
     println!("Features:");
@@ -115,6 +118,11 @@ fn run_server(args: &[String]) {
         .or_else(|| env::var("FASTKV_FSYNC").ok())
         .unwrap_or_else(|| "everysec".into());
 
+    let capacity: usize = get_flag(args, "capacity")
+        .or_else(|| env::var("FASTKV_CAPACITY").ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
     let mode = get_flag(args, "mode")
         .unwrap_or_else(|| "tokio".into());
 
@@ -125,11 +133,12 @@ fn run_server(args: &[String]) {
     };
 
     println!("FastKV v{} (Lock-Free Edition)", VERSION);
-    println!("  host:   {}", host);
-    println!("  port:   {}", port);
-    println!("  dir:    {}", data_dir);
-    println!("  fsync:  {:?}", fsync_policy);
-    println!("  mode:   {}", mode);
+    println!("  host:     {}", host);
+    println!("  port:     {}", port);
+    println!("  capacity: {} buckets", capacity);
+    println!("  dir:      {}", data_dir);
+    println!("  fsync:    {:?}", fsync_policy);
+    println!("  mode:     {}", mode);
 
     // --- Data directory ---
     std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
@@ -150,7 +159,7 @@ fn run_server(args: &[String]) {
     };
 
     // --- KV store ---
-    let store = Arc::new(KvStore::new());
+    let store = Arc::new(KvStore::with_capacity(capacity));
 
     // --- List manager ---
     let lists_mgr = Arc::new(ListManager::new(Arc::clone(&store)));
@@ -235,7 +244,7 @@ fn run_tests() {
     println!("FastKV v{} — Running smoke tests...\n", VERSION);
 
     println!("Test 1: Basic operations (GET/SET/DEL)");
-    let store = KvStore::new();
+    let store = KvStore::with_capacity(100);
     store.set(b"hello", b"world");
     assert_eq!(store.get(b"hello"), Some(b"world".to_vec()));
     store.set(b"hello", b"rust");
@@ -282,7 +291,7 @@ fn run_tests() {
     println!("  + PASS");
 
     println!("\nTest 7: Many keys (1 000)");
-    let store = KvStore::new();
+    let store = KvStore::with_capacity(2000);
     for i in 0..1000 {
         let key = format!("key:{}", i);
         let value = format!("value:{}", i);
@@ -291,7 +300,7 @@ fn run_tests() {
     println!("  + Inserted 1000 keys");
 
     println!("\nTest 8: Multi-threaded (4 threads)");
-    let store = Arc::new(KvStore::new());
+    let store = Arc::new(KvStore::with_capacity(1000));
     let mut handles = vec![];
     for t in 0..4 {
         let store = Arc::clone(&store);
@@ -309,7 +318,7 @@ fn run_tests() {
     println!("  + 4 threads wrote 400 keys");
 
     println!("\nTest 9: Expiration");
-    let store = Arc::new(KvStore::new());
+    let store = Arc::new(KvStore::with_capacity(100));
     let exp = ExpirationManager::new(Arc::clone(&store));
     store.set(b"temp", b"data");
     assert!(exp.expire(b"temp", std::time::Duration::from_secs(10)));
@@ -325,7 +334,7 @@ fn run_tests() {
 fn run_benchmark() {
     println!("Running single-threaded benchmark...\n");
 
-    let store = KvStore::new();
+    let store = KvStore::with_capacity(200_000);  // 2× expected key count
     let iterations = 100_000;
 
     println!("Warming up...");
@@ -387,7 +396,7 @@ fn run_threaded_benchmark() {
     for num_threads in [1, 2, 4, 8] {
         println!("\n=== {} Thread(s) ===", num_threads);
 
-        let store = Arc::new(KvStore::new());
+        let store = Arc::new(KvStore::with_capacity(200_000));  // 2× expected key count
         let ops_per_thread = iterations / num_threads;
 
         let start = Instant::now();

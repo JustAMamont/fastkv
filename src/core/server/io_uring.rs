@@ -33,9 +33,12 @@ pub struct IoUringServer {
 
 impl IoUringServer {
     /// Create a server with default settings (port 6379).
+    ///
+    /// Uses a small capacity (1K buckets) since no data is expected.
+    /// For production use [`with_components`] to set `--capacity`.
     pub fn new() -> Self {
         Self {
-            store: Arc::new(KvStore::new()),
+            store: Arc::new(KvStore::with_capacity(1000)),
             wal: None,
             expiry: None,
             lists: None,
@@ -45,9 +48,12 @@ impl IoUringServer {
     }
 
     /// Create a server that listens on *port*.
+    ///
+    /// Uses a small capacity (1K buckets) since no data is expected.
+    /// For production use [`with_components`] to set `--capacity`.
     pub fn with_port(port: u16) -> Self {
         Self {
-            store: Arc::new(KvStore::new()),
+            store: Arc::new(KvStore::with_capacity(1000)),
             wal: None,
             expiry: None,
             lists: None,

@@ -38,18 +38,21 @@ cargo build --release
 ### Run Server
 
 ```bash
-# Default — 0.0.0.0:6379, WAL in ./fastkv_data, fsync everysec
+# Default — 0.0.0.0:6379, WAL in ./fastkv_data, fsync everysec, 100K buckets
 fast_kv server
 
 # Custom host, port, data dir, fsync policy
 fast_kv server --host 127.0.0.1 --port 6380 --dir /var/lib/fastkv --fsync always
+
+# High-cardinality workload (>50K keys): increase capacity
+fast_kv server --capacity 1000000
 
 # With io_uring (Linux only, maximum throughput)
 cargo build --release --features io-uring
 fast_kv server --mode io_uring
 
 # Via environment variables
-FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_FSYNC=always fast_kv server
+FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_FSYNC=always fast_kv server
 ```
 
 #### Server Flags
@@ -58,9 +61,22 @@ FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_FSYNC=always fast_kv server
 |------|---------|-------------|
 | `--host <addr>` | `0.0.0.0` | Bind address |
 | `--port <port>` | `6379` | Listen port |
+| `--capacity <num>` | `100000` | Hash table buckets (see Memory below) |
 | `--dir <path>` | `./fastkv_data` | Data directory for WAL |
 | `--fsync <policy>` | `everysec` | WAL fsync: `always`, `everysec`, `never` |
 | `--mode <backend>` | `tokio` | Server backend: `tokio` or `io_uring` (Linux only) |
+
+#### Capacity & Memory
+
+The `--capacity` flag controls how many buckets the lock-free hash table pre-allocates at startup. The table **does not resize** — if it fills up, `SET` returns an error. Choose a capacity at least 2× your expected key count.
+
+| Capacity | Memory (N=64) | Memory (N=256) | Max keys (50% load) |
+|----------|---------------|----------------|---------------------|
+| 1 000 | 0.2 MB | 0.5 MB | ~500 |
+| 10 000 | 1.8 MB | 5.5 MB | ~5 000 |
+| 100 000 | 19 MB | 55 MB | ~50 000 |
+| 500 000 | 92 MB | 268 MB | ~250 000 |
+| 1 000 000 | 183 MB | 550 MB | ~500 000 |
 
 ### Connect with redis-cli
 
@@ -119,6 +135,7 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 |----------|---------|-------------|
 | `FASTKV_HOST` | `0.0.0.0` | Bind address (overridden by `--host`) |
 | `FASTKV_PORT` | `6379` | Listen port (overridden by `--port`) |
+| `FASTKV_CAPACITY` | `100000` | Hash table buckets (overridden by `--capacity`) |
 | `FASTKV_DIR` | `./fastkv_data` | Directory for WAL file |
 | `FASTKV_FSYNC` | `everysec` | WAL fsync policy: `always`, `everysec`, or `never` |
 
@@ -367,6 +384,7 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 | Problem | Solution |
 |---------|----------|
 | Connection refused | `ss -tlnp \| grep 6379` — check if server is running |
+| SET returns error | Table is full — increase `--capacity` (default 100K, try `--capacity 500000`) |
 | Low performance | Use `cargo build --release`; check CPU governor; enable io_uring on Linux |
 | io_uring build error | Requires Linux kernel 5.1+: `uname -r` |
 | Stale WAL data | Delete WAL to start fresh: `rm ./fastkv_data/fastkv.wal` |

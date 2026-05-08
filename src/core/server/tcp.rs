@@ -70,9 +70,12 @@ pub struct TokioServer {
 
 impl TokioServer {
     /// Create a server with default settings (port 6379, no WAL, no TTL, no lists).
+    ///
+    /// Uses a small capacity (1K buckets) since no data is expected.
+    /// For production use [`with_components`] to set `--capacity`.
     pub fn new() -> Self {
         Self {
-            store: Arc::new(KvStore::new()),
+            store: Arc::new(KvStore::with_capacity(1000)),
             wal: None,
             expiry: None,
             lists: None,
@@ -82,9 +85,12 @@ impl TokioServer {
     }
 
     /// Create a server that listens on *port*.
+    ///
+    /// Uses a small capacity (1K buckets) since no data is expected.
+    /// For production use [`with_components`] to set `--capacity`.
     pub fn with_port(port: u16) -> Self {
         Self {
-            store: Arc::new(KvStore::new()),
+            store: Arc::new(KvStore::with_capacity(1000)),
             wal: None,
             expiry: None,
             lists: None,
@@ -1540,7 +1546,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_ping() {
-        let store = KvStore::new();
+        let store = KvStore::with_capacity(100);
         let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None };
         let mut out = Vec::new();
 

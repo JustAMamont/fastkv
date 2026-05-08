@@ -34,7 +34,7 @@
 //! use fast_kv::core::kv::KvStore;
 //! use fast_kv::core::expiration::ExpirationManager;
 //!
-//! let store = Arc::new(KvStore::new());
+//! let store = Arc::new(KvStore::with_capacity(100_000));
 //! let exp = Arc::new(ExpirationManager::new(Arc::clone(&store)));
 //!
 //! store.set(b"key", b"value");
