@@ -12,7 +12,7 @@
 //! every GET can be checked for expiration.
 
 use crate::core::hash::{self, HashDelResult, WRONGTYPE_ERR};
-use crate::core::kv::{IncrError, KvStore};
+use crate::core::kv::{IncrError, KvStoreLockFree, DEFAULT_INLINE_SIZE};
 use crate::core::expiration::ExpirationManager;
 use crate::core::list::{self, ListManager};
 use crate::core::resp::{write_usize_buf, RespEncoder, RespParser};
@@ -38,11 +38,11 @@ const INITIAL_RESPONSE_SIZE: usize = 4096;
 ///
 /// Using a single context struct avoids parameter explosion when new
 /// components (lists, sets, sorted sets, …) are added over time.
-pub struct ServerContext<'a> {
-    pub store: &'a KvStore,
+pub struct ServerContext<'a, const N: usize = DEFAULT_INLINE_SIZE> {
+    pub store: &'a KvStoreLockFree<N>,
     pub wal: Option<&'a Wal>,
-    pub expiry: Option<&'a ExpirationManager>,
-    pub lists: Option<&'a ListManager>,
+    pub expiry: Option<&'a ExpirationManager<N>>,
+    pub lists: Option<&'a ListManager<N>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -52,30 +52,30 @@ pub struct ServerContext<'a> {
 /// Tokio-based async TCP server.
 ///
 /// Accepts Redis clients (RESP protocol) on the configured port.
-pub struct TokioServer {
+pub struct TokioServer<const N: usize = DEFAULT_INLINE_SIZE> {
     /// Shared lock-free KV store.
     #[allow(dead_code)]
-    store: Arc<KvStore>,
+    store: Arc<KvStoreLockFree<N>>,
     /// Optional WAL for crash-consistent persistence.
     wal: Option<Arc<Wal>>,
     /// Optional expiration manager.
-    expiry: Option<Arc<ExpirationManager>>,
+    expiry: Option<Arc<ExpirationManager<N>>>,
     /// Optional list manager.
-    lists: Option<Arc<ListManager>>,
+    lists: Option<Arc<ListManager<N>>>,
     /// Host to bind to.
     host: String,
     /// Port to listen on.
     pub port: u16,
 }
 
-impl TokioServer {
+impl<const N: usize> TokioServer<N> {
     /// Create a server with default settings (port 6379, no WAL, no TTL, no lists).
     ///
     /// Uses a small capacity (1K buckets) since no data is expected.
     /// For production use [`with_components`] to set `--capacity`.
     pub fn new() -> Self {
         Self {
-            store: Arc::new(KvStore::with_capacity(1000)),
+            store: Arc::new(KvStoreLockFree::<N>::with_capacity(1000)),
             wal: None,
             expiry: None,
             lists: None,
@@ -90,7 +90,7 @@ impl TokioServer {
     /// For production use [`with_components`] to set `--capacity`.
     pub fn with_port(port: u16) -> Self {
         Self {
-            store: Arc::new(KvStore::with_capacity(1000)),
+            store: Arc::new(KvStoreLockFree::<N>::with_capacity(1000)),
             wal: None,
             expiry: None,
             lists: None,
@@ -103,16 +103,16 @@ impl TokioServer {
     pub fn with_components(
         port: u16,
         host: String,
-        store: Arc<KvStore>,
+        store: Arc<KvStoreLockFree<N>>,
         wal: Option<Arc<Wal>>,
-        expiry: Option<Arc<ExpirationManager>>,
-        lists: Option<Arc<ListManager>>,
+        expiry: Option<Arc<ExpirationManager<N>>>,
+        lists: Option<Arc<ListManager<N>>>,
     ) -> Self {
         Self { store, wal, expiry, lists, host, port }
     }
 
     /// Clone the shared store reference.
-    pub fn store(&self) -> Arc<KvStore> {
+    pub fn store(&self) -> Arc<KvStoreLockFree<N>> {
         Arc::clone(&self.store)
     }
 
@@ -157,7 +157,7 @@ impl TokioServer {
     }
 }
 
-impl Default for TokioServer {
+impl<const N: usize> Default for TokioServer<N> {
     fn default() -> Self {
         Self::new()
     }
@@ -168,12 +168,12 @@ impl Default for TokioServer {
 // ---------------------------------------------------------------------------
 
 /// Per-connection state and main read/write loop.
-async fn handle_client(
+async fn handle_client<const N: usize>(
     mut socket: TcpStream,
-    store: Arc<KvStore>,
+    store: Arc<KvStoreLockFree<N>>,
     wal: Option<Arc<Wal>>,
-    expiry: Option<Arc<ExpirationManager>>,
-    lists: Option<Arc<ListManager>>,
+    expiry: Option<Arc<ExpirationManager<N>>>,
+    lists: Option<Arc<ListManager<N>>>,
     addr: std::net::SocketAddr,
 ) {
     // Reusable buffers — allocated once, cleared between iterations.
@@ -181,7 +181,7 @@ async fn handle_client(
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
     let mut resp_buf = Vec::with_capacity(INITIAL_RESPONSE_SIZE);
 
-    let ctx = ServerContext {
+    let ctx = ServerContext::<N> {
         store: &store,
         wal: wal.as_deref(),
         expiry: expiry.as_deref(),
@@ -306,9 +306,9 @@ fn find_resp_array_end(data: &[u8]) -> Option<usize> {
 /// This is the **central command dispatcher**. Both the Tokio server and
 /// the io_uring server delegate to this function so that behaviour is
 /// identical regardless of the I/O backend.
-pub fn process_command_into(
+pub fn process_command_into<const N: usize>(
     data: &[u8],
-    ctx: &ServerContext,
+    ctx: &ServerContext<N>,
     out: &mut Vec<u8>,
     is_inline: bool,
 ) -> bool {
@@ -333,9 +333,9 @@ pub fn process_command_into(
 /// Dispatch an already-parsed [`Command`] and append the response.
 ///
 /// Returns `true` if the connection should be closed (e.g. QUIT command).
-fn dispatch_command(
+fn dispatch_command<const N: usize>(
     cmd: &crate::core::resp::Command,
-    ctx: &ServerContext,
+    ctx: &ServerContext<N>,
     out: &mut Vec<u8>,
 ) -> bool {
     match cmd.name.as_str() {
@@ -418,9 +418,9 @@ fn err_wrong_args(out: &mut Vec<u8>) {
 /// Parse and dispatch a plain-text inline command (e.g. `GET key\r\n`).
 ///
 /// Returns `true` if the connection should be closed (e.g. QUIT command).
-fn handle_inline(
+fn handle_inline<const N: usize>(
     data: &[u8],
-    ctx: &ServerContext,
+    ctx: &ServerContext<N>,
     out: &mut Vec<u8>,
 ) -> bool {
     let line_end = data.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(data.len());
@@ -445,7 +445,7 @@ fn handle_inline(
 /// Handle `GET key` — return the value or null bulk string.
 ///
 /// Returns a WRONGTYPE error if the key holds a hash or list.
-fn cmd_get(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_get<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     // Lazy expiration check (single lock acquisition).
@@ -466,7 +466,7 @@ fn cmd_get(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<
 }
 
 /// Handle `SET key value` — insert/update and persist to WAL.
-fn cmd_set(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_set<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(key), Some(value)) = (cmd.key(), cmd.value()) else { return err_wrong_args(out); };
 
     // Parse optional flags: NX, XX, EX, PX
@@ -557,7 +557,7 @@ fn cmd_set(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<
 }
 
 /// Handle `DEL key [key ...]` — remove one or more keys, return count of deleted.
-fn cmd_del(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_del<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     if cmd.argc() < 2 {
         return err_wrong_args(out);
     }
@@ -590,7 +590,7 @@ fn cmd_echo(cmd: &crate::core::resp::Command, out: &mut Vec<u8>) {
 }
 
 /// Handle `INFO` — return server info as a bulk string.
-fn cmd_info(ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_info<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(b"# Server\r\nfastkv_version:");
     buf.extend_from_slice(crate::VERSION.as_bytes());
@@ -607,7 +607,7 @@ fn cmd_info(ctx: &ServerContext, out: &mut Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 /// Handle `INCR`/`DECR` — atomically increment/decrement by *delta*.
-fn cmd_incr(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>, delta: i64) {
+fn cmd_incr<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>, delta: i64) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     // Check type: INCR only works on plain string keys.
@@ -653,7 +653,7 @@ fn cmd_incr(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `INCRBY key delta` — increment by a specified amount.
-fn cmd_incrby(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_incrby<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(_key), Some(delta_bytes)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
 
     let delta: i64 = match std::str::from_utf8(delta_bytes).ok().and_then(|s| s.parse().ok()) {
@@ -665,7 +665,7 @@ fn cmd_incrby(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
 }
 
 /// Handle `DECRBY key delta` — decrement by a specified (positive) amount.
-fn cmd_decrby(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_decrby<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(_key), Some(delta_bytes)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
 
     let delta: i64 = match std::str::from_utf8(delta_bytes).ok().and_then(|s| s.parse().ok()) {
@@ -677,7 +677,7 @@ fn cmd_decrby(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
 }
 
 /// Handle `APPEND key suffix` — append to string value, persist result.
-fn cmd_append(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_append<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(key), Some(suffix)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
 
     if let Some(current) = ctx.store.get(key) {
@@ -706,7 +706,7 @@ fn cmd_append(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
 }
 
 /// Handle `STRLEN key` — return byte length of the string value.
-fn cmd_strlen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_strlen<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     if let Some(exp) = ctx.expiry {
@@ -727,7 +727,7 @@ fn cmd_strlen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
 }
 
 /// Handle `GETRANGE key start end` — return substring (inclusive bounds).
-fn cmd_getrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_getrange<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(key), Some(start_s), Some(end_s)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
         return err_wrong_args(out);
     };
@@ -754,7 +754,7 @@ fn cmd_getrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut
 }
 
 /// Handle `SETRANGE key offset value` — overwrite part of a string, persist result.
-fn cmd_setrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_setrange<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(key), Some(offset_s), Some(replacement)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
         return err_wrong_args(out);
     };
@@ -790,7 +790,7 @@ fn cmd_setrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut
 }
 
 /// Handle `MGET key1 key2 ...` — return an array of values (nil for missing).
-fn cmd_mget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_mget<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     if cmd.argc() < 2 {
         return err_wrong_args(out);
     }
@@ -813,7 +813,7 @@ fn cmd_mget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `MSET k1 v1 k2 v2 ...` — set multiple key-value pairs atomically.
-fn cmd_mset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_mset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let argc = cmd.argc();
     if argc < 3 || argc % 2 == 0 {
         return err_wrong_args(out);
@@ -840,7 +840,7 @@ fn cmd_mset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `EXISTS key [key ...]` — return count of existing keys.
-fn cmd_exists(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_exists<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     if cmd.argc() < 2 {
         return err_wrong_args(out);
     }
@@ -864,7 +864,7 @@ fn cmd_exists(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
 // ---------------------------------------------------------------------------
 
 /// Handle `EXPIRE key seconds` — set a TTL in seconds and persist to WAL.
-fn cmd_expire(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_expire<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(key), Some(secs_s)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
     let Some(exp) = ctx.expiry else {
         out.extend_from_slice(b"-ERR expiration not enabled\r\n");
@@ -906,7 +906,7 @@ fn cmd_expire(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
 }
 
 /// Handle `TTL key` — return remaining TTL in seconds, or -2 if no TTL.
-fn cmd_ttl(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_ttl<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     // Redis semantics:
@@ -933,7 +933,7 @@ fn cmd_ttl(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<
 }
 
 /// Handle `PTTL key` — return remaining TTL in milliseconds, or -2 if no TTL.
-fn cmd_pttl(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_pttl<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     if !ctx.store.exists(key) {
@@ -956,7 +956,7 @@ fn cmd_pttl(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `PERSIST key` — remove the TTL, making the key persistent.
-fn cmd_persist(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_persist<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
     let Some(exp) = ctx.expiry else {
         out.extend_from_slice(b":0\r\n");
@@ -972,7 +972,7 @@ fn cmd_persist(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut 
 
 /// Retrieve the current value for a key, respecting expiration.
 #[inline]
-fn get_current_value(key: &[u8], ctx: &ServerContext) -> Vec<u8> {
+fn get_current_value<const N: usize>(key: &[u8], ctx: &ServerContext<N>) -> Vec<u8> {
     if let Some(exp) = ctx.expiry {
         if exp.check_and_purge_if_expired(key) {
             return Vec::new();
@@ -982,7 +982,7 @@ fn get_current_value(key: &[u8], ctx: &ServerContext) -> Vec<u8> {
 }
 
 /// Handle `HSET key field value [field value ...]`.
-fn cmd_hset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
     if cmd.argc() < 4 || (cmd.argc() - 2) % 2 != 0 {
         return err_wrong_args(out);
@@ -1034,7 +1034,7 @@ fn cmd_hset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `HGET key field`.
-fn cmd_hget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hget<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(key), Some(field)) = (cmd.key(), cmd.arg(2)) else {
         return err_wrong_args(out);
     };
@@ -1053,7 +1053,7 @@ fn cmd_hget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `HDEL key field [field ...]`.
-fn cmd_hdel(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hdel<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
     if cmd.argc() < 3 {
         return err_wrong_args(out);
@@ -1098,7 +1098,7 @@ fn cmd_hdel(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `HGETALL key`.
-fn cmd_hgetall(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hgetall<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     let current = get_current_value(key, ctx);
@@ -1120,7 +1120,7 @@ fn cmd_hgetall(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut 
 }
 
 /// Handle `HEXISTS key field`.
-fn cmd_hexists(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hexists<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let (Some(key), Some(field)) = (cmd.key(), cmd.arg(2)) else {
         return err_wrong_args(out);
     };
@@ -1136,7 +1136,7 @@ fn cmd_hexists(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut 
 }
 
 /// Handle `HLEN key`.
-fn cmd_hlen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hlen<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     let current = get_current_value(key, ctx);
@@ -1150,7 +1150,7 @@ fn cmd_hlen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `HKEYS key`.
-fn cmd_hkeys(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hkeys<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     let current = get_current_value(key, ctx);
@@ -1170,7 +1170,7 @@ fn cmd_hkeys(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Ve
 }
 
 /// Handle `HVALS key`.
-fn cmd_hvals(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hvals<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
 
     let current = get_current_value(key, ctx);
@@ -1190,7 +1190,7 @@ fn cmd_hvals(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Ve
 }
 
 /// Handle `HMGET key field [field ...]`.
-fn cmd_hmget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hmget<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
     if cmd.argc() < 3 {
         return err_wrong_args(out);
@@ -1217,7 +1217,7 @@ fn cmd_hmget(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Ve
 }
 
 /// Handle `HMSET key field value [field value ...]`.
-fn cmd_hmset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_hmset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(key) = cmd.key() else { return err_wrong_args(out); };
     if cmd.argc() < 4 || (cmd.argc() - 2) % 2 != 0 {
         return err_wrong_args(out);
@@ -1262,7 +1262,7 @@ fn cmd_hmset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Ve
 // ---------------------------------------------------------------------------
 
 /// Handle `LPUSH key element [element ...]`.
-fn cmd_lpush(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_lpush<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1281,7 +1281,7 @@ fn cmd_lpush(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Ve
 }
 
 /// Handle `RPUSH key element [element ...]`.
-fn cmd_rpush(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_rpush<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1300,7 +1300,7 @@ fn cmd_rpush(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Ve
 }
 
 /// Handle `LPOP key [count]`.
-fn cmd_lpop(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_lpop<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1339,7 +1339,7 @@ fn cmd_lpop(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `RPOP key [count]`.
-fn cmd_rpop(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_rpop<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1377,7 +1377,7 @@ fn cmd_rpop(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `LRANGE key start stop`.
-fn cmd_lrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_lrange<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1400,7 +1400,7 @@ fn cmd_lrange(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
 }
 
 /// Handle `LLEN key`.
-fn cmd_llen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_llen<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1419,7 +1419,7 @@ fn cmd_llen(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `LINDEX key index`.
-fn cmd_lindex(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_lindex<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1437,7 +1437,7 @@ fn cmd_lindex(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut V
 }
 
 /// Handle `LREM key count element`.
-fn cmd_lrem(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_lrem<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1453,7 +1453,7 @@ fn cmd_lrem(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec
 }
 
 /// Handle `LTRIM key start stop`.
-fn cmd_ltrim(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_ltrim<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1470,7 +1470,7 @@ fn cmd_ltrim(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Ve
 }
 
 /// Handle `LSET key index element`.
-fn cmd_lset(cmd: &crate::core::resp::Command, ctx: &ServerContext, out: &mut Vec<u8>) {
+fn cmd_lset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     let Some(lists) = ctx.lists else {
         RespEncoder::write_error(out, "ERR lists not enabled");
         return;
@@ -1498,7 +1498,7 @@ mod tests {
 
     #[test]
     fn test_server_creation() {
-        let server = TokioServer::new();
+        let server: TokioServer = TokioServer::new();
         assert_eq!(server.port, DEFAULT_PORT);
     }
 
@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_get_set() {
-        let store = KvStore::with_capacity(100);
+        let store: KvStoreLockFree = KvStoreLockFree::with_capacity(100);
         let ctx = ServerContext {
             store: &store,
             wal: None,
@@ -1546,7 +1546,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_ping() {
-        let store = KvStore::with_capacity(100);
+        let store: KvStoreLockFree = KvStoreLockFree::with_capacity(100);
         let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None };
         let mut out = Vec::new();
 
@@ -1560,7 +1560,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_lpush_lrange_lpop() {
-        let store = Arc::new(KvStore::with_capacity(100));
+        let store: Arc<KvStoreLockFree> = Arc::new(KvStoreLockFree::with_capacity(100));
         let lists = ListManager::new(Arc::clone(&store));
         let ctx = ServerContext {
             store: &store,
@@ -1597,7 +1597,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_del_removes_list() {
-        let store = Arc::new(KvStore::with_capacity(100));
+        let store: Arc<KvStoreLockFree> = Arc::new(KvStoreLockFree::with_capacity(100));
         let lists = ListManager::new(Arc::clone(&store));
         let ctx = ServerContext {
             store: &store,
@@ -1630,7 +1630,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_wrong_type_get_on_list() {
-        let store = Arc::new(KvStore::with_capacity(100));
+        let store: Arc<KvStoreLockFree> = Arc::new(KvStoreLockFree::with_capacity(100));
         let lists = ListManager::new(Arc::clone(&store));
         let ctx = ServerContext {
             store: &store,

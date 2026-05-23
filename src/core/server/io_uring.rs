@@ -8,7 +8,7 @@
 //! Enable with: `cargo run --release --features io-uring -- server 6380 io_uring`
 
 use crate::core::expiration::ExpirationManager;
-use crate::core::kv::KvStore;
+use crate::core::kv::{KvStoreLockFree, DEFAULT_INLINE_SIZE};
 use crate::core::list::ListManager;
 use crate::core::server::tcp::{parse_command_bounds, process_command_into, ServerContext};
 use crate::core::wal::Wal;
@@ -22,23 +22,23 @@ const DEFAULT_PORT: u16 = 6379;
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// io_uring-based TCP server.
-pub struct IoUringServer {
-    store: Arc<KvStore>,
+pub struct IoUringServer<const N: usize = DEFAULT_INLINE_SIZE> {
+    store: Arc<KvStoreLockFree<N>>,
     wal: Option<Arc<Wal>>,
-    expiry: Option<Arc<ExpirationManager>>,
-    lists: Option<Arc<ListManager>>,
+    expiry: Option<Arc<ExpirationManager<N>>>,
+    lists: Option<Arc<ListManager<N>>>,
     host: String,
     pub port: u16,
 }
 
-impl IoUringServer {
+impl<const N: usize> IoUringServer<N> {
     /// Create a server with default settings (port 6379).
     ///
     /// Uses a small capacity (1K buckets) since no data is expected.
     /// For production use [`with_components`] to set `--capacity`.
     pub fn new() -> Self {
         Self {
-            store: Arc::new(KvStore::with_capacity(1000)),
+            store: Arc::new(KvStoreLockFree::<N>::with_capacity(1000)),
             wal: None,
             expiry: None,
             lists: None,
@@ -53,7 +53,7 @@ impl IoUringServer {
     /// For production use [`with_components`] to set `--capacity`.
     pub fn with_port(port: u16) -> Self {
         Self {
-            store: Arc::new(KvStore::with_capacity(1000)),
+            store: Arc::new(KvStoreLockFree::<N>::with_capacity(1000)),
             wal: None,
             expiry: None,
             lists: None,
@@ -66,10 +66,10 @@ impl IoUringServer {
     pub fn with_components(
         port: u16,
         host: String,
-        store: Arc<KvStore>,
+        store: Arc<KvStoreLockFree<N>>,
         wal: Option<Arc<Wal>>,
-        expiry: Option<Arc<ExpirationManager>>,
-        lists: Option<Arc<ListManager>>,
+        expiry: Option<Arc<ExpirationManager<N>>>,
+        lists: Option<Arc<ListManager<N>>>,
     ) -> Self {
         Self { store, wal, expiry, lists, host, port }
     }
@@ -124,19 +124,19 @@ impl IoUringServer {
 }
 
 /// Per-connection state and main read/write loop (io_uring edition).
-async fn handle_client(
+async fn handle_client<const N: usize>(
     stream: tokio_uring::net::TcpStream,
-    store: Arc<KvStore>,
+    store: Arc<KvStoreLockFree<N>>,
     wal: Option<Arc<Wal>>,
-    expiry: Option<Arc<ExpirationManager>>,
-    lists: Option<Arc<ListManager>>,
+    expiry: Option<Arc<ExpirationManager<N>>>,
+    lists: Option<Arc<ListManager<N>>>,
     addr: SocketAddr,
 ) {
     let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
     let mut response: Vec<u8> = Vec::with_capacity(4096);
 
-    let ctx = ServerContext {
+    let ctx = ServerContext::<N> {
         store: &store,
         wal: wal.as_deref(),
         expiry: expiry.as_deref(),
@@ -191,7 +191,7 @@ async fn handle_client(
     }
 }
 
-impl Default for IoUringServer {
+impl<const N: usize> Default for IoUringServer<N> {
     fn default() -> Self {
         Self::new()
     }

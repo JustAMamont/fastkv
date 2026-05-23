@@ -4,8 +4,9 @@
 //! and quick tests.
 
 use fast_kv::{
-    ExpirationManager, FsyncPolicy, KvStore, ListManager, VERSION, Wal,
+    ExpirationManager, FsyncPolicy, KvStoreLockFree, ListManager, VERSION, Wal,
     core::expiration::spawn_active_expiration,
+    core::kv::DEFAULT_INLINE_SIZE,
     WalOp,
 };
 use std::env;
@@ -50,6 +51,8 @@ fn print_usage() {
     println!("  --host <addr>        Bind address (default: 0.0.0.0)");
     println!("  --port <port>        Listen port (default: 6379)");
     println!("  --capacity <num>     Hash table buckets (default: 100000)");
+    println!("  --inline-size <N>    Per-side inline storage size in bytes (default: 64)");
+    println!("                       Supported: 64, 128, 256, 512");
     println!("  --dir <path>         Data directory for WAL (default: ./fastkv_data)");
     println!("  --fsync <policy>     fsync policy: always | everysec | never (default: everysec)");
     println!("  --mode <backend>     Server backend: tokio (default)");
@@ -60,6 +63,7 @@ fn print_usage() {
     println!("  FASTKV_HOST          Bind address");
     println!("  FASTKV_PORT          Listen port");
     println!("  FASTKV_CAPACITY      Hash table buckets");
+    println!("  FASTKV_INLINE_SIZE   Per-side inline storage size (64|128|256|512)");
     println!("  FASTKV_DIR           Data directory for WAL");
     println!("  FASTKV_FSYNC         fsync policy: always | everysec | never");
     println!();
@@ -69,7 +73,13 @@ fn print_usage() {
     println!("  fast_kv server --host 127.0.0.1 --port 6380");
     println!("  fast_kv server --dir /var/lib/fastkv --fsync always");
     println!("  fast_kv server --capacity 1000000      # 1M buckets for high-cardinality workloads");
-    println!("  docker run -p 6379:6379 -v fastkv_data:/data ghcr.io/<user>/fastkv:latest");
+    println!("  fast_kv server --inline-size 256       # 256-byte inline for larger values");
+    println!();
+    println!("Memory usage guide (per-side inline size × capacity):");
+    println!("  --inline-size 64  (default)  ~19 MB / 100K buckets");
+    println!("  --inline-size 128            ~27 MB / 100K buckets");
+    println!("  --inline-size 256            ~55 MB / 100K buckets");
+    println!("  --inline-size 512            ~110 MB / 100K buckets");
     println!();
     println!("Features:");
     println!("  + Lock-free hash table");
@@ -99,6 +109,10 @@ fn get_flag(args: &[String], name: &str) -> Option<String> {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Supported inline sizes. Each value produces a separate monomorphized
+/// binary path so that lock-free performance is preserved (no dyn dispatch).
+const SUPPORTED_INLINE_SIZES: &[usize] = &[64, 128, 256, 512];
+
 fn run_server(args: &[String]) {
     // --- Parse flags, fall back to env vars, then defaults ---
     let host = get_flag(args, "host")
@@ -123,6 +137,11 @@ fn run_server(args: &[String]) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
 
+    let inline_size: usize = get_flag(args, "inline-size")
+        .or_else(|| env::var("FASTKV_INLINE_SIZE").ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_INLINE_SIZE);
+
     let mode = get_flag(args, "mode")
         .unwrap_or_else(|| "tokio".into());
 
@@ -132,19 +151,52 @@ fn run_server(args: &[String]) {
         _ => FsyncPolicy::EverySec,
     };
 
+    // Validate inline size.
+    if !SUPPORTED_INLINE_SIZES.contains(&inline_size) {
+        eprintln!(
+            "Error: unsupported --inline-size {}. Supported values: {:?}",
+            inline_size, SUPPORTED_INLINE_SIZES
+        );
+        std::process::exit(1);
+    }
+
     println!("FastKV v{} (Lock-Free Edition)", VERSION);
-    println!("  host:     {}", host);
-    println!("  port:     {}", port);
-    println!("  capacity: {} buckets", capacity);
-    println!("  dir:      {}", data_dir);
-    println!("  fsync:    {:?}", fsync_policy);
-    println!("  mode:     {}", mode);
+    println!("  host:        {}", host);
+    println!("  port:        {}", port);
+    println!("  capacity:    {} buckets", capacity);
+    println!("  inline-size: {} bytes (per side)", inline_size);
+    println!("  dir:         {}", data_dir);
+    println!("  fsync:       {:?}", fsync_policy);
+    println!("  mode:        {}", mode);
 
     // --- Data directory ---
     std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
         eprintln!("Warning: could not create data dir '{}': {}", data_dir, e);
     });
 
+    // --- Dispatch to the monomorphized server for the chosen inline size ---
+    match inline_size {
+        64  => run_server_with_n::<64>(host, port, capacity, data_dir, fsync_policy, mode),
+        128 => run_server_with_n::<128>(host, port, capacity, data_dir, fsync_policy, mode),
+        256 => run_server_with_n::<256>(host, port, capacity, data_dir, fsync_policy, mode),
+        512 => run_server_with_n::<512>(host, port, capacity, data_dir, fsync_policy, mode),
+        _   => unreachable!(), // validated above
+    }
+}
+
+/// Monomorphized server entry point. `N` is the per-side inline storage size.
+///
+/// This function is instantiated once per supported inline size by the
+/// `match` in [`run_server`], producing optimal lock-free code for each
+/// configuration without any dynamic-dispatch overhead.
+fn run_server_with_n<const N: usize>(
+    host: String,
+    port: u16,
+    capacity: usize,
+    data_dir: String,
+    fsync_policy: FsyncPolicy,
+    mode: String,
+) {
     // --- WAL ---
     let wal_path = format!("{}/fastkv.wal", data_dir);
     let wal = match Wal::open(&wal_path, fsync_policy) {
@@ -159,14 +211,14 @@ fn run_server(args: &[String]) {
     };
 
     // --- KV store ---
-    let store = Arc::new(KvStore::with_capacity(capacity));
+    let store = Arc::new(KvStoreLockFree::<N>::with_capacity(capacity));
 
     // --- List manager ---
-    let lists_mgr = Arc::new(ListManager::new(Arc::clone(&store)));
+    let lists_mgr = Arc::new(ListManager::<N>::new(Arc::clone(&store)));
     let lists = Some(Arc::clone(&lists_mgr));
 
     // --- Expiration ---
-    let expiry = Some(Arc::new(ExpirationManager::with_on_expire(
+    let expiry = Some(Arc::new(ExpirationManager::<N>::with_on_expire(
         Arc::clone(&store),
         {
             let mgr = Arc::clone(&lists_mgr);
@@ -184,16 +236,31 @@ fn run_server(args: &[String]) {
                 Vec::new()
             }
         };
+        let mut recovered = 0usize;
+        let mut skipped = 0usize;
         for entry in &entries {
             match entry.op {
-                WalOp::Set => { store.set(&entry.key, &entry.value); }
-                WalOp::Del => { store.del(&entry.key); }
-                WalOp::Expire => { /* handled in Phase 2 */ }
+                WalOp::Set => {
+                    if store.set(&entry.key, &entry.value) {
+                        recovered += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                WalOp::Del => {
+                    if store.del(&entry.key) {
+                        recovered += 1;
+                    }
+                }
+                WalOp::Expire => { /* handled below */ }
             }
         }
         if !entries.is_empty() {
-            let set_del_count = entries.iter().filter(|e| e.op != WalOp::Expire).count();
-            println!("  Recovered {} entries from WAL (DBSIZE: {})", set_del_count, store.len());
+            println!("  Recovered {} entries from WAL (DBSIZE: {}){}",
+                recovered,
+                store.len(),
+                if skipped > 0 { format!(", {} skipped (exceeds inline-size={})", skipped, N) } else { String::new() }
+            );
         }
 
         // Phase 2: replay EXPIRE entries (after all keys exist).
@@ -217,8 +284,8 @@ fn run_server(args: &[String]) {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         "io_uring" => {
             use fast_kv::core::server::IoUringServer;
-            println!("Starting FastKV io_uring server on {}:{}...", host, port);
-            let server = IoUringServer::with_components(port, host.clone(), store, wal, expiry, lists);
+            println!("Starting FastKV io_uring server on {}:{} (inline-size={})...", host, port, N);
+            let server = IoUringServer::<N>::with_components(port, host, store, wal, expiry, lists);
             server.run();
         }
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -228,8 +295,8 @@ fn run_server(args: &[String]) {
         }
         _ => {
             use fast_kv::core::server::TokioServer;
-            println!("Starting FastKV server on {}:{}...", host, port);
-            let server = TokioServer::with_components(port, host, store, wal, expiry, lists);
+            println!("Starting FastKV server on {}:{} (inline-size={})...", host, port, N);
+            let server = TokioServer::<N>::with_components(port, host, store, wal, expiry, lists);
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(server.run());
         }
@@ -244,7 +311,7 @@ fn run_tests() {
     println!("FastKV v{} — Running smoke tests...\n", VERSION);
 
     println!("Test 1: Basic operations (GET/SET/DEL)");
-    let store = KvStore::with_capacity(100);
+    let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
     store.set(b"hello", b"world");
     assert_eq!(store.get(b"hello"), Some(b"world".to_vec()));
     store.set(b"hello", b"rust");
@@ -291,7 +358,7 @@ fn run_tests() {
     println!("  + PASS");
 
     println!("\nTest 7: Many keys (1 000)");
-    let store = KvStore::with_capacity(2000);
+    let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(2000);
     for i in 0..1000 {
         let key = format!("key:{}", i);
         let value = format!("value:{}", i);
@@ -300,7 +367,7 @@ fn run_tests() {
     println!("  + Inserted 1000 keys");
 
     println!("\nTest 8: Multi-threaded (4 threads)");
-    let store = Arc::new(KvStore::with_capacity(1000));
+    let store = Arc::new(KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(1000));
     let mut handles = vec![];
     for t in 0..4 {
         let store = Arc::clone(&store);
@@ -318,7 +385,7 @@ fn run_tests() {
     println!("  + 4 threads wrote 400 keys");
 
     println!("\nTest 9: Expiration");
-    let store = Arc::new(KvStore::with_capacity(100));
+    let store = Arc::new(KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100));
     let exp = ExpirationManager::new(Arc::clone(&store));
     store.set(b"temp", b"data");
     assert!(exp.expire(b"temp", std::time::Duration::from_secs(10)));
@@ -334,7 +401,7 @@ fn run_tests() {
 fn run_benchmark() {
     println!("Running single-threaded benchmark...\n");
 
-    let store = KvStore::with_capacity(200_000);  // 2× expected key count
+    let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(200_000);  // 2× expected key count
     let iterations = 100_000;
 
     println!("Warming up...");
@@ -396,7 +463,7 @@ fn run_threaded_benchmark() {
     for num_threads in [1, 2, 4, 8] {
         println!("\n=== {} Thread(s) ===", num_threads);
 
-        let store = Arc::new(KvStore::with_capacity(200_000));  // 2× expected key count
+        let store = Arc::new(KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(200_000));  // 2× expected key count
         let ops_per_thread = iterations / num_threads;
 
         let start = Instant::now();

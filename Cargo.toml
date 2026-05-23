@@ -1,6 +1,6 @@
 [package]
 name = "fast_kv"
-version = "0.4.56"
+version = "0.5.0"
 edition = "2024"
 description = "High-performance, Redis-compatible key-value store with WAL persistence, TTL expiration, and lock-free concurrency"
 license = "MIT"

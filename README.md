@@ -5,6 +5,7 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 ## Features
 
 - **Lock-free hash table** — thread-safe without mutexes; uses atomic CAS and optimistic version reads
+- **Configurable inline size** — `--inline-size 64|128|256|512` per-side storage, zero-overhead monomorphization
 - **Redis-compatible RESP protocol** — works with `redis-cli` and any Redis-compatible tooling
 - **Pipeline support** — batch multiple commands in a single round-trip for higher throughput
 - **WAL persistence** — crash-consistent write-ahead log with configurable fsync policy and TTL recovery
@@ -38,7 +39,7 @@ cargo build --release
 ### Run Server
 
 ```bash
-# Default — 0.0.0.0:6379, WAL in ./fastkv_data, fsync everysec, 100K buckets
+# Default — 0.0.0.0:6379, WAL in ./fastkv_data, fsync everysec, 100K buckets, inline-size 64
 fast_kv server
 
 # Custom host, port, data dir, fsync policy
@@ -47,12 +48,15 @@ fast_kv server --host 127.0.0.1 --port 6380 --dir /var/lib/fastkv --fsync always
 # High-cardinality workload (>50K keys): increase capacity
 fast_kv server --capacity 1000000
 
+# Larger values (up to 256 bytes per side): increase inline-size
+fast_kv server --inline-size 256 --capacity 500000
+
 # With io_uring (Linux only, maximum throughput)
 cargo build --release --features io-uring
 fast_kv server --mode io_uring
 
 # Via environment variables
-FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_FSYNC=always fast_kv server
+FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_INLINE_SIZE=256 FASTKV_FSYNC=always fast_kv server
 ```
 
 #### Server Flags
@@ -62,6 +66,7 @@ FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_FSYNC=always 
 | `--host <addr>` | `0.0.0.0` | Bind address |
 | `--port <port>` | `6379` | Listen port |
 | `--capacity <num>` | `100000` | Hash table buckets (see Memory below) |
+| `--inline-size <N>` | `64` | Per-side inline storage: `64`, `128`, `256`, or `512` bytes |
 | `--dir <path>` | `./fastkv_data` | Data directory for WAL |
 | `--fsync <policy>` | `everysec` | WAL fsync: `always`, `everysec`, `never` |
 | `--mode <backend>` | `tokio` | Server backend: `tokio` or `io_uring` (Linux only) |
@@ -70,13 +75,17 @@ FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_FSYNC=always 
 
 The `--capacity` flag controls how many buckets the lock-free hash table pre-allocates at startup. The table **does not resize** — if it fills up, `SET` returns an error. Choose a capacity at least 2× your expected key count.
 
-| Capacity | Memory (N=64) | Memory (N=256) | Max keys (50% load) |
-|----------|---------------|----------------|---------------------|
-| 1 000 | 0.2 MB | 0.5 MB | ~500 |
-| 10 000 | 1.8 MB | 5.5 MB | ~5 000 |
-| 100 000 | 19 MB | 55 MB | ~50 000 |
-| 500 000 | 92 MB | 268 MB | ~250 000 |
-| 1 000 000 | 183 MB | 550 MB | ~500 000 |
+The `--inline-size` flag controls the per-side inline storage for keys and values. Larger inline sizes allow bigger values but use more memory. Each size is monomorphized at compile time for zero runtime overhead.
+
+| Capacity | N=64 | N=128 | N=256 | N=512 | Max keys (50% load) |
+|----------|------|-------|-------|-------|---------------------|
+| 1 000 | 0.2 MB | 0.3 MB | 0.5 MB | 1.0 MB | ~500 |
+| 10 000 | 1.8 MB | 2.7 MB | 5.5 MB | 10 MB | ~5 000 |
+| 100 000 | 19 MB | 27 MB | 55 MB | 110 MB | ~50 000 |
+| 500 000 | 92 MB | 137 MB | 268 MB | 537 MB | ~250 000 |
+| 1 000 000 | 183 MB | 275 MB | 550 MB | 1.1 GB | ~500 000 |
+
+> **WAL recovery note**: when recovering from a WAL that was created with a different `--inline-size`, entries that exceed the current inline limit are skipped with a warning.
 
 ### Connect with redis-cli
 
@@ -136,6 +145,7 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 | `FASTKV_HOST` | `0.0.0.0` | Bind address (overridden by `--host`) |
 | `FASTKV_PORT` | `6379` | Listen port (overridden by `--port`) |
 | `FASTKV_CAPACITY` | `100000` | Hash table buckets (overridden by `--capacity`) |
+| `FASTKV_INLINE_SIZE` | `64` | Per-side inline size: `64`, `128`, `256`, `512` (overridden by `--inline-size`) |
 | `FASTKV_DIR` | `./fastkv_data` | Directory for WAL file |
 | `FASTKV_FSYNC` | `everysec` | WAL fsync policy: `always`, `everysec`, or `never` |
 
@@ -319,14 +329,17 @@ fastkv/
 ### Lock-free Hash Table
 
 ```
-LockFreeEntry (64-byte cache-line aligned)
-┌─────────────────────────────────────────────┐
-│  hash: AtomicU64        — 0 = empty         │
-│  key_len: AtomicU32                         │
-│  value_len: AtomicU32                       │
-│  version: AtomicU64     — optimistic reads  │
-│  data: [AtomicU8; 128]  — inline key+value  │
-└─────────────────────────────────────────────┘
+LockFreeEntry<N> (cache-line aligned, N = --inline-size)
+┌──────────────────────────────────────────────────────────┐
+│  hash: AtomicU64            — 0 = empty                  │
+│  key_len: AtomicU32                                      │
+│  value_len: AtomicU32                                    │
+│  version: AtomicU64         — optimistic reads           │
+│  data: [[AtomicU8; N]; 2]   — bank[0]=key, bank[1]=value │
+└──────────────────────────────────────────────────────────┘
+
+Default N=64: each key and value up to 64 bytes stored inline (no heap).
+Supported N: 64 (default), 128, 256, 512 — monomorphized for zero overhead.
 
 Operations:
   SET  — CAS (Compare-And-Swap) for lock-free insertion
@@ -384,10 +397,11 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 | Problem | Solution |
 |---------|----------|
 | Connection refused | `ss -tlnp \| grep 6379` — check if server is running |
-| SET returns error | Table is full — increase `--capacity` (default 100K, try `--capacity 500000`) |
+| SET returns error | Table is full — increase `--capacity`; or value too large — increase `--inline-size` |
 | Low performance | Use `cargo build --release`; check CPU governor; enable io_uring on Linux |
 | io_uring build error | Requires Linux kernel 5.1+: `uname -r` |
 | Stale WAL data | Delete WAL to start fresh: `rm ./fastkv_data/fastkv.wal` |
+| WAL recovery skips entries | Entry exceeds current `--inline-size` — use the same inline-size as when WAL was created |
 
 ## License
 
