@@ -21,7 +21,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .exceptions import FastKVConnectionError
 from .resp import encode_command
@@ -359,3 +359,54 @@ class FastKVAsyncClient:
         """Set element at *index* in list at *key*.  Returns ``True`` on success."""
         result = await self._execute_command("LSET", key, index, element)
         return result == b"OK" or result == "OK"
+
+    # =========================================================================
+    # Blob commands (require blob-store feature on server)
+    # =========================================================================
+
+    async def bset(self, key: str, value: Union[str, bytes]) -> bool:
+        """Store a large value as a compressed blob.
+
+        The server compresses *value* with zstd and stores it in the blob
+        arena.  Use for values that exceed inline size or benefit from
+        compression (sessions, JSON, etc.).
+        """
+        if isinstance(value, str):
+            value = value.encode("utf-8")
+        result = await self._execute_command("BSET", key, value)
+        return result == b"OK" or result == "OK"
+
+    async def bget(self, key: str) -> Optional[bytes]:
+        """Retrieve and decompress a blob value.
+
+        If the value is a blob reference, it is transparently decompressed.
+        Plain string values are returned as-is.
+        """
+        return await self._execute_command("BGET", key)
+
+    async def bgetraw(self, key: str) -> Optional[bytes]:
+        """Retrieve the raw compressed bytes of a blob value.
+
+        Useful for transferring blob data without decompression overhead.
+        """
+        return await self._execute_command("BGETRAW", key)
+
+    async def bstats(self) -> Dict[str, Any]:
+        """Return blob arena statistics as a dictionary."""
+        raw = await self._execute_command("BSTATS")
+        if raw is None:
+            return {}
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        result: Dict[str, Any] = {}
+        for line in text.strip().split("\r\n"):
+            if ":" in line:
+                k, v = line.split(":", 1)
+                k = k.strip().replace(" ", "_").replace("#_", "")
+                try:
+                    if k == "compression_ratio":
+                        result[k] = float(v)
+                    else:
+                        result[k] = int(v)
+                except ValueError:
+                    result[k] = v
+        return result

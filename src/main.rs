@@ -9,6 +9,8 @@ use fast_kv::{
     core::kv::DEFAULT_INLINE_SIZE,
     WalOp,
 };
+#[cfg(feature = "blob-store")]
+use fast_kv::BlobArena;
 use std::env;
 use std::sync::Arc;
 use std::thread;
@@ -168,6 +170,8 @@ fn run_server(args: &[String]) {
     println!("  dir:         {}", data_dir);
     println!("  fsync:       {:?}", fsync_policy);
     println!("  mode:        {}", mode);
+    #[cfg(feature = "blob-store")]
+    println!("  blob-store:  enabled (zstd compression)");
 
     // --- Data directory ---
     std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
@@ -217,6 +221,10 @@ fn run_server_with_n<const N: usize>(
     let lists_mgr = Arc::new(ListManager::<N>::new(Arc::clone(&store)));
     let lists = Some(Arc::clone(&lists_mgr));
 
+    // --- Blob arena ---
+    #[cfg(feature = "blob-store")]
+    let blob: Option<Arc<BlobArena>> = Some(Arc::new(BlobArena::new()));
+
     // --- Expiration ---
     let expiry = Some(Arc::new(ExpirationManager::<N>::with_on_expire(
         Arc::clone(&store),
@@ -253,6 +261,48 @@ fn run_server_with_n<const N: usize>(
                     }
                 }
                 WalOp::Expire => { /* handled below */ }
+                #[cfg(feature = "blob-store")]
+                WalOp::BSet => {
+                    // Replay blob set: compress original value, store in arena,
+                    // put BlobRef in hash table.
+                    if let Some(ref blob_arena) = blob {
+                        if let Some(blob_ref) = blob_arena.store(&entry.value) {
+                            let encoded = blob_ref.encode();
+                            if store.set(&entry.key, &encoded) {
+                                recovered += 1;
+                            } else {
+                                // BlobRef too large for inline — free the slot.
+                                blob_arena.free(&blob_ref);
+                                skipped += 1;
+                            }
+                        } else {
+                            skipped += 1;
+                        }
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                #[cfg(feature = "blob-store")]
+                WalOp::BDel => {
+                    // Replay blob delete: free the arena slot and delete from kv.
+                    if let Some(ref blob_arena) = blob {
+                        if let Some(v) = store.get(&entry.key) {
+                            if fast_kv::core::blob::BlobArena::is_blob_ref(&v) {
+                                if let Some(blob_ref) = fast_kv::core::blob::BlobRef::decode(&v) {
+                                    blob_arena.free(&blob_ref);
+                                }
+                            }
+                        }
+                    }
+                    if store.del(&entry.key) {
+                        recovered += 1;
+                    }
+                }
+                #[cfg(not(feature = "blob-store"))]
+                _ => {
+                    // Skip blob entries when blob-store is not enabled.
+                    skipped += 1;
+                }
             }
         }
         if !entries.is_empty() {
@@ -278,6 +328,17 @@ fn run_server_with_n<const N: usize>(
         }
     }
 
+    #[cfg(feature = "blob-store")]
+    if let Some(ref blob_arena) = blob {
+        let stats = blob_arena.stats();
+        if stats.total_used > 0 {
+            println!("  Blob arena: {} bytes used, compression ratio: {:.2}x",
+                stats.total_used,
+                if stats.compression_ratio > 0.0 { 1.0 / stats.compression_ratio } else { 0.0 }
+            );
+        }
+    }
+
     println!();
 
     match mode.as_str() {
@@ -285,7 +346,10 @@ fn run_server_with_n<const N: usize>(
         "io_uring" => {
             use fast_kv::core::server::IoUringServer;
             println!("Starting FastKV io_uring server on {}:{} (inline-size={})...", host, port, N);
-            let server = IoUringServer::<N>::with_components(port, host, store, wal, expiry, lists);
+            #[cfg(feature = "blob-store")]
+            let server = IoUringServer::<N>::with_components(port, host, store, wal, expiry, lists, blob);
+            #[cfg(not(feature = "blob-store"))]
+            let server = IoUringServer::<N>::with_components_no_blob(port, host, store, wal, expiry, lists);
             server.run();
         }
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -296,7 +360,10 @@ fn run_server_with_n<const N: usize>(
         _ => {
             use fast_kv::core::server::TokioServer;
             println!("Starting FastKV server on {}:{} (inline-size={})...", host, port, N);
-            let server = TokioServer::<N>::with_components(port, host, store, wal, expiry, lists);
+            #[cfg(feature = "blob-store")]
+            let server = TokioServer::<N>::with_components(port, host, store, wal, expiry, lists, blob);
+            #[cfg(not(feature = "blob-store"))]
+            let server = TokioServer::<N>::with_components_no_blob(port, host, store, wal, expiry, lists);
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(server.run());
         }

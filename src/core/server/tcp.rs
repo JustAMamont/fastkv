@@ -17,6 +17,8 @@ use crate::core::expiration::ExpirationManager;
 use crate::core::list::{self, ListManager};
 use crate::core::resp::{write_usize_buf, RespEncoder, RespParser};
 use crate::core::wal::Wal;
+#[cfg(feature = "blob-store")]
+use crate::core::blob::BlobArena;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -43,6 +45,8 @@ pub struct ServerContext<'a, const N: usize = DEFAULT_INLINE_SIZE> {
     pub wal: Option<&'a Wal>,
     pub expiry: Option<&'a ExpirationManager<N>>,
     pub lists: Option<&'a ListManager<N>>,
+    #[cfg(feature = "blob-store")]
+    pub blob: Option<&'a BlobArena>,
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +66,9 @@ pub struct TokioServer<const N: usize = DEFAULT_INLINE_SIZE> {
     expiry: Option<Arc<ExpirationManager<N>>>,
     /// Optional list manager.
     lists: Option<Arc<ListManager<N>>>,
+    /// Optional blob arena for large-value storage.
+    #[cfg(feature = "blob-store")]
+    blob: Option<Arc<BlobArena>>,
     /// Host to bind to.
     host: String,
     /// Port to listen on.
@@ -79,6 +86,8 @@ impl<const N: usize> TokioServer<N> {
             wal: None,
             expiry: None,
             lists: None,
+            #[cfg(feature = "blob-store")]
+            blob: None,
             host: "0.0.0.0".into(),
             port: DEFAULT_PORT,
         }
@@ -94,6 +103,8 @@ impl<const N: usize> TokioServer<N> {
             wal: None,
             expiry: None,
             lists: None,
+            #[cfg(feature = "blob-store")]
+            blob: None,
             host: "0.0.0.0".into(),
             port,
         }
@@ -107,8 +118,30 @@ impl<const N: usize> TokioServer<N> {
         wal: Option<Arc<Wal>>,
         expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
+        #[cfg(feature = "blob-store")] blob: Option<Arc<BlobArena>>,
     ) -> Self {
-        Self { store, wal, expiry, lists, host, port }
+        Self {
+            store, wal, expiry, lists,
+            #[cfg(feature = "blob-store")]
+            blob,
+            host, port,
+        }
+    }
+
+    /// Create a fully configured server (no blob-store).
+    #[cfg(not(feature = "blob-store"))]
+    pub fn with_components_no_blob(
+        port: u16,
+        host: String,
+        store: Arc<KvStoreLockFree<N>>,
+        wal: Option<Arc<Wal>>,
+        expiry: Option<Arc<ExpirationManager<N>>>,
+        lists: Option<Arc<ListManager<N>>>,
+    ) -> Self {
+        Self {
+            store, wal, expiry, lists,
+            host, port,
+        }
     }
 
     /// Clone the shared store reference.
@@ -135,6 +168,8 @@ impl<const N: usize> TokioServer<N> {
         let wal = self.wal.clone();
         let expiry = self.expiry.clone();
         let lists = self.lists.clone();
+        #[cfg(feature = "blob-store")]
+        let blob = self.blob.clone();
 
         loop {
             let (socket, peer_addr) = match listener.accept().await {
@@ -149,8 +184,13 @@ impl<const N: usize> TokioServer<N> {
             let wal = wal.clone();
             let expiry = expiry.clone();
             let lists = lists.clone();
+            #[cfg(feature = "blob-store")]
+            let blob = blob.clone();
 
             tokio::spawn(async move {
+                #[cfg(feature = "blob-store")]
+                handle_client(socket, store, wal, expiry, lists, blob, peer_addr).await;
+                #[cfg(not(feature = "blob-store"))]
                 handle_client(socket, store, wal, expiry, lists, peer_addr).await;
             });
         }
@@ -167,16 +207,17 @@ impl<const N: usize> Default for TokioServer<N> {
 // Client handler
 // ---------------------------------------------------------------------------
 
-/// Per-connection state and main read/write loop.
+/// Per-connection state and main read/write loop (with blob-store).
+#[cfg(feature = "blob-store")]
 async fn handle_client<const N: usize>(
     mut socket: TcpStream,
     store: Arc<KvStoreLockFree<N>>,
     wal: Option<Arc<Wal>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
+    blob: Option<Arc<BlobArena>>,
     addr: std::net::SocketAddr,
 ) {
-    // Reusable buffers — allocated once, cleared between iterations.
     let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
     let mut resp_buf = Vec::with_capacity(INITIAL_RESPONSE_SIZE);
@@ -186,16 +227,14 @@ async fn handle_client<const N: usize>(
         wal: wal.as_deref(),
         expiry: expiry.as_deref(),
         lists: lists.as_deref(),
+        blob: blob.as_deref(),
     };
 
     loop {
         let n = match socket.read(&mut read_buf).await {
-            Ok(0) => break,  // client disconnected
+            Ok(0) => break,
             Ok(n) => n,
-            Err(e) => {
-                eprintln!("[{}] Read error: {}", addr, e);
-                break;
-            }
+            Err(e) => { eprintln!("[{}] Read error: {}", addr, e); break; }
         };
 
         leftover.extend_from_slice(&read_buf[..n]);
@@ -218,8 +257,62 @@ async fn handle_client<const N: usize>(
 
         if !resp_buf.is_empty() {
             if let Err(e) = socket.write_all(&resp_buf).await {
-                eprintln!("[{}] Write error: {}", addr, e);
-                break;
+                eprintln!("[{}] Write error: {}", addr, e); break;
+            }
+        }
+        if should_close { break; }
+    }
+}
+
+/// Per-connection state and main read/write loop (no blob-store).
+#[cfg(not(feature = "blob-store"))]
+async fn handle_client<const N: usize>(
+    mut socket: TcpStream,
+    store: Arc<KvStoreLockFree<N>>,
+    wal: Option<Arc<Wal>>,
+    expiry: Option<Arc<ExpirationManager<N>>>,
+    lists: Option<Arc<ListManager<N>>>,
+    addr: std::net::SocketAddr,
+) {
+    let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
+    let mut leftover: Vec<u8> = Vec::with_capacity(4096);
+    let mut resp_buf = Vec::with_capacity(INITIAL_RESPONSE_SIZE);
+
+    let ctx = ServerContext::<N> {
+        store: &store,
+        wal: wal.as_deref(),
+        expiry: expiry.as_deref(),
+        lists: lists.as_deref(),
+    };
+
+    loop {
+        let n = match socket.read(&mut read_buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => { eprintln!("[{}] Read error: {}", addr, e); break; }
+        };
+
+        leftover.extend_from_slice(&read_buf[..n]);
+        resp_buf.clear();
+
+        let mut consumed = 0;
+        let mut should_close = false;
+        while consumed < leftover.len() {
+            match parse_command_bounds(&leftover[consumed..]) {
+                Some((len, is_inline)) => {
+                    let cmd_data = &leftover[consumed..consumed + len];
+                    should_close = process_command_into(cmd_data, &ctx, &mut resp_buf, is_inline);
+                    consumed += len;
+                    if should_close { break; }
+                }
+                None => break,
+            }
+        }
+        leftover.drain(..consumed);
+
+        if !resp_buf.is_empty() {
+            if let Err(e) = socket.write_all(&resp_buf).await {
+                eprintln!("[{}] Write error: {}", addr, e); break;
             }
         }
         if should_close { break; }
@@ -245,7 +338,7 @@ pub fn parse_command_bounds(data: &[u8]) -> Option<(usize, bool)> {
         // Inline commands — recognized by their first letter.
         b'G' | b'S' | b'D' | b'P' | b'I' | b'H' | b'L' | b'E' | b'C'
         | b'Q' | b'F' | b'K' | b'M' | b'T' | b'X' | b'R' | b'O' | b'U'
-        | b'Z' | b'N' => {
+        | b'Z' | b'N' | b'B' => {
             for i in 0..data.len() {
                 if data[i] == b'\n' {
                     return Some((i + 1, true));
@@ -397,6 +490,16 @@ fn dispatch_command<const N: usize>(
         "LTRIM"  => { cmd_ltrim(cmd, ctx, out); false }
         "LSET"   => { cmd_lset(cmd, ctx, out); false }
 
+        // ----- Blob -----
+        #[cfg(feature = "blob-store")]
+        "BSET"    => { cmd_bset(cmd, ctx, out); false }
+        #[cfg(feature = "blob-store")]
+        "BGET"    => { cmd_bget(cmd, ctx, out); false }
+        #[cfg(feature = "blob-store")]
+        "BGETRAW" => { cmd_bgetraw(cmd, ctx, out); false }
+        #[cfg(feature = "blob-store")]
+        "BSTATS"  => { cmd_bstats(ctx, out); false }
+
         _ => {
             let msg = format!("ERR unknown command '{}'", cmd.name);
             RespEncoder::write_error(out, &msg);
@@ -460,7 +563,24 @@ fn cmd_get<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext
         Some(v) if hash::is_hash_value(&v) || list::is_list_value(&v) => {
             RespEncoder::write_error(out, WRONGTYPE_ERR);
         }
-        Some(v) => RespEncoder::write_bulk_string(out, &v),
+        Some(v) => {
+            // Auto-decompress blob references for transparent GET.
+            #[cfg(feature = "blob-store")]
+            if crate::core::blob::BlobArena::is_blob_ref(&v) {
+                if let Some(blob_arena) = ctx.blob {
+                    if let Some(blob_ref) = crate::core::blob::BlobRef::decode(&v) {
+                        if let Some(decompressed) = blob_arena.retrieve(&blob_ref) {
+                            RespEncoder::write_bulk_string(out, &decompressed);
+                            return;
+                        }
+                    }
+                }
+                // Blob ref but arena unavailable or decompression failed.
+                RespEncoder::write_error(out, "ERR blob decompression failed");
+                return;
+            }
+            RespEncoder::write_bulk_string(out, &v)
+        }
         None => RespEncoder::write_null(out),
     }
 }
@@ -564,9 +684,34 @@ fn cmd_del<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext
     let mut deleted: i64 = 0;
     for i in 1..cmd.argc() {
         let Some(key) = cmd.arg(i) else { continue };
+        // Before deleting, check if the value is a blob ref and free it.
+        #[cfg(feature = "blob-store")]
+        let mut is_blob_key = false;
+        #[cfg(feature = "blob-store")]
+        if let Some(v) = ctx.store.get(key) {
+            if crate::core::blob::BlobArena::is_blob_ref(&v) {
+                if let Some(blob_arena) = ctx.blob {
+                    if let Some(blob_ref) = crate::core::blob::BlobRef::decode(&v) {
+                        blob_arena.free(&blob_ref);
+                    }
+                }
+                is_blob_key = true;
+            }
+        }
         if ctx.store.del(key) {
             deleted += 1;
-            if let Some(w) = ctx.wal { let _ = w.del(key); }
+            if let Some(w) = ctx.wal {
+                // Use BDEL for blob keys so recovery knows to also free
+                // the arena slot; regular DEL for non-blob keys.
+                #[cfg(feature = "blob-store")]
+                if is_blob_key {
+                    let _ = w.bdel(key);
+                } else {
+                    let _ = w.del(key);
+                }
+                #[cfg(not(feature = "blob-store"))]
+                let _ = w.del(key);
+            }
             if let Some(exp) = ctx.expiry { exp.remove(key); }
             if let Some(lists) = ctx.lists { lists.remove_key(key); }
         }
@@ -1489,6 +1634,163 @@ fn cmd_lset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
 }
 
 // ---------------------------------------------------------------------------
+// Blob commands (feature-gated behind blob-store)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "blob-store")]
+/// Handle `BSET key value` — compress and store in blob arena, store ref in hash table.
+fn cmd_bset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let (Some(key), Some(value)) = (cmd.key(), cmd.value()) else { return err_wrong_args(out); };
+
+    let Some(blob_arena) = ctx.blob else {
+        RespEncoder::write_error(out, "ERR blob store not enabled");
+        return;
+    };
+
+    // If the key currently holds a blob ref, free the old slot.
+    if let Some(old_val) = ctx.store.get(key) {
+        if crate::core::blob::BlobArena::is_blob_ref(&old_val) {
+            if let Some(old_ref) = crate::core::blob::BlobRef::decode(&old_val) {
+                blob_arena.free(&old_ref);
+            }
+        }
+    }
+
+    // If the key held a list, clean up the list data.
+    if let Some(lists) = ctx.lists {
+        if list::is_list_value(&ctx.store.get(key).unwrap_or_default()) {
+            lists.remove_key(key);
+        }
+    }
+
+    // Remove old TTL if overwriting.
+    if let Some(exp) = ctx.expiry {
+        exp.remove(key);
+    }
+
+    // Store in blob arena.
+    let Some(blob_ref) = blob_arena.store(value) else {
+        RespEncoder::write_error(out, "ERR blob store failed");
+        return;
+    };
+
+    // Store the blob ref in the hash table.
+    let encoded = blob_ref.encode();
+    if ctx.store.set(key, &encoded) {
+        if let Some(w) = ctx.wal {
+            // Write the ORIGINAL uncompressed value to the WAL so that the
+            // blob arena can be reconstructed on recovery.
+            if w.bset(key, value).is_err() {
+                out.extend_from_slice(b"-ERR WAL write failed\r\n");
+                return;
+            }
+        }
+        out.extend_from_slice(b"+OK\r\n");
+    } else {
+        // Failed to store ref inline — free the blob slot.
+        blob_arena.free(&blob_ref);
+        RespEncoder::write_error(out, "ERR blob ref too large for inline storage");
+    }
+}
+
+#[cfg(feature = "blob-store")]
+/// Handle `BGET key` — retrieve and decompress a blob value.
+fn cmd_bget<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    // Lazy expiration check.
+    if let Some(exp) = ctx.expiry {
+        if exp.check_and_purge_if_expired(key) {
+            RespEncoder::write_null(out);
+            return;
+        }
+    }
+
+    let Some(blob_arena) = ctx.blob else {
+        RespEncoder::write_error(out, "ERR blob store not enabled");
+        return;
+    };
+
+    let Some(v) = ctx.store.get(key) else {
+        RespEncoder::write_null(out);
+        return;
+    };
+
+    // Reject hash/list values.
+    if hash::is_hash_value(&v) || list::is_list_value(&v) {
+        RespEncoder::write_error(out, WRONGTYPE_ERR);
+        return;
+    }
+
+    if !crate::core::blob::BlobArena::is_blob_ref(&v) {
+        // Not a blob ref — return as-is (plain string).
+        RespEncoder::write_bulk_string(out, &v);
+        return;
+    }
+
+    let Some(blob_ref) = crate::core::blob::BlobRef::decode(&v) else {
+        RespEncoder::write_error(out, "ERR invalid blob reference");
+        return;
+    };
+
+    match blob_arena.retrieve(&blob_ref) {
+        Some(data) => RespEncoder::write_bulk_string(out, &data),
+        None => RespEncoder::write_error(out, "ERR blob decompression failed"),
+    }
+}
+
+#[cfg(feature = "blob-store")]
+/// Handle `BGETRAW key` — return compressed bytes as-is.
+fn cmd_bgetraw<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    // Lazy expiration check.
+    if let Some(exp) = ctx.expiry {
+        if exp.check_and_purge_if_expired(key) {
+            RespEncoder::write_null(out);
+            return;
+        }
+    }
+
+    let Some(blob_arena) = ctx.blob else {
+        RespEncoder::write_error(out, "ERR blob store not enabled");
+        return;
+    };
+
+    let Some(v) = ctx.store.get(key) else {
+        RespEncoder::write_null(out);
+        return;
+    };
+
+    if !crate::core::blob::BlobArena::is_blob_ref(&v) {
+        RespEncoder::write_error(out, "ERR not a blob reference");
+        return;
+    }
+
+    let Some(blob_ref) = crate::core::blob::BlobRef::decode(&v) else {
+        RespEncoder::write_error(out, "ERR invalid blob reference");
+        return;
+    };
+
+    match blob_arena.retrieve_raw(&blob_ref) {
+        Some(data) => RespEncoder::write_bulk_string(out, &data),
+        None => RespEncoder::write_error(out, "ERR blob read failed"),
+    }
+}
+
+#[cfg(feature = "blob-store")]
+/// Handle `BSTATS` — return blob arena statistics.
+fn cmd_bstats<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(blob_arena) = ctx.blob else {
+        RespEncoder::write_error(out, "ERR blob store not enabled");
+        return;
+    };
+
+    let stats = blob_arena.stats();
+    RespEncoder::write_bulk_string(out, stats.to_string().as_bytes());
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1525,6 +1827,8 @@ mod tests {
             wal: None,
             expiry: None,
             lists: None,
+            #[cfg(feature = "blob-store")]
+            blob: None,
         };
         let mut out = Vec::new();
 
@@ -1547,7 +1851,10 @@ mod tests {
     #[test]
     fn test_dispatch_ping() {
         let store: KvStoreLockFree = KvStoreLockFree::with_capacity(100);
-        let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None };
+        let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None,
+            #[cfg(feature = "blob-store")]
+            blob: None,
+        };
         let mut out = Vec::new();
 
         let cmd = crate::core::resp::Command {
@@ -1567,6 +1874,8 @@ mod tests {
             wal: None,
             expiry: None,
             lists: Some(&lists),
+            #[cfg(feature = "blob-store")]
+            blob: None,
         };
         let mut out = Vec::new();
 
@@ -1604,6 +1913,8 @@ mod tests {
             wal: None,
             expiry: None,
             lists: Some(&lists),
+            #[cfg(feature = "blob-store")]
+            blob: None,
         };
         let mut out = Vec::new();
 
@@ -1637,6 +1948,8 @@ mod tests {
             wal: None,
             expiry: None,
             lists: Some(&lists),
+            #[cfg(feature = "blob-store")]
+            blob: None,
         };
         let mut out = Vec::new();
 

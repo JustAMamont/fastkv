@@ -486,3 +486,111 @@ class FastKVClient:
         """
         result = self._execute_command("LSET", key, index, element)
         return result == b"OK" or result == "OK"
+
+    # =========================================================================
+    # Blob commands (require blob-store feature on server)
+    # =========================================================================
+
+    def bset(self, key: str, value: Union[str, bytes]) -> bool:
+        """Store a large value as a compressed blob.
+
+        The server compresses *value* with zstd and stores it in the blob
+        arena.  A 33-byte reference is kept in the hash table.  Use this
+        for values that exceed the inline size limit (default 64 bytes) or
+        for any data that benefits from compression (sessions, JSON, etc.).
+
+        Parameters
+        ----------
+        key : str
+            The key to set.
+        value : str | bytes
+            The value to store.  Strings are encoded as UTF-8.
+
+        Returns
+        -------
+        bool
+            ``True`` on success.
+
+        Raises
+        ------
+        FastKVResponseError
+            If the blob store is not enabled on the server or the value
+            could not be stored.
+        """
+        if isinstance(value, str):
+            value = value.encode("utf-8")
+        result = self._execute_command("BSET", key, value)
+        return result == b"OK" or result == "OK"
+
+    def bget(self, key: str) -> Optional[bytes]:
+        """Retrieve and decompress a blob value.
+
+        If the value at *key* is a blob reference, it is transparently
+        decompressed.  If it is a plain string value, it is returned as-is.
+
+        Parameters
+        ----------
+        key : str
+            The key to retrieve.
+
+        Returns
+        -------
+        bytes | None
+            The decompressed value, or ``None`` if the key does not exist.
+        """
+        return self._execute_command("BGET", key)
+
+    def bgetraw(self, key: str) -> Optional[bytes]:
+        """Retrieve the raw compressed bytes of a blob value.
+
+        Useful for transferring blob data without decompression overhead
+        (e.g. replicating to another node).
+
+        Parameters
+        ----------
+        key : str
+            The key to retrieve.
+
+        Returns
+        -------
+        bytes | None
+            The compressed bytes, or ``None`` if the key does not exist
+            or is not a blob reference.
+        """
+        return self._execute_command("BGETRAW", key)
+
+    def bstats(self) -> Dict[str, Any]:
+        """Return blob arena statistics.
+
+        Returns
+        -------
+        dict
+            A dictionary with keys:
+
+            - ``total_used`` (int) — bytes currently used in the arena.
+            - ``total_compressed`` (int) — total compressed bytes ever stored.
+            - ``total_original`` (int) — total original (uncompressed) bytes
+              ever stored.
+            - ``compression_ratio`` (float) — compressed / original ratio.
+              Lower is better; e.g. 0.15 means 6.7× compression.
+            - ``free_slots`` (int) — number of reclaimed slots available for
+              reuse.
+        """
+        raw = self._execute_command("BSTATS")
+        if raw is None:
+            return {}
+        # Parse the text format: "key:value\r\n..."
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        result: Dict[str, Any] = {}
+        for line in text.strip().split("\r\n"):
+            if ":" in line:
+                k, v = line.split(":", 1)
+                k = k.strip().replace(" ", "_").replace("#_", "")
+                try:
+                    if k == "compression_ratio":
+                        result[k] = float(v)
+                    else:
+                        result[k] = int(v)
+                except ValueError:
+                    result[k] = v
+        return result

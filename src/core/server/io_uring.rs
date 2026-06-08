@@ -12,6 +12,8 @@ use crate::core::kv::{KvStoreLockFree, DEFAULT_INLINE_SIZE};
 use crate::core::list::ListManager;
 use crate::core::server::tcp::{parse_command_bounds, process_command_into, ServerContext};
 use crate::core::wal::Wal;
+#[cfg(feature = "blob-store")]
+use crate::core::blob::BlobArena;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -27,6 +29,8 @@ pub struct IoUringServer<const N: usize = DEFAULT_INLINE_SIZE> {
     wal: Option<Arc<Wal>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
+    #[cfg(feature = "blob-store")]
+    blob: Option<Arc<BlobArena>>,
     host: String,
     pub port: u16,
 }
@@ -42,6 +46,8 @@ impl<const N: usize> IoUringServer<N> {
             wal: None,
             expiry: None,
             lists: None,
+            #[cfg(feature = "blob-store")]
+            blob: None,
             host: "0.0.0.0".into(),
             port: DEFAULT_PORT,
         }
@@ -57,13 +63,30 @@ impl<const N: usize> IoUringServer<N> {
             wal: None,
             expiry: None,
             lists: None,
+            #[cfg(feature = "blob-store")]
+            blob: None,
             host: "0.0.0.0".into(),
             port,
         }
     }
 
     /// Create a fully configured server.
+    #[cfg(feature = "blob-store")]
     pub fn with_components(
+        port: u16,
+        host: String,
+        store: Arc<KvStoreLockFree<N>>,
+        wal: Option<Arc<Wal>>,
+        expiry: Option<Arc<ExpirationManager<N>>>,
+        lists: Option<Arc<ListManager<N>>>,
+        blob: Option<Arc<BlobArena>>,
+    ) -> Self {
+        Self { store, wal, expiry, lists, blob, host, port }
+    }
+
+    /// Create a fully configured server (no blob-store).
+    #[cfg(not(feature = "blob-store"))]
+    pub fn with_components_no_blob(
         port: u16,
         host: String,
         store: Arc<KvStoreLockFree<N>>,
@@ -100,6 +123,8 @@ impl<const N: usize> IoUringServer<N> {
         let wal = self.wal.clone();
         let expiry = self.expiry.clone();
         let lists = self.lists.clone();
+        #[cfg(feature = "blob-store")]
+        let blob = self.blob.clone();
 
         loop {
             let (stream, client_addr) = match listener.accept().await {
@@ -113,17 +138,93 @@ impl<const N: usize> IoUringServer<N> {
             let store = Arc::clone(&self.store);
             let wal = wal.clone();
             let expiry = expiry.clone();
-
-                let lists = lists.clone();
+            let lists = lists.clone();
+            #[cfg(feature = "blob-store")]
+            let blob = blob.clone();
 
             tokio_uring::spawn(async move {
+                #[cfg(feature = "blob-store")]
+                handle_client(stream, store, wal, expiry, lists, blob, client_addr).await;
+                #[cfg(not(feature = "blob-store"))]
                 handle_client(stream, store, wal, expiry, lists, client_addr).await;
             });
         }
     }
 }
 
-/// Per-connection state and main read/write loop (io_uring edition).
+/// Per-connection state and main read/write loop (io_uring edition, with blob-store).
+#[cfg(feature = "blob-store")]
+async fn handle_client<const N: usize>(
+    stream: tokio_uring::net::TcpStream,
+    store: Arc<KvStoreLockFree<N>>,
+    wal: Option<Arc<Wal>>,
+    expiry: Option<Arc<ExpirationManager<N>>>,
+    lists: Option<Arc<ListManager<N>>>,
+    blob: Option<Arc<BlobArena>>,
+    addr: SocketAddr,
+) {
+    let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
+    let mut leftover: Vec<u8> = Vec::with_capacity(4096);
+    let mut response: Vec<u8> = Vec::with_capacity(4096);
+
+    let ctx = ServerContext::<N> {
+        store: &store,
+        wal: wal.as_deref(),
+        expiry: expiry.as_deref(),
+        lists: lists.as_deref(),
+        blob: blob.as_deref(),
+    };
+
+    loop {
+        let (result, buf) = stream.read(buffer).await;
+        buffer = buf;
+
+        let n = match result {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("[{}] Read error: {}", addr, e);
+                break;
+            }
+        };
+
+        leftover.extend_from_slice(&buffer[..n]);
+        response.clear();
+
+        let mut consumed = 0;
+        let mut should_close = false;
+        while consumed < leftover.len() {
+            match parse_command_bounds(&leftover[consumed..]) {
+                Some((len, is_inline)) => {
+                    let cmd_data = &leftover[consumed..consumed + len];
+                    should_close = process_command_into(
+                        cmd_data,
+                        &ctx,
+                        &mut response,
+                        is_inline,
+                    );
+                    consumed += len;
+                    if should_close { break; }
+                }
+                None => break,
+            }
+        }
+        leftover.drain(..consumed);
+
+        if !response.is_empty() {
+            let (result, resp) = stream.write_all(response).await;
+            response = resp;
+            if let Err(e) = result {
+                eprintln!("[{}] Write error: {}", addr, e);
+                break;
+            }
+        }
+        if should_close { break; }
+    }
+}
+
+/// Per-connection state and main read/write loop (io_uring edition, no blob-store).
+#[cfg(not(feature = "blob-store"))]
 async fn handle_client<const N: usize>(
     stream: tokio_uring::net::TcpStream,
     store: Arc<KvStoreLockFree<N>>,

@@ -1,6 +1,6 @@
 [package]
 name = "fast_kv"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "High-performance, Redis-compatible key-value store with WAL persistence, TTL expiration, and lock-free concurrency"
 license = "MIT"
@@ -10,6 +10,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 zerocopy = { version = "0.8", optional = true }
 tokio-uring = { version = "0.5", optional = true }
 crc32c = "0.6"
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -32,3 +33,4 @@ opt-level = 0
 default = []
 zero-copy = ["zerocopy"]
 io-uring = ["tokio-uring"]
+blob-store = ["zstd"]

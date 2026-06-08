@@ -48,5 +48,7 @@ pub use core::wal::{Wal, WalEntry, WalOp, FsyncPolicy};
 pub use core::expiration::ExpirationManager;
 pub use core::hash::{HashError, HashDelResult, WRONGTYPE_ERR};
 pub use core::list::ListManager;
+#[cfg(feature = "blob-store")]
+pub use core::blob::{BlobArena, BlobRef, BlobStats, BLOB_REF_FLAG, BLOB_REF_SIZE};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -79,6 +79,11 @@ pub enum WalOp {
     Del = 0x02,
     /// Set a TTL deadline on a key.
     Expire = 0x03,
+    /// Insert or update a blob key (original uncompressed value stored
+    /// in the WAL so that the blob arena can be reconstructed on recovery).
+    BSet = 0x04,
+    /// Delete a blob key (also frees the blob arena slot).
+    BDel = 0x05,
 }
 
 impl TryFrom<u8> for WalOp {
@@ -89,6 +94,8 @@ impl TryFrom<u8> for WalOp {
             0x01 => Ok(WalOp::Set),
             0x02 => Ok(WalOp::Del),
             0x03 => Ok(WalOp::Expire),
+            0x04 => Ok(WalOp::BSet),
+            0x05 => Ok(WalOp::BDel),
             other => Err(WalError::UnknownOp(other)),
         }
     }
@@ -310,6 +317,32 @@ impl Wal {
     /// Returns [`WalError::Io`] on write failure.
     pub fn expire(&self, key: &[u8], deadline_ms: u64) -> Result<(), WalError> {
         self.append(WalOp::Expire, key, &deadline_ms.to_le_bytes())
+    }
+
+    /// Append a BSET entry to the WAL.
+    ///
+    /// Stores the **original uncompressed** value so that the blob arena
+    /// can be fully reconstructed on recovery (compress → arena store →
+    /// BlobRef in hash table). The value length must not exceed 65535
+    /// bytes (u16 limit in the WAL format).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] on write failure.
+    pub fn bset(&self, key: &[u8], original_value: &[u8]) -> Result<(), WalError> {
+        self.append(WalOp::BSet, key, original_value)
+    }
+
+    /// Append a BDEL entry to the WAL.
+    ///
+    /// On recovery the blob arena slot is freed and the key is deleted
+    /// from the hash table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] on write failure.
+    pub fn bdel(&self, key: &[u8]) -> Result<(), WalError> {
+        self.append(WalOp::BDel, key, &[])
     }
 
     /// Append an arbitrary entry to the WAL.
@@ -634,6 +667,8 @@ mod tests {
         assert_eq!(WalOp::try_from(0x01).unwrap(), WalOp::Set);
         assert_eq!(WalOp::try_from(0x02).unwrap(), WalOp::Del);
         assert_eq!(WalOp::try_from(0x03).unwrap(), WalOp::Expire);
+        assert_eq!(WalOp::try_from(0x04).unwrap(), WalOp::BSet);
+        assert_eq!(WalOp::try_from(0x05).unwrap(), WalOp::BDel);
         assert!(matches!(WalOp::try_from(0xFF), Err(WalError::UnknownOp(0xFF))));
         assert!(matches!(WalOp::try_from(0x00), Err(WalError::UnknownOp(0x00))));
     }
@@ -748,6 +783,55 @@ mod tests {
         let wal = Wal::open(&path, FsyncPolicy::Always).unwrap();
         assert!(wal.path().ends_with("meta.wal"));
         assert_eq!(wal.fsync_policy(), FsyncPolicy::Always);
+    }
+
+    #[test]
+    fn test_wal_bset_bdel_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.wal");
+        let wal = Wal::open(&path, FsyncPolicy::Never).unwrap();
+
+        wal.set(b"plain", b"value").unwrap();
+        wal.bset(b"session:1", b"large_blob_data_here").unwrap();
+        wal.bset(b"session:2", b"another_blob").unwrap();
+        wal.bdel(b"session:1").unwrap();
+        drop(wal);
+
+        let entries = Wal::recover(&path).unwrap();
+        assert_eq!(entries.len(), 4);
+
+        assert_eq!(entries[0].op, WalOp::Set);
+        assert_eq!(entries[0].key, b"plain");
+        assert_eq!(entries[0].value, b"value");
+
+        assert_eq!(entries[1].op, WalOp::BSet);
+        assert_eq!(entries[1].key, b"session:1");
+        assert_eq!(entries[1].value, b"large_blob_data_here");
+
+        assert_eq!(entries[2].op, WalOp::BSet);
+        assert_eq!(entries[2].key, b"session:2");
+        assert_eq!(entries[2].value, b"another_blob");
+
+        assert_eq!(entries[3].op, WalOp::BDel);
+        assert_eq!(entries[3].key, b"session:1");
+        assert_eq!(entries[3].value, b"");
+    }
+
+    #[test]
+    fn test_wal_bset_large_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob_large.wal");
+        let wal = Wal::open(&path, FsyncPolicy::Never).unwrap();
+
+        // Simulate a 4KB session blob.
+        let large_value = vec![b'x'; 4096];
+        wal.bset(b"session:big", &large_value).unwrap();
+        drop(wal);
+
+        let entries = Wal::recover(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, WalOp::BSet);
+        assert_eq!(entries[0].value.len(), 4096);
     }
 
 }

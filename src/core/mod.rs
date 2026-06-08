@@ -7,6 +7,7 @@
 //! * [`wal`] — write-ahead log for crash-consistent persistence
 //! * [`expiration`] — TTL / key-expiration management
 //! * [`hash`] — Redis-compatible hash data type (HGET/HSET/…)
+//! * [`blob`] — compressed large-value storage (BSET/BGET/…)
 //! * [`server`] — TCP server implementations (Tokio, io_uring)
 
 pub mod kv;
@@ -16,3 +17,6 @@ pub mod expiration;
 pub mod hash;
 pub mod list;
 pub mod server;
+
+#[cfg(feature = "blob-store")]
+pub mod blob;

@@ -6,9 +6,10 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 
 - **Lock-free hash table** — thread-safe without mutexes; uses atomic CAS and optimistic version reads
 - **Configurable inline size** — `--inline-size 64|128|256|512` per-side storage, zero-overhead monomorphization
+- **Blob Arena** — zstd-compressed large-value storage (feature `blob-store`); `BSET`/`BGET`/`BGETRAW`/`BSTATS`
 - **Redis-compatible RESP protocol** — works with `redis-cli` and any Redis-compatible tooling
 - **Pipeline support** — batch multiple commands in a single round-trip for higher throughput
-- **WAL persistence** — crash-consistent write-ahead log with configurable fsync policy and TTL recovery
+- **WAL persistence** — crash-consistent write-ahead log with configurable fsync policy and TTL recovery (including BSET/BDel ops)
 - **TTL / Expiration** — `EXPIRE`, `TTL`, `PTTL`, `PERSIST` with lazy + active key purging, persisted to WAL
 - **Hash data type** — `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HMGET`, `HMSET`
 - **List data type** — `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LREM`, `LTRIM`, `LSET`
@@ -33,7 +34,11 @@ FastKV vs Redis (io_uring, 2 cores)
 ### Build
 
 ```bash
+# Standard build (without blob arena)
 cargo build --release
+
+# With blob arena (zstd-compressed large-value storage)
+cargo build --release --features blob-store
 ```
 
 ### Run Server
@@ -51,8 +56,16 @@ fast_kv server --capacity 1000000
 # Larger values (up to 256 bytes per side): increase inline-size
 fast_kv server --inline-size 256 --capacity 500000
 
+# With blob arena (zstd-compressed large values)
+cargo build --release --features blob-store
+fast_kv server
+
 # With io_uring (Linux only, maximum throughput)
 cargo build --release --features io-uring
+fast_kv server --mode io_uring
+
+# With both blob arena and io_uring
+cargo build --release --features "blob-store,io-uring"
 fast_kv server --mode io_uring
 
 # Via environment variables
@@ -100,6 +113,30 @@ OK
 "world"
 127.0.0.1:6379> PING
 PONG
+```
+
+### Blob Arena (large values, requires `--features blob-store`)
+
+```bash
+# Build with blob-store feature
+cargo build --release --features blob-store
+fast_kv server
+```
+
+```
+127.0.0.1:6379> BSET session:1 "{\"ua\":\"Chrome/120\",\"cookies\":\"...\"}"
+OK
+127.0.0.1:6379> BGET session:1
+"{\"ua\":\"Chrome/120\",\"cookies\":\"...\"}"
+127.0.0.1:6379> BGETRAW session:1
+"<compressed bytes>"
+127.0.0.1:6379> BSTATS
+# Blob Arena
+total_used:1234
+total_compressed:1234
+total_original:5678
+compression_ratio:0.2172
+free_slots:0
 ```
 
 ## Installation
@@ -203,6 +240,18 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 | `HMGET key field [field ...]` | Get multiple fields |
 | `HMSET key f1 v1 f2 v2 ...` | Set multiple fields |
 
+### Blob Store (feature: `blob-store`)
+
+| Command | Description |
+|---------|-------------|
+| `BSET key value` | Set with auto-compression: if value > blob threshold, compress with zstd and store in blob arena |
+| `BGET key` | Get with auto-decompression: transparently decompresses blob refs |
+| `BGETRAW key` | Get raw compressed bytes (skip decompression, useful for transfer) |
+| `BSTATS` | Blob arena statistics: total_used, total_compressed, total_original, compression_ratio, free_slots |
+
+> `GET` transparently decompresses blob refs — use `BGET` for clarity, but regular `GET` works too.
+> `DEL` automatically frees blob arena slots.
+
 ### List
 
 | Command | Description |
@@ -221,19 +270,24 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 
 ## Testing
 
-### Server Unit Tests (122 tests)
+### Server Unit Tests
 
 ```bash
+# Standard tests (110 tests)
 cargo test
+
+# With blob-store feature (124 tests)
+cargo test --features blob-store
 ```
 
 | Module | Tests | Coverage |
 |--------|------:|----------|
 | `kv.rs` | 29 | GET/SET/DEL, INCR/DECR, MGET/MSET, APPEND, STRLEN, GETRANGE, SETRANGE, lock-free ops, concurrent |
-| `wal.rs` | 16 | Create/recover, CRC-32C, alignment, binary keys, large values, EXPIRE entry |
+| `wal.rs` | 18 | Create/recover, CRC-32C, alignment, binary keys, large values, EXPIRE entry, BSET/BDel entries |
 | `expiration.rs` | 14 | EXPIRE/TTL/PERSIST, lazy/active purging, concurrent, DEL cascade |
 | `hash.rs` | 20 | HSET/HGET/HDEL, HGETALL, HEXISTS, HLEN, HKEYS/HVALS, HMGET/HMSET, edge cases |
 | `list.rs` | 17 | LPUSH/RPUSH, LPOP/RPOP, LRANGE, LLEN, LINDEX, LREM, LTRIM, LSET, WRONGTYPE |
+| `blob.rs` | 14 | BlobRef encode/decode, store/retrieve, free/reuse, hash integrity, stats, BGETRAW, edge cases |
 | `resp.rs` | 18 | RESP array/inline parse, encode, roundtrip, binary data, error types |
 | `tcp.rs` | 8 | Dispatch handlers, DEL list cleanup, WRONGTYPE, PING, inline parsing |
 
@@ -249,7 +303,7 @@ cargo test
 
 | Suite | Tests |
 |-------|------:|
-| Rust (server) | 122 |
+| Rust (server) | 124 (with blob-store) / 110 (without) |
 | Rust (client) | 23 |
 | Python sync | 27 |
 | Python async | 28 |
@@ -281,7 +335,8 @@ fastkv/
 │       ├── mod.rs
 │       ├── kv.rs               # Lock-free hash table + string operations
 │       ├── resp.rs             # RESP protocol parser/encoder
-│       ├── wal.rs              # Write-ahead log (SET/DEL/EXPIRE)
+│       ├── wal.rs              # Write-ahead log (SET/DEL/EXPIRE/BSET/BDel)
+│       ├── blob.rs             # Blob Arena — zstd-compressed large-value storage
 │       ├── expiration.rs       # TTL / key expiration
 │       ├── hash.rs             # Hash data type
 │       ├── list.rs             # List data type
@@ -343,9 +398,36 @@ Supported N: 64 (default), 128, 256, 512 — monomorphized for zero overhead.
 
 Operations:
   SET  — CAS (Compare-And-Swap) for lock-free insertion
-  GET  — Optimistic read with version check
-  DEL  — Atomic hash reset
+  GET  — Optimistic read with version check (auto-decompresses blob refs)
+  DEL  — Atomic hash reset (auto-frees blob arena slots)
   INCR — CAS loop on version for atomic read-modify-write
+```
+
+### Blob Arena (feature: `blob-store`)
+
+```
+Blob Ref (inline value with flag 0xFD):
+┌──────────┬──────────┬───────────┬───────────┬──────────────┐
+│ flag: 0xFD│ offset:  │ comp_len: │ orig_len: │ data_hash:   │
+│ 1 byte    │ u64 8B   │ u32 4B    │ u32 4B    │ dual-crc32c  │
+│           │          │           │           │ 16B          │
+└──────────┴──────────┴───────────┴───────────┴──────────────┘
+Total: 33 bytes — fits even in N=64 inline size
+
+Architecture:
+  - Chunked allocation: 64 MB chunks, new chunks on demand
+  - Lock-free write: CAS on write_offset to atomically claim space
+  - Lock-free read: data is immutable after write
+  - Free list: sorted best-fit with binary search O(log n) reuse
+  - Compression: zstd level 3
+  - Integrity: dual crc32c (two seeds) for 16-byte hash
+  - WAL: BSET (op 0x04) and BDel (op 0x05) for crash recovery
+
+Expected characteristics:
+  - Session compression: 4 KB -> ~600 B (6-7x)
+  - Write throughput: >500K ops/sec (pipeline)
+  - Read throughput: >700K ops/sec (pipeline)
+  - Memory for 1M sessions: ~600 MB arena + ~500 MB KV = ~1.1 GB
 ```
 
 ### WAL (Write-Ahead Log)
@@ -358,8 +440,12 @@ Operations:
 
 Fsync policies:  always (safest) | everysec (balanced) | never (fastest)
 
+WAL Operations:
+  0x00 = SET     0x01 = DEL     0x02 = EXPIRE
+  0x04 = BSET    0x05 = BDel   (blob-store feature only)
+
 Recovery:
-  Phase 1 — replay SET and DEL entries into KV store
+  Phase 1 — replay SET, DEL, BSET, and BDel entries into KV store
   Phase 2 — replay EXPIRE entries into expiration manager
   Corrupted trailing entries are silently discarded
 ```
@@ -382,10 +468,15 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 - [x] Phase 5 — Hash: HSET/HGET/HDEL/HGETALL/HEXISTS/HLEN/HKEYS/HVALS/HMGET/HMSET
 - [x] Phase 6 — List: LPUSH/RPUSH, LPOP/RPOP, LRANGE/LLEN/LINDEX, LREM/LTRIM/LSET, WRONGTYPE
 - [x] Phase 7 — Client SDKs: Go, Python (sync + async), Java (sync + reactive), Node.js, Rust (zero-dependency, pipeline support)
-- [ ] Phase 8 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
-- [ ] Phase 9 — Sorted Set: ZADD, ZREM, ZRANGE, ZSCORE, ZRANK, ZCARD
-- [ ] Phase 10 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), Lua scripting
-- [ ] Phase 11 — Cluster: hash-slot sharding, node discovery, failover
+- [x] Phase 8 — Blob Arena: BSET/BGET/BGETRAW/BSTATS, zstd compression, lock-free arena, WAL persistence, Python client
+- [ ] Phase 9 — SimHash/MinHash/LSH: similarity search for profiles (feature: `similarity`)
+- [ ] Phase 10 — SCAN/KEYS: cursor-based key iteration, glob MATCH, DBSTATS
+- [ ] Phase 11 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
+- [ ] Phase 12 — List WAL: persistent list operations (LPUSH/RPUSH/LPOP/RPOP/LTRIM)
+- [ ] Phase 13 — Compressed WAL Segments: segment-based WAL with zstd batch compression
+- [ ] Phase 14 — Sorted Set: ZADD, ZREM, ZRANGE, ZSCORE, ZRANK, ZCARD
+- [ ] Phase 15 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), Lua scripting
+- [ ] Phase 16 — Cluster: hash-slot sharding, node discovery, failover
 
 ## Requirements
 
