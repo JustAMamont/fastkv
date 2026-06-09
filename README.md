@@ -7,6 +7,7 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 - **Lock-free hash table** — thread-safe without mutexes; uses atomic CAS and optimistic version reads
 - **Configurable inline size** — `--inline-size 64|128|256|512` per-side storage, zero-overhead monomorphization
 - **Blob Arena** — zstd-compressed large-value storage (feature `blob-store`); `BSET`/`BGET`/`BGETRAW`/`BSTATS`
+- **Similarity search** — SimHash (64-bit near-duplicate), MinHash (Jaccard estimation), LSH O(1) bucket search (feature `similarity`); `SIMHASH`/`FINDSIM`/`LSHADD`/`LSHREM`
 - **Redis-compatible RESP protocol** — works with `redis-cli` and any Redis-compatible tooling
 - **Pipeline support** — batch multiple commands in a single round-trip for higher throughput
 - **WAL persistence** — crash-consistent write-ahead log with configurable fsync policy and TTL recovery (including BSET/BDel ops)
@@ -39,6 +40,12 @@ cargo build --release
 
 # With blob arena (zstd-compressed large-value storage)
 cargo build --release --features blob-store
+
+# With similarity search (SimHash/MinHash/LSH)
+cargo build --release --features similarity
+
+# All features
+cargo build --release --features "blob-store,similarity"
 ```
 
 ### Run Server
@@ -67,6 +74,10 @@ fast_kv server --mode io_uring
 # With both blob arena and io_uring
 cargo build --release --features "blob-store,io-uring"
 fast_kv server --mode io_uring
+
+# With blob arena + similarity
+cargo build --release --features "blob-store,similarity"
+fast_kv server
 
 # Via environment variables
 FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_INLINE_SIZE=256 FASTKV_FSYNC=always fast_kv server
@@ -268,16 +279,34 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 
 > Lists are in-memory only (not persisted to WAL). Suitable for ephemeral data such as queues and buffers.
 
+### Similarity (feature: `similarity`)
+
+| Command | Description |
+|---------|-------------|
+| `SIMHASH key` | Compute 64-bit SimHash for stored value; returns hex string |
+| `FINDSIM key [threshold]` | Find similar keys via LSH buckets; default Hamming threshold = 3 |
+| `LSHADD key [simhash_hex]` | Index key in LSH buckets; auto-computes SimHash if not provided |
+| `LSHREM key [simhash_hex]` | Remove key from LSH buckets; looks up stored SimHash if not provided |
+
+> SimHash splits a 64-bit hash into 4 bands × 16 bits for O(1) approximate nearest-neighbor lookup.
+> LSH bucket keys are regular KV entries (`lsh:sim:{band}:{value}`), so they benefit from WAL persistence and TTL.
+> `SIMHASH` transparently decompresses blob refs when computing hashes for `BSET`-stored values.
+>
+> **Python client**: `simhash(key)`, `find_similar(key, threshold=3)`, `lsh_add(key, simhash_hex=None)`, `lsh_rem(key, simhash_hex=None)` (sync + async).
+
 ## Testing
 
 ### Server Unit Tests
 
 ```bash
-# Standard tests (110 tests)
+# Standard tests (139 tests)
 cargo test
 
-# With blob-store feature (124 tests)
+# With blob-store feature (139 tests)
 cargo test --features blob-store
+
+# With blob-store + similarity features (153 tests)
+cargo test --features "blob-store,similarity"
 ```
 
 | Module | Tests | Coverage |
@@ -288,6 +317,9 @@ cargo test --features blob-store
 | `hash.rs` | 20 | HSET/HGET/HDEL, HGETALL, HEXISTS, HLEN, HKEYS/HVALS, HMGET/HMSET, edge cases |
 | `list.rs` | 17 | LPUSH/RPUSH, LPOP/RPOP, LRANGE, LLEN, LINDEX, LREM, LTRIM, LSET, WRONGTYPE |
 | `blob.rs` | 14 | BlobRef encode/decode, store/retrieve, free/reuse, hash integrity, stats, BGETRAW, edge cases |
+| `simhash.rs` | 10 | SimHash 64-bit, weighted features, hamming distance, similarity threshold, KV integration |
+| `minhash.rs` | 10 | MinHash 128-hash signature, Jaccard estimation, serialization, band value extraction |
+| `lsh.rs` | 9 | LSH band extraction, add/remove/find, SimHash + MinHash bucket indexing, ID list codec |
 | `resp.rs` | 18 | RESP array/inline parse, encode, roundtrip, binary data, error types |
 | `tcp.rs` | 8 | Dispatch handlers, DEL list cleanup, WRONGTYPE, PING, inline parsing |
 
@@ -303,7 +335,7 @@ cargo test --features blob-store
 
 | Suite | Tests |
 |-------|------:|
-| Rust (server) | 124 (with blob-store) / 110 (without) |
+| Rust (server) | 153 (with blob-store + similarity) / 139 (without) |
 | Rust (client) | 23 |
 | Python sync | 27 |
 | Python async | 28 |
@@ -337,6 +369,9 @@ fastkv/
 │       ├── resp.rs             # RESP protocol parser/encoder
 │       ├── wal.rs              # Write-ahead log (SET/DEL/EXPIRE/BSET/BDel)
 │       ├── blob.rs             # Blob Arena — zstd-compressed large-value storage
+│       ├── simhash.rs          # SimHash 64-bit locality-sensitive hashing
+│       ├── minhash.rs          # MinHash signature for Jaccard similarity
+│       ├── lsh.rs              # LSH bucket indexing + O(1) similarity search
 │       ├── expiration.rs       # TTL / key expiration
 │       ├── hash.rs             # Hash data type
 │       ├── list.rs             # List data type
@@ -459,6 +494,43 @@ Two strategies work together:
 
 EXPIRE entries are written to WAL and restored on recovery after keys are loaded.
 
+### Similarity (feature: `similarity`)
+
+```
+SimHash (64-bit near-duplicate detection)
+┌──────────────────────────────────────────────────────────┐
+│  1. Hash each field with 64-bit wyhash                    │
+│  2. Weighted vote vector: +weight for 1-bits, -weight     │
+│     for 0-bits                                            │
+│  3. Final hash: bit = 1 if vote > 0 else 0               │
+│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT│
+│                                                           │
+│  Default weights: user_agent(4), webgl_renderer(3),       │
+│  screen_resolution(2), os(2), fonts(1), timezone(1),     │
+│  locale(1), platform(2), webgl_vendor(2), browser_ver(3) │
+└──────────────────────────────────────────────────────────┘
+
+MinHash (Jaccard similarity for set fields)
+┌──────────────────────────────────────────────────────────┐
+│  128 hash functions via LCG permutation coefficients      │
+│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64              │
+│  Signature: Vec<u32> of 128 minimums (512 bytes)         │
+│  Jaccard estimate = fraction of matching components       │
+└──────────────────────────────────────────────────────────┘
+
+LSH (O(1) approximate nearest-neighbor search)
+┌──────────────────────────────────────────────────────────┐
+│  SimHash: 64 bits → 4 bands × 16 bits                    │
+│  Bucket keys: lsh:sim:{band}:{value} → list of profile IDs│
+│  MinHash:  128 values → 4 bands × 32 rows                │
+│  Bucket keys: lsh:min:{band}:{value} → list of profile IDs│
+│                                                           │
+│  Search: look up all 4 bands, deduplicate candidates,    │
+│  optionally filter by Hamming distance threshold (≤ 3)    │
+│  Metadata: lsh:simhash:{id} → stored 64-bit SimHash       │
+└──────────────────────────────────────────────────────────┘
+```
+
 ## Roadmap
 
 - [x] Phase 1 — Core: lock-free hash table, RESP protocol, TCP server (Tokio + io_uring), pipeline
@@ -469,7 +541,7 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 - [x] Phase 6 — List: LPUSH/RPUSH, LPOP/RPOP, LRANGE/LLEN/LINDEX, LREM/LTRIM/LSET, WRONGTYPE
 - [x] Phase 7 — Client SDKs: Go, Python (sync + async), Java (sync + reactive), Node.js, Rust (zero-dependency, pipeline support)
 - [x] Phase 8 — Blob Arena: BSET/BGET/BGETRAW/BSTATS, zstd compression, lock-free arena, WAL persistence, Python client
-- [ ] Phase 9 — SimHash/MinHash/LSH: similarity search for profiles (feature: `similarity`)
+- [x] Phase 9 — SimHash/MinHash/LSH: similarity search for profiles (feature: `similarity`)
 - [ ] Phase 10 — SCAN/KEYS: cursor-based key iteration, glob MATCH, DBSTATS
 - [ ] Phase 11 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
 - [ ] Phase 12 — List WAL: persistent list operations (LPUSH/RPUSH/LPOP/RPOP/LTRIM)

@@ -500,6 +500,16 @@ fn dispatch_command<const N: usize>(
         #[cfg(feature = "blob-store")]
         "BSTATS"  => { cmd_bstats(ctx, out); false }
 
+        // ----- Similarity -----
+        #[cfg(feature = "similarity")]
+        "SIMHASH" => { cmd_simhash(cmd, ctx, out); false }
+        #[cfg(feature = "similarity")]
+        "FINDSIM" => { cmd_findsim(cmd, ctx, out); false }
+        #[cfg(feature = "similarity")]
+        "LSHADD"  => { cmd_lshadd(cmd, ctx, out); false }
+        #[cfg(feature = "similarity")]
+        "LSHREM"  => { cmd_lshrem(cmd, ctx, out); false }
+
         _ => {
             let msg = format!("ERR unknown command '{}'", cmd.name);
             RespEncoder::write_error(out, &msg);
@@ -1788,6 +1798,190 @@ fn cmd_bstats<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
 
     let stats = blob_arena.stats();
     RespEncoder::write_bulk_string(out, stats.to_string().as_bytes());
+}
+
+// ===========================================================================
+// Similarity commands (SIMHASH, FINDSIM, LSHADD, LSHREM)
+// ===========================================================================
+
+#[cfg(feature = "similarity")]
+/// Handle `SIMHASH key` — compute SimHash for a stored value.
+///
+/// Returns the 64-bit SimHash as a hex string, or an error if the key
+/// doesn't exist.
+fn cmd_simhash<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    #[cfg(feature = "blob-store")]
+    {
+        let result = crate::core::lsh::compute_simhash_for_key(ctx.store, ctx.blob, key);
+        match result {
+            Some(hash) => {
+                let hex = format!("{:016x}", hash);
+                RespEncoder::write_bulk_string(out, hex.as_bytes());
+            }
+            None => RespEncoder::write_null(out),
+        }
+    }
+
+    #[cfg(not(feature = "blob-store"))]
+    {
+        let result = crate::core::lsh::compute_simhash_for_key(ctx.store, key);
+        match result {
+            Some(hash) => {
+                let hex = format!("{:016x}", hash);
+                RespEncoder::write_bulk_string(out, hex.as_bytes());
+            }
+            None => RespEncoder::write_null(out),
+        }
+    }
+}
+
+#[cfg(feature = "similarity")]
+/// Handle `FINDSIM key [threshold]` — find similar keys via LSH.
+///
+/// Looks up the SimHash for *key*, then queries LSH buckets to find
+/// candidate similar profiles. The optional *threshold* parameter
+/// specifies the maximum Hamming distance (default 3).
+///
+/// Returns a RESP array of similar key names.
+fn cmd_findsim<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    // Parse optional threshold.
+    let threshold = if cmd.argc() > 2 {
+        match cmd.arg(2) {
+            Some(bytes) => std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(crate::core::simhash::DEFAULT_HAMMING_THRESHOLD),
+            None => crate::core::simhash::DEFAULT_HAMMING_THRESHOLD,
+        }
+    } else {
+        crate::core::simhash::DEFAULT_HAMMING_THRESHOLD
+    };
+
+    // Get the stored SimHash for this key.
+    let simhash_val = crate::core::lsh::get_simhash_for_profile(ctx.store, key);
+    let Some(simhash_val) = simhash_val else {
+        // Key not indexed — compute on the fly.
+        #[cfg(feature = "blob-store")]
+        {
+            let Some(hash) = crate::core::lsh::compute_simhash_for_key(ctx.store, ctx.blob, key) else {
+                RespEncoder::write_empty_array(out);
+                return;
+            };
+            let candidates = crate::core::lsh::find_similar_sim(ctx.store, hash, 4, threshold);
+            write_candidate_array(&candidates, out);
+            return;
+        }
+        #[cfg(not(feature = "blob-store"))]
+        {
+            let Some(hash) = crate::core::lsh::compute_simhash_for_key(ctx.store, key) else {
+                RespEncoder::write_empty_array(out);
+                return;
+            };
+            let candidates = crate::core::lsh::find_similar_sim(ctx.store, hash, 4, threshold);
+            write_candidate_array(&candidates, out);
+            return;
+        }
+    };
+
+    let candidates = crate::core::lsh::find_similar_sim(ctx.store, simhash_val, 4, threshold);
+    write_candidate_array(&candidates, out);
+}
+
+#[cfg(feature = "similarity")]
+/// Handle `LSHADD key [simhash_hex]` — index a key in LSH buckets.
+///
+/// If *simhash_hex* is provided, it is used directly. Otherwise, the
+/// SimHash is computed from the key's value.
+///
+/// Returns the number of band entries created.
+fn cmd_lshadd<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    let simhash_val = if cmd.argc() > 2 {
+        // Explicit SimHash provided as hex string.
+        match cmd.arg(2) {
+            Some(hex_bytes) => {
+                let hex_str = std::str::from_utf8(hex_bytes).unwrap_or("");
+                u64::from_str_radix(hex_str, 16).unwrap_or(0)
+            }
+            None => 0,
+        }
+    } else {
+        // Compute SimHash from the stored value.
+        #[cfg(feature = "blob-store")]
+        {
+            match crate::core::lsh::compute_simhash_for_key(ctx.store, ctx.blob, key) {
+                Some(h) => h,
+                None => {
+                    RespEncoder::write_error(out, "ERR key not found");
+                    return;
+                }
+            }
+        }
+        #[cfg(not(feature = "blob-store"))]
+        {
+            match crate::core::lsh::compute_simhash_for_key(ctx.store, key) {
+                Some(h) => h,
+                None => {
+                    RespEncoder::write_error(out, "ERR key not found");
+                    return;
+                }
+            }
+        }
+    };
+
+    // Store the SimHash value for later FINDSIM verification.
+    crate::core::lsh::store_simhash_for_profile(ctx.store, key, simhash_val);
+
+    // Add to LSH buckets.
+    let count = crate::core::lsh::lsh_add_sim(ctx.store, key, simhash_val, 4);
+    RespEncoder::write_integer(out, count as i64);
+}
+
+#[cfg(feature = "similarity")]
+/// Handle `LSHREM key [simhash_hex]` — remove a key from LSH buckets.
+///
+/// If *simhash_hex* is provided, it is used directly. Otherwise, the
+/// stored SimHash metadata is looked up.
+///
+/// Returns the number of band entries removed.
+fn cmd_lshrem<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    let simhash_val = if cmd.argc() > 2 {
+        match cmd.arg(2) {
+            Some(hex_bytes) => {
+                let hex_str = std::str::from_utf8(hex_bytes).unwrap_or("");
+                u64::from_str_radix(hex_str, 16).unwrap_or(0)
+            }
+            None => 0,
+        }
+    } else {
+        // Look up stored SimHash.
+        match crate::core::lsh::get_simhash_for_profile(ctx.store, key) {
+            Some(h) => h,
+            None => {
+                RespEncoder::write_error(out, "ERR key not indexed (no stored SimHash)");
+                return;
+            }
+        }
+    };
+
+    let count = crate::core::lsh::lsh_rem_sim(ctx.store, key, simhash_val, 4);
+    RespEncoder::write_integer(out, count as i64);
+}
+
+#[cfg(feature = "similarity")]
+/// Write a list of candidate IDs as a RESP array.
+fn write_candidate_array(candidates: &[Vec<u8>], out: &mut Vec<u8>) {
+    RespEncoder::write_array_len(out, candidates.len() as i64);
+    for id in candidates {
+        RespEncoder::write_bulk_string(out, id);
+    }
 }
 
 // ---------------------------------------------------------------------------

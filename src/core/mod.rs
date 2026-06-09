@@ -8,6 +8,9 @@
 //! * [`expiration`] — TTL / key-expiration management
 //! * [`hash`] — Redis-compatible hash data type (HGET/HSET/…)
 //! * [`blob`] — compressed large-value storage (BSET/BGET/…)
+//! * [`simhash`] — SimHash locality-sensitive hashing for near-duplicate detection
+//! * [`minhash`] — MinHash signature for Jaccard similarity estimation
+//! * [`lsh`] — Locality-Sensitive Hashing (LSH) for O(1) approximate nearest neighbor search
 //! * [`server`] — TCP server implementations (Tokio, io_uring)
 
 pub mod kv;
@@ -16,6 +19,12 @@ pub mod wal;
 pub mod expiration;
 pub mod hash;
 pub mod list;
+#[cfg(feature = "similarity")]
+pub mod simhash;
+#[cfg(feature = "similarity")]
+pub mod minhash;
+#[cfg(feature = "similarity")]
+pub mod lsh;
 pub mod server;
 
 #[cfg(feature = "blob-store")]

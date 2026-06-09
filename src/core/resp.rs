@@ -412,6 +412,23 @@ impl RespEncoder {
             Self::write_bulk_string(out, item);
         }
     }
+
+    /// Append `*<count>\r\n` (array header only — no elements).
+    ///
+    /// Useful when the caller wants to write array elements individually.
+    #[inline]
+    pub fn write_array_len(out: &mut Vec<u8>, len: i64) {
+        out.push(b'*');
+        let s = len.to_string();
+        out.extend_from_slice(s.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    /// Append `*0\r\n` — an empty RESP array.
+    #[inline]
+    pub fn write_empty_array(out: &mut Vec<u8>) {
+        out.extend_from_slice(b"*0\r\n");
+    }
 }
 
 // ============================================================================

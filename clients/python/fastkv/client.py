@@ -594,3 +594,110 @@ class FastKVClient:
                 except ValueError:
                     result[k] = v
         return result
+
+    # -- similarity commands --------------------------------------------------
+
+    def simhash(self, key: str) -> Optional[str]:
+        """Compute SimHash for a stored value.
+
+        Returns the 64-bit SimHash as a zero-padded hex string (16 chars),
+        or ``None`` if the key does not exist.
+
+        Parameters
+        ----------
+        key : str
+            The key to compute the SimHash for.
+
+        Returns
+        -------
+        str | None
+            The hex-encoded SimHash (e.g. ``"a1b2c3d4e5f6a7b8"``), or
+            ``None`` if the key doesn't exist.
+        """
+        result = self._execute_command("SIMHASH", key)
+        if result is None:
+            return None
+        return result.decode("utf-8") if isinstance(result, bytes) else str(result)
+
+    def find_similar(self, key: str, threshold: int = 3) -> List[str]:
+        """Find keys with similar SimHash via LSH.
+
+        Uses the stored LSH index to find candidate similar profiles
+        within the given Hamming distance threshold.
+
+        Parameters
+        ----------
+        key : str
+            The key to find similar profiles for.
+        threshold : int
+            Maximum Hamming distance for similarity (default 3).
+
+        Returns
+        -------
+        list[str]
+            A list of similar key names.
+        """
+        result = self._execute_command("FINDSIM", key, str(threshold))
+        if result is None:
+            return []
+        # The response is a RESP array — the client should decode it.
+        # _execute_command returns the raw decoded value.
+        if isinstance(result, list):
+            return [item.decode("utf-8") if isinstance(item, bytes) else str(item) for item in result]
+        return []
+
+    def lsh_add(self, key: str, simhash_hex: Optional[str] = None) -> int:
+        """Index a key in the LSH similarity index.
+
+        If *simhash_hex* is provided, it is used directly. Otherwise, the
+        SimHash is computed from the key's stored value.
+
+        Parameters
+        ----------
+        key : str
+            The key to index.
+        simhash_hex : str | None
+            Optional pre-computed SimHash as a hex string.
+
+        Returns
+        -------
+        int
+            The number of band entries created.
+        """
+        if simhash_hex is not None:
+            result = self._execute_command("LSHADD", key, simhash_hex)
+        else:
+            result = self._execute_command("LSHADD", key)
+        if isinstance(result, int):
+            return result
+        if isinstance(result, bytes):
+            return int(result)
+        return 0
+
+    def lsh_rem(self, key: str, simhash_hex: Optional[str] = None) -> int:
+        """Remove a key from the LSH similarity index.
+
+        If *simhash_hex* is provided, it is used directly. Otherwise, the
+        stored SimHash metadata is looked up.
+
+        Parameters
+        ----------
+        key : str
+            The key to remove from the index.
+        simhash_hex : str | None
+            Optional pre-computed SimHash as a hex string.
+
+        Returns
+        -------
+        int
+            The number of band entries removed.
+        """
+        if simhash_hex is not None:
+            result = self._execute_command("LSHREM", key, simhash_hex)
+        else:
+            result = self._execute_command("LSHREM", key)
+        if isinstance(result, int):
+            return result
+        if isinstance(result, bytes):
+            return int(result)
+        return 0

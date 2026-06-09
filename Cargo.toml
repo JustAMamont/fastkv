@@ -1,6 +1,6 @@
 [package]
 name = "fast_kv"
-version = "0.6.0"
+version = "0.7.1"
 edition = "2024"
 description = "High-performance, Redis-compatible key-value store with WAL persistence, TTL expiration, and lock-free concurrency"
 license = "MIT"
@@ -34,3 +34,4 @@ default = []
 zero-copy = ["zerocopy"]
 io-uring = ["tokio-uring"]
 blob-store = ["zstd"]
+similarity = []

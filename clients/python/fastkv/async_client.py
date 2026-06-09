@@ -410,3 +410,61 @@ class FastKVAsyncClient:
                 except ValueError:
                     result[k] = v
         return result
+
+    # -- similarity commands --------------------------------------------------
+
+    async def simhash(self, key: str) -> Optional[str]:
+        """Compute SimHash for a stored value.
+
+        Returns the 64-bit SimHash as a zero-padded hex string (16 chars),
+        or ``None`` if the key does not exist.
+        """
+        result = await self._execute_command("SIMHASH", key)
+        if result is None:
+            return None
+        return result.decode("utf-8") if isinstance(result, bytes) else str(result)
+
+    async def find_similar(self, key: str, threshold: int = 3) -> List[str]:
+        """Find keys with similar SimHash via LSH.
+
+        Uses the stored LSH index to find candidate similar profiles
+        within the given Hamming distance threshold.
+        """
+        result = await self._execute_command("FINDSIM", key, str(threshold))
+        if result is None:
+            return []
+        if isinstance(result, list):
+            return [item.decode("utf-8") if isinstance(item, bytes) else str(item) for item in result]
+        return []
+
+    async def lsh_add(self, key: str, simhash_hex: Optional[str] = None) -> int:
+        """Index a key in the LSH similarity index.
+
+        If *simhash_hex* is provided, it is used directly. Otherwise, the
+        SimHash is computed from the key's stored value.
+        """
+        if simhash_hex is not None:
+            result = await self._execute_command("LSHADD", key, simhash_hex)
+        else:
+            result = await self._execute_command("LSHADD", key)
+        if isinstance(result, int):
+            return result
+        if isinstance(result, bytes):
+            return int(result)
+        return 0
+
+    async def lsh_rem(self, key: str, simhash_hex: Optional[str] = None) -> int:
+        """Remove a key from the LSH similarity index.
+
+        If *simhash_hex* is provided, it is used directly. Otherwise, the
+        stored SimHash metadata is looked up.
+        """
+        if simhash_hex is not None:
+            result = await self._execute_command("LSHREM", key, simhash_hex)
+        else:
+            result = await self._execute_command("LSHREM", key)
+        if isinstance(result, int):
+            return result
+        if isinstance(result, bytes):
+            return int(result)
+        return 0
