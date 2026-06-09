@@ -5,8 +5,10 @@
 //! byte) is stored in the KV store to mark list-type keys so that `GET` /
 //! `SET` on a list key returns `WRONGTYPE`.
 //!
-//! Lists are **not** persisted to WAL — they are purely in-memory. This is
-//! suitable for ephemeral data such as matchmaking queues.
+//! List mutations are persisted to the WAL via the `LIST_OP` (0x06) entry type.
+//! Each entry encodes a sub-operation (LPUSH, RPUSH, LPOP, RPOP, LTRIM, LSET,
+//! LREM) together with its arguments. On recovery, these entries are replayed
+//! in order to reconstruct the list state.
 //!
 //! ## Commands
 //!
@@ -404,6 +406,231 @@ fn normalize_index(idx: i64, len: i64) -> i64 {
         (len + idx).max(0)
     } else {
         idx.min(len - 1).max(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// List Sub-Operations (WAL encoding/decoding)
+// ---------------------------------------------------------------------------
+
+/// Sub-operation codes for the WAL `LIST_OP` (0x06) entry type.
+///
+/// Each list mutation is encoded as `[sub_op: u8]` followed by operation-
+/// specific data. On recovery, these payloads are decoded and replayed
+/// against the `ListManager` to reconstruct the list state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ListSubOp {
+    /// Push elements to the head of the list.
+    LPush = 0x01,
+    /// Push elements to the tail of the list.
+    RPush = 0x02,
+    /// Pop elements from the head of the list.
+    LPop = 0x03,
+    /// Pop elements from the tail of the list.
+    RPop = 0x04,
+    /// Trim the list to a range.
+    LTrim = 0x05,
+    /// Set an element at a given index.
+    LSet = 0x06,
+    /// Remove occurrences of an element.
+    LRem = 0x07,
+}
+
+impl TryFrom<u8> for ListSubOp {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(ListSubOp::LPush),
+            0x02 => Ok(ListSubOp::RPush),
+            0x03 => Ok(ListSubOp::LPop),
+            0x04 => Ok(ListSubOp::RPop),
+            0x05 => Ok(ListSubOp::LTrim),
+            0x06 => Ok(ListSubOp::LSet),
+            0x07 => Ok(ListSubOp::LRem),
+            other => Err(other),
+        }
+    }
+}
+
+/// Encode an LPUSH or RPUSH sub-operation for the WAL.
+///
+/// Format: `[sub_op: u8] [num_elements: u16 LE] [elem1_len: u16 LE] [elem1] ...`
+pub fn encode_list_push(sub_op: ListSubOp, elements: &[&[u8]]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(3 + elements.len() * 34);
+    buf.push(sub_op as u8);
+    buf.extend_from_slice(&(elements.len() as u16).to_le_bytes());
+    for elem in elements {
+        buf.extend_from_slice(&(elem.len() as u16).to_le_bytes());
+        buf.extend_from_slice(elem);
+    }
+    buf
+}
+
+/// Encode an LPOP or RPOP sub-operation for the WAL.
+///
+/// Format: `[sub_op: u8] [count: u16 LE]`
+pub fn encode_list_pop(sub_op: ListSubOp, count: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(3);
+    buf.push(sub_op as u8);
+    buf.extend_from_slice(&(count as u16).to_le_bytes());
+    buf
+}
+
+/// Encode an LTRIM sub-operation for the WAL.
+///
+/// Format: `[sub_op: u8] [start: i64 LE] [stop: i64 LE]`
+pub fn encode_list_trim(start: i64, stop: i64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(17);
+    buf.push(ListSubOp::LTrim as u8);
+    buf.extend_from_slice(&start.to_le_bytes());
+    buf.extend_from_slice(&stop.to_le_bytes());
+    buf
+}
+
+/// Encode an LSET sub-operation for the WAL.
+///
+/// Format: `[sub_op: u8] [index: i64 LE] [element_len: u16 LE] [element]`
+pub fn encode_list_set(index: i64, element: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(11 + element.len());
+    buf.push(ListSubOp::LSet as u8);
+    buf.extend_from_slice(&index.to_le_bytes());
+    buf.extend_from_slice(&(element.len() as u16).to_le_bytes());
+    buf.extend_from_slice(element);
+    buf
+}
+
+/// Encode an LREM sub-operation for the WAL.
+///
+/// Format: `[sub_op: u8] [count: i64 LE] [element_len: u16 LE] [element]`
+pub fn encode_list_rem(count: i64, element: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(11 + element.len());
+    buf.push(ListSubOp::LRem as u8);
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&(element.len() as u16).to_le_bytes());
+    buf.extend_from_slice(element);
+    buf
+}
+
+/// Decode a WAL LIST_OP payload and return the sub-op byte plus a
+/// human-readable description of the operation (for logging).
+///
+/// Returns `(sub_op, description)`.
+pub fn decode_list_op(payload: &[u8]) -> Result<(ListSubOp, String), String> {
+    if payload.is_empty() {
+        return Err("empty LIST_OP payload".to_string());
+    }
+    let sub_op = ListSubOp::try_from(payload[0]).map_err(|b| format!("unknown list sub-op 0x{:02x}", b))?;
+    let desc = match sub_op {
+        ListSubOp::LPush | ListSubOp::RPush => {
+            if payload.len() < 3 { return Err("LPUSH/RPUSH payload too short".to_string()); }
+            let num = u16::from_le_bytes([payload[1], payload[2]]);
+            format!("{:?} {} elements", sub_op, num)
+        }
+        ListSubOp::LPop | ListSubOp::RPop => {
+            if payload.len() < 3 { return Err("LPOP/RPOP payload too short".to_string()); }
+            let count = u16::from_le_bytes([payload[1], payload[2]]);
+            format!("{:?} count={}", sub_op, count)
+        }
+        ListSubOp::LTrim => {
+            if payload.len() < 17 { return Err("LTRIM payload too short".to_string()); }
+            let start = i64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let stop = i64::from_le_bytes(payload[9..17].try_into().unwrap());
+            format!("LTRIM start={} stop={}", start, stop)
+        }
+        ListSubOp::LSet => {
+            if payload.len() < 11 { return Err("LSET payload too short".to_string()); }
+            let idx = i64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let elen = u16::from_le_bytes(payload[9..11].try_into().unwrap());
+            format!("LSET index={} elem_len={}", idx, elen)
+        }
+        ListSubOp::LRem => {
+            if payload.len() < 11 { return Err("LREM payload too short".to_string()); }
+            let count = i64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let elen = u16::from_le_bytes(payload[9..11].try_into().unwrap());
+            format!("LREM count={} elem_len={}", count, elen)
+        }
+    };
+    Ok((sub_op, desc))
+}
+
+/// Replay a single WAL LIST_OP payload against the given `ListManager`.
+///
+/// Called during crash recovery for each `WalOp::ListOp` entry.
+pub fn replay_list_op<const N: usize>(lists: &ListManager<N>, key: &[u8], payload: &[u8]) {
+    if payload.is_empty() {
+        return;
+    }
+    let sub_op = match ListSubOp::try_from(payload[0]) {
+        Ok(op) => op,
+        Err(_) => {
+            eprintln!("[WAL] Unknown list sub-op 0x{:02x}, skipping", payload[0]);
+            return;
+        }
+    };
+
+    match sub_op {
+        ListSubOp::LPush => {
+            if payload.len() < 3 { return; }
+            let num = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+            let mut offset = 3;
+            let mut elements: Vec<&[u8]> = Vec::with_capacity(num);
+            for _ in 0..num {
+                if offset + 2 > payload.len() { break; }
+                let elen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if offset + elen > payload.len() { break; }
+                elements.push(&payload[offset..offset + elen]);
+                offset += elen;
+            }
+            let _ = lists.lpush(key, &elements);
+        }
+        ListSubOp::RPush => {
+            if payload.len() < 3 { return; }
+            let num = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+            let mut offset = 3;
+            let mut elements: Vec<&[u8]> = Vec::with_capacity(num);
+            for _ in 0..num {
+                if offset + 2 > payload.len() { break; }
+                let elen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if offset + elen > payload.len() { break; }
+                elements.push(&payload[offset..offset + elen]);
+                offset += elen;
+            }
+            let _ = lists.rpush(key, &elements);
+        }
+        ListSubOp::LPop => {
+            if payload.len() < 3 { return; }
+            let count = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+            lists.lpop(key, count);
+        }
+        ListSubOp::RPop => {
+            if payload.len() < 3 { return; }
+            let count = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+            lists.rpop(key, count);
+        }
+        ListSubOp::LTrim => {
+            if payload.len() < 17 { return; }
+            let start = i64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let stop = i64::from_le_bytes(payload[9..17].try_into().unwrap());
+            lists.ltrim(key, start, stop);
+        }
+        ListSubOp::LSet => {
+            if payload.len() < 11 { return; }
+            let idx = i64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let elen = u16::from_le_bytes(payload[9..11].try_into().expect("elen")) as usize;
+            if 11 + elen > payload.len() { return; }
+            lists.lset(key, idx, &payload[11..11 + elen]);
+        }
+        ListSubOp::LRem => {
+            if payload.len() < 11 { return; }
+            let count = i64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let elen = u16::from_le_bytes(payload[9..11].try_into().expect("elen")) as usize;
+            if 11 + elen > payload.len() { return; }
+            lists.lrem(key, count, &payload[11..11 + elen]);
+        }
     }
 }
 

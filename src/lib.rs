@@ -44,7 +44,9 @@ pub mod core;
 
 pub use core::kv::{KvStore, KvStoreLockFree, DEFAULT_INLINE_SIZE, IncrError};
 pub use core::resp::{Command, RespEncoder, RespParser};
-pub use core::wal::{Wal, WalEntry, WalOp, FsyncPolicy};
+pub use core::wal::{Wal, WalEntry, WalOp, FsyncPolicy, WalWriter};
+#[cfg(feature = "blob-store")]
+pub use core::wal_segment::{WalSegment, SegmentConfig, recover_segments};
 pub use core::expiration::ExpirationManager;
 pub use core::hash::{HashError, HashDelResult, WRONGTYPE_ERR};
 pub use core::list::ListManager;

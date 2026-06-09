@@ -277,7 +277,21 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 | `LTRIM key start stop` | Trim list to range |
 | `LSET key index elem` | Set element by index |
 
-> Lists are in-memory only (not persisted to WAL). Suitable for ephemeral data such as queues and buffers.
+> List operations are persisted to WAL (op 0x06 = LIST_OP with sub-ops LPUSH/RPUSH/LPOP/RPOP/LTRIM). Crash recovery replays list operations from WAL.
+
+### Scan / Stats
+
+| Command | Description |
+|---------|-------------|
+| `SCAN cursor [COUNT n] [MATCH pattern]` | Cursor-based key iteration; returns `[next_cursor, [key1, key2, ...]]` |
+| `DBSTATS` | Aggregate store statistics: `total_keys`, `total_buckets`, `load_factor`, `entry_size`, `total_memory`, `blob_count`, `inline_size` |
+
+> `SCAN` uses optimistic version-check reads (same protocol as `GET`) for lock-free iteration.
+> `MATCH` supports glob patterns: `*` (any sequence), `?` (single char), `[abc]` (char class).
+> When `next_cursor` is `0`, iteration is complete.
+>
+> **Python client**: `scan(cursor=0, count=10, match=None)` returns `(next_cursor, keys)`;
+> `dbstats()` returns a dict with all statistics fields.
 
 ### Similarity (feature: `similarity`)
 
@@ -299,19 +313,19 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 ### Server Unit Tests
 
 ```bash
-# Standard tests (139 tests)
+# Standard tests (121 tests)
 cargo test
 
-# With blob-store feature (139 tests)
+# With blob-store feature (147 tests)
 cargo test --features blob-store
 
-# With blob-store + similarity features (153 tests)
+# With blob-store + similarity features (164 tests)
 cargo test --features "blob-store,similarity"
 ```
 
 | Module | Tests | Coverage |
 |--------|------:|----------|
-| `kv.rs` | 29 | GET/SET/DEL, INCR/DECR, MGET/MSET, APPEND, STRLEN, GETRANGE, SETRANGE, lock-free ops, concurrent |
+| `kv.rs` | 39 | GET/SET/DEL, INCR/DECR, MGET/MSET, APPEND, STRLEN, GETRANGE, SETRANGE, SCAN, glob MATCH, DBSTATS, lock-free ops, concurrent |
 | `wal.rs` | 18 | Create/recover, CRC-32C, alignment, binary keys, large values, EXPIRE entry, BSET/BDel entries |
 | `expiration.rs` | 14 | EXPIRE/TTL/PERSIST, lazy/active purging, concurrent, DEL cascade |
 | `hash.rs` | 20 | HSET/HGET/HDEL, HGETALL, HEXISTS, HLEN, HKEYS/HVALS, HMGET/HMSET, edge cases |
@@ -335,7 +349,7 @@ cargo test --features "blob-store,similarity"
 
 | Suite | Tests |
 |-------|------:|
-| Rust (server) | 153 (with blob-store + similarity) / 139 (without) |
+| Rust (server) | 164 (with blob-store + similarity) / 121 (without) |
 | Rust (client) | 23 |
 | Python sync | 27 |
 | Python async | 28 |
@@ -442,11 +456,10 @@ Operations:
 
 ```
 Blob Ref (inline value with flag 0xFD):
-┌──────────┬──────────┬───────────┬───────────┬──────────────┐
+┌───────────┬──────────┬───────────┬───────────┬──────────────┐
 │ flag: 0xFD│ offset:  │ comp_len: │ orig_len: │ data_hash:   │
 │ 1 byte    │ u64 8B   │ u32 4B    │ u32 4B    │ dual-crc32c  │
-│           │          │           │           │ 16B          │
-└──────────┴──────────┴───────────┴───────────┴──────────────┘
+└───────────┴──────────┴───────────┴───────────┴──────────────┘
 Total: 33 bytes — fits even in N=64 inline size
 
 Architecture:
@@ -478,9 +491,10 @@ Fsync policies:  always (safest) | everysec (balanced) | never (fastest)
 WAL Operations:
   0x00 = SET     0x01 = DEL     0x02 = EXPIRE
   0x04 = BSET    0x05 = BDel   (blob-store feature only)
+  0x06 = LIST_OP              (sub-ops: LPUSH=0x01, RPUSH=0x02, LPOP=0x03, RPOP=0x04, LTRIM=0x05)
 
 Recovery:
-  Phase 1 — replay SET, DEL, BSET, and BDel entries into KV store
+  Phase 1 — replay SET, DEL, BSET, BDel, and LIST_OP entries into KV store
   Phase 2 — replay EXPIRE entries into expiration manager
   Corrupted trailing entries are silently discarded
 ```
@@ -498,35 +512,35 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 
 ```
 SimHash (64-bit near-duplicate detection)
-┌──────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────┐
 │  1. Hash each feature with 64-bit wyhash                  │
 │  2. Weighted vote vector: +weight for 1-bits, -weight     │
 │     for 0-bits                                            │
-│  3. Final hash: bit = 1 if vote > 0 else 0               │
-│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT│
+│  3. Final hash: bit = 1 if vote > 0 else 0                │
+│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT │
 │  5. Configurable per-field weights                        │
 │  6. Default threshold: Hamming distance ≤ 3 = similar     │
-└──────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────┘
 
 MinHash (Jaccard similarity for set-type data)
-┌──────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────┐
 │  128 hash functions via LCG permutation coefficients      │
-│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64              │
-│  Signature: Vec<u32> of 128 minimums (512 bytes)         │
+│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64                │
+│  Signature: Vec<u32> of 128 minimums (512 bytes)          │
 │  Jaccard estimate = fraction of matching components       │
-└──────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────┘
 
 LSH (O(1) approximate nearest-neighbor search)
-┌──────────────────────────────────────────────────────────┐
-│  SimHash: 64 bits → 4 bands × 16 bits                    │
-│  Bucket keys: lsh:sim:{band}:{value} → list of IDs       │
-│  MinHash:  128 values → 4 bands × 32 rows                │
-│  Bucket keys: lsh:min:{band}:{value} → list of IDs       │
+┌───────────────────────────────────────────────────────────┐
+│  SimHash: 64 bits → 4 bands × 16 bits                     │
+│  Bucket keys: lsh:sim:{band}:{value} → list of IDs        │
+│  MinHash:  128 values → 4 bands × 32 rows                 │
+│  Bucket keys: lsh:min:{band}:{value} → list of IDs        │
 │                                                           │
-│  Search: look up all 4 bands, deduplicate candidates,    │
+│  Search: look up all 4 bands, deduplicate candidates,     │
 │  optionally filter by Hamming distance threshold (≤ 3)    │
 │  Metadata: lsh:simhash:{id} → stored 64-bit SimHash       │
-└──────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────┘
 ```
 
 ## Roadmap
@@ -540,9 +554,9 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 7 — Client SDKs: Go, Python (sync + async), Java (sync + reactive), Node.js, Rust (zero-dependency, pipeline support)
 - [x] Phase 8 — Blob Arena: BSET/BGET/BGETRAW/BSTATS, zstd compression, lock-free arena, WAL persistence, Python client
 - [x] Phase 9 — SimHash/MinHash/LSH: similarity search for near-duplicate detection (feature: `similarity`)
-- [ ] Phase 10 — SCAN/KEYS: cursor-based key iteration, glob MATCH, DBSTATS
+- [x] Phase 10 — SCAN/KEYS: cursor-based key iteration, glob MATCH, DBSTATS
 - [ ] Phase 11 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
-- [ ] Phase 12 — List WAL: persistent list operations (LPUSH/RPUSH/LPOP/RPOP/LTRIM)
+- [x] Phase 12 — List WAL: persistent list operations (LPUSH/RPUSH/LPOP/RPOP/LTRIM)
 - [ ] Phase 13 — Compressed WAL Segments: segment-based WAL with zstd batch compression
 - [ ] Phase 14 — Sorted Set: ZADD, ZREM, ZRANGE, ZSCORE, ZRANK, ZCARD
 - [ ] Phase 15 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), Lua scripting

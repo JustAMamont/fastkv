@@ -54,16 +54,16 @@ use crc32c::crc32c as compute_crc32c;
 // ---------------------------------------------------------------------------
 
 /// File magic bytes: "FKVL" (FastKV WAL).
-const WAL_MAGIC: &[u8; 4] = b"FKVL";
+pub const WAL_MAGIC: &[u8; 4] = b"FKVL";
 
 /// Current WAL format version.
-const WAL_VERSION: u16 = 1;
+pub const WAL_VERSION: u16 = 1;
 
 /// File header size: magic (4) + version (2) = 6 bytes.
-const HEADER_SIZE: usize = 6;
+pub const HEADER_SIZE: usize = 6;
 
 /// Alignment of each entry on disk (bytes). Must be a power of two.
-const ENTRY_ALIGN: usize = 16;
+pub const ENTRY_ALIGN: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Operations
@@ -84,6 +84,8 @@ pub enum WalOp {
     BSet = 0x04,
     /// Delete a blob key (also frees the blob arena slot).
     BDel = 0x05,
+    /// List operation (sub-op encoded in value bytes).
+    ListOp = 0x06,
 }
 
 impl TryFrom<u8> for WalOp {
@@ -96,6 +98,7 @@ impl TryFrom<u8> for WalOp {
             0x03 => Ok(WalOp::Expire),
             0x04 => Ok(WalOp::BSet),
             0x05 => Ok(WalOp::BDel),
+            0x06 => Ok(WalOp::ListOp),
             other => Err(WalError::UnknownOp(other)),
         }
     }
@@ -345,6 +348,20 @@ impl Wal {
         self.append(WalOp::BDel, key, &[])
     }
 
+    /// Append a LIST_OP entry to the WAL.
+    ///
+    /// Persists list mutations (LPUSH, RPUSH, LPOP, RPOP, LTRIM, LSET, LREM)
+    /// so that lists survive server restarts.
+    ///
+    /// The *payload* is the encoded sub-operation (see [`ListSubOp`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] on write failure.
+    pub fn list_op(&self, key: &[u8], payload: &[u8]) -> Result<(), WalError> {
+        self.append(WalOp::ListOp, key, payload)
+    }
+
     /// Append an arbitrary entry to the WAL.
     fn append(&self, op: WalOp, key: &[u8], value: &[u8]) -> Result<(), WalError> {
         // Compute sizes upfront to use a single buffer.
@@ -536,6 +553,35 @@ impl Drop for Wal {
             let _ = file.sync_data();
         }
     }
+}
+
+/// A trait for WAL write operations, implemented by both [`Wal`] and
+/// [`WalSegment`](super::wal_segment::WalSegment).
+pub trait WalWriter: Send + Sync {
+    /// Append a SET entry.
+    fn wal_set(&self, key: &[u8], value: &[u8]) -> Result<(), WalError>;
+    /// Append a DEL entry.
+    fn wal_del(&self, key: &[u8]) -> Result<(), WalError>;
+    /// Append an EXPIRE entry.
+    fn wal_expire(&self, key: &[u8], deadline_ms: u64) -> Result<(), WalError>;
+    /// Append a BSET entry.
+    fn wal_bset(&self, key: &[u8], original_value: &[u8]) -> Result<(), WalError>;
+    /// Append a BDEL entry.
+    fn wal_bdel(&self, key: &[u8]) -> Result<(), WalError>;
+    /// Append a LIST_OP entry.
+    fn wal_list_op(&self, key: &[u8], payload: &[u8]) -> Result<(), WalError>;
+    /// Force an fsync.
+    fn wal_sync_now(&self) -> Result<(), WalError>;
+}
+
+impl WalWriter for Wal {
+    fn wal_set(&self, key: &[u8], value: &[u8]) -> Result<(), WalError> { self.set(key, value) }
+    fn wal_del(&self, key: &[u8]) -> Result<(), WalError> { self.del(key) }
+    fn wal_expire(&self, key: &[u8], deadline_ms: u64) -> Result<(), WalError> { self.expire(key, deadline_ms) }
+    fn wal_bset(&self, key: &[u8], original_value: &[u8]) -> Result<(), WalError> { self.bset(key, original_value) }
+    fn wal_bdel(&self, key: &[u8]) -> Result<(), WalError> { self.bdel(key) }
+    fn wal_list_op(&self, key: &[u8], payload: &[u8]) -> Result<(), WalError> { self.list_op(key, payload) }
+    fn wal_sync_now(&self) -> Result<(), WalError> { self.sync_now() }
 }
 
 // ---------------------------------------------------------------------------

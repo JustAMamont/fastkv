@@ -11,7 +11,7 @@ use crate::core::expiration::ExpirationManager;
 use crate::core::kv::{KvStoreLockFree, DEFAULT_INLINE_SIZE};
 use crate::core::list::ListManager;
 use crate::core::server::tcp::{parse_command_bounds, process_command_into, ServerContext};
-use crate::core::wal::Wal;
+use crate::core::wal::WalWriter;
 #[cfg(feature = "blob-store")]
 use crate::core::blob::BlobArena;
 use std::net::SocketAddr;
@@ -26,7 +26,7 @@ const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 /// io_uring-based TCP server.
 pub struct IoUringServer<const N: usize = DEFAULT_INLINE_SIZE> {
     store: Arc<KvStoreLockFree<N>>,
-    wal: Option<Arc<Wal>>,
+    wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
     #[cfg(feature = "blob-store")]
@@ -76,7 +76,7 @@ impl<const N: usize> IoUringServer<N> {
         port: u16,
         host: String,
         store: Arc<KvStoreLockFree<N>>,
-        wal: Option<Arc<Wal>>,
+        wal: Option<Arc<dyn WalWriter>>,
         expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
         blob: Option<Arc<BlobArena>>,
@@ -90,8 +90,8 @@ impl<const N: usize> IoUringServer<N> {
         port: u16,
         host: String,
         store: Arc<KvStoreLockFree<N>>,
-        wal: Option<Arc<Wal>>,
-        expiry: Option<Arc<ExpirationManager<N>>>,
+        wal: Option<Arc<dyn WalWriter>>,
+        expiry: Option<Arc<ExpirationManager<N>>,
         lists: Option<Arc<ListManager<N>>>,
     ) -> Self {
         Self { store, wal, expiry, lists, host, port }
@@ -157,7 +157,7 @@ impl<const N: usize> IoUringServer<N> {
 async fn handle_client<const N: usize>(
     stream: tokio_uring::net::TcpStream,
     store: Arc<KvStoreLockFree<N>>,
-    wal: Option<Arc<Wal>>,
+    wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
     blob: Option<Arc<BlobArena>>,
@@ -228,7 +228,7 @@ async fn handle_client<const N: usize>(
 async fn handle_client<const N: usize>(
     stream: tokio_uring::net::TcpStream,
     store: Arc<KvStoreLockFree<N>>,
-    wal: Option<Arc<Wal>>,
+    wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
     addr: SocketAddr,

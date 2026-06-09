@@ -16,7 +16,7 @@ use crate::core::kv::{IncrError, KvStoreLockFree, DEFAULT_INLINE_SIZE};
 use crate::core::expiration::ExpirationManager;
 use crate::core::list::{self, ListManager};
 use crate::core::resp::{write_usize_buf, RespEncoder, RespParser};
-use crate::core::wal::Wal;
+use crate::core::wal::WalWriter;
 #[cfg(feature = "blob-store")]
 use crate::core::blob::BlobArena;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ const INITIAL_RESPONSE_SIZE: usize = 4096;
 /// components (lists, sets, sorted sets, …) are added over time.
 pub struct ServerContext<'a, const N: usize = DEFAULT_INLINE_SIZE> {
     pub store: &'a KvStoreLockFree<N>,
-    pub wal: Option<&'a Wal>,
+    pub wal: Option<&'a dyn WalWriter>,
     pub expiry: Option<&'a ExpirationManager<N>>,
     pub lists: Option<&'a ListManager<N>>,
     #[cfg(feature = "blob-store")]
@@ -60,8 +60,8 @@ pub struct TokioServer<const N: usize = DEFAULT_INLINE_SIZE> {
     /// Shared lock-free KV store.
     #[allow(dead_code)]
     store: Arc<KvStoreLockFree<N>>,
-    /// Optional WAL for crash-consistent persistence.
-    wal: Option<Arc<Wal>>,
+    /// Optional WAL for crash-consistent persistence (trait object).
+    wal: Option<Arc<dyn WalWriter>>,
     /// Optional expiration manager.
     expiry: Option<Arc<ExpirationManager<N>>>,
     /// Optional list manager.
@@ -111,18 +111,18 @@ impl<const N: usize> TokioServer<N> {
     }
 
     /// Create a fully configured server.
+    #[cfg(feature = "blob-store")]
     pub fn with_components(
         port: u16,
         host: String,
         store: Arc<KvStoreLockFree<N>>,
-        wal: Option<Arc<Wal>>,
+        wal: Option<Arc<dyn WalWriter>>,
         expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
-        #[cfg(feature = "blob-store")] blob: Option<Arc<BlobArena>>,
+        blob: Option<Arc<BlobArena>>,
     ) -> Self {
         Self {
             store, wal, expiry, lists,
-            #[cfg(feature = "blob-store")]
             blob,
             host, port,
         }
@@ -134,7 +134,7 @@ impl<const N: usize> TokioServer<N> {
         port: u16,
         host: String,
         store: Arc<KvStoreLockFree<N>>,
-        wal: Option<Arc<Wal>>,
+        wal: Option<Arc<dyn WalWriter>>,
         expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
     ) -> Self {
@@ -212,7 +212,7 @@ impl<const N: usize> Default for TokioServer<N> {
 async fn handle_client<const N: usize>(
     mut socket: TcpStream,
     store: Arc<KvStoreLockFree<N>>,
-    wal: Option<Arc<Wal>>,
+    wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
     blob: Option<Arc<BlobArena>>,
@@ -269,7 +269,7 @@ async fn handle_client<const N: usize>(
 async fn handle_client<const N: usize>(
     mut socket: TcpStream,
     store: Arc<KvStoreLockFree<N>>,
-    wal: Option<Arc<Wal>>,
+    wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
     addr: std::net::SocketAddr,
@@ -660,7 +660,7 @@ fn cmd_set<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext
 
     if ctx.store.set(key, value) {
         if let Some(w) = ctx.wal {
-            if w.set(key, value).is_err() {
+            if w.wal_set(key, value).is_err() {
                 out.extend_from_slice(b"-ERR WAL write failed\r\n");
                 return;
             }
@@ -678,7 +678,7 @@ fn cmd_set<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext
             if let Some(dur) = ttl {
                 if let Some(deadline_ms) = exp.expire_with_deadline(key, dur) {
                     if let Some(w) = ctx.wal {
-                        let _ = w.expire(key, deadline_ms);
+                        let _ = w.wal_expire(key, deadline_ms);
                     }
                 }
             }
@@ -719,12 +719,12 @@ fn cmd_del<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext
                 // the arena slot; regular DEL for non-blob keys.
                 #[cfg(feature = "blob-store")]
                 if is_blob_key {
-                    let _ = w.bdel(key);
+                    let _ = w.wal_bdel(key);
                 } else {
-                    let _ = w.del(key);
+                    let _ = w.wal_del(key);
                 }
                 #[cfg(not(feature = "blob-store"))]
-                let _ = w.del(key);
+                let _ = w.wal_del(key);
             }
             if let Some(exp) = ctx.expiry { exp.remove(key); }
             if let Some(lists) = ctx.lists { lists.remove_key(key); }
@@ -780,7 +780,7 @@ fn cmd_incr<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
     match ctx.store.incr(key, delta) {
         Ok(new_val) => {
             if let Some(w) = ctx.wal {
-                if w.set(key, new_val.to_string().as_bytes()).is_err() {
+                if w.wal_set(key, new_val.to_string().as_bytes()).is_err() {
                     RespEncoder::write_error(out, "ERR WAL write failed");
                     return;
                 }
@@ -792,7 +792,7 @@ fn cmd_incr<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
             let new_val = delta;
             ctx.store.set(key, new_val.to_string().as_bytes());
             if let Some(w) = ctx.wal {
-                if w.set(key, new_val.to_string().as_bytes()).is_err() {
+                if w.wal_set(key, new_val.to_string().as_bytes()).is_err() {
                     RespEncoder::write_error(out, "ERR WAL write failed");
                     return;
                 }
@@ -850,7 +850,7 @@ fn cmd_append<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerCont
         Some(new_len) => {
             if let Some(w) = ctx.wal {
                 if let Some(val) = ctx.store.get(key) {
-                    if w.set(key, &val).is_err() {
+                    if w.wal_set(key, &val).is_err() {
                         RespEncoder::write_error(out, "ERR WAL write failed");
                         return;
                     }
@@ -934,7 +934,7 @@ fn cmd_setrange<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerCo
         Some(new_len) => {
             if let Some(w) = ctx.wal {
                 if let Some(val) = ctx.store.get(key) {
-                    if w.set(key, &val).is_err() {
+                    if w.wal_set(key, &val).is_err() {
                         RespEncoder::write_error(out, "ERR WAL write failed");
                         return;
                     }
@@ -986,7 +986,7 @@ fn cmd_mset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
     if ctx.store.mset(&pairs) {
         if let Some(w) = ctx.wal {
             for (k, v) in &pairs {
-                if w.set(k, v).is_err() {
+                if w.wal_set(k, v).is_err() {
                     RespEncoder::write_error(out, "ERR WAL write failed");
                     return;
                 }
@@ -1040,7 +1040,7 @@ fn cmd_expire<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerCont
         ctx.store.del(key);
         if let Some(exp) = ctx.expiry { exp.remove(key); }
         if let Some(lists) = ctx.lists { lists.remove_key(key); }
-        if let Some(w) = ctx.wal { let _ = w.del(key); }
+        if let Some(w) = ctx.wal { let _ = w.wal_del(key); }
         RespEncoder::write_integer(out, 1);
         return;
     }
@@ -1051,7 +1051,7 @@ fn cmd_expire<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerCont
         Some(deadline_ms) => {
             // Persist to WAL.
             if let Some(w) = ctx.wal {
-                if w.expire(key, deadline_ms).is_err() {
+                if w.wal_expire(key, deadline_ms).is_err() {
                     RespEncoder::write_error(out, "ERR WAL write failed");
                     return;
                 }
@@ -1181,7 +1181,7 @@ fn cmd_hset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
 
     if ctx.store.set(key, &current) {
         if let Some(w) = ctx.wal {
-            if w.set(key, &current).is_err() {
+            if w.wal_set(key, &current).is_err() {
                 RespEncoder::write_error(out, "ERR WAL write failed");
                 return;
             }
@@ -1239,7 +1239,7 @@ fn cmd_hdel<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
             HashDelResult::HashEmpty => {
                 deleted += 1;
                 ctx.store.del(key);
-                if let Some(w) = ctx.wal { let _ = w.del(key); }
+                if let Some(w) = ctx.wal { let _ = w.wal_del(key); }
                 if let Some(exp) = ctx.expiry { exp.remove(key); }
                 current = Vec::new();
                 break;
@@ -1250,7 +1250,7 @@ fn cmd_hdel<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
 
     if !current.is_empty() {
         ctx.store.set(key, &current);
-        if let Some(w) = ctx.wal { let _ = w.set(key, &current); }
+        if let Some(w) = ctx.wal { let _ = w.wal_set(key, &current); }
     }
 
     RespEncoder::write_integer(out, deleted);
@@ -1405,7 +1405,7 @@ fn cmd_hmset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerConte
 
     if ctx.store.set(key, &current) {
         if let Some(w) = ctx.wal {
-            if w.set(key, &current).is_err() {
+            if w.wal_set(key, &current).is_err() {
                 RespEncoder::write_error(out, "ERR WAL write failed");
                 return;
             }
@@ -1694,7 +1694,7 @@ fn cmd_bset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
         if let Some(w) = ctx.wal {
             // Write the ORIGINAL uncompressed value to the WAL so that the
             // blob arena can be reconstructed on recovery.
-            if w.bset(key, value).is_err() {
+            if w.wal_bset(key, value).is_err() {
                 out.extend_from_slice(b"-ERR WAL write failed\r\n");
                 return;
             }

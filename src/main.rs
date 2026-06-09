@@ -5,12 +5,12 @@
 
 use fast_kv::{
     ExpirationManager, FsyncPolicy, KvStoreLockFree, ListManager, VERSION, Wal,
+    WalOp,
     core::expiration::spawn_active_expiration,
     core::kv::DEFAULT_INLINE_SIZE,
-    WalOp,
 };
 #[cfg(feature = "blob-store")]
-use fast_kv::BlobArena;
+use fast_kv::{BlobArena, WalSegment, SegmentConfig, recover_segments};
 use std::env;
 use std::sync::Arc;
 use std::thread;
@@ -58,6 +58,10 @@ fn print_usage() {
     println!("  --dir <path>         Data directory for WAL (default: ./fastkv_data)");
     println!("  --fsync <policy>     fsync policy: always | everysec | never (default: everysec)");
     println!("  --mode <backend>     Server backend: tokio (default)");
+    #[cfg(feature = "blob-store")]
+    println!("  --wal-compress       Enable compressed segment-based WAL (saves disk for high-volume)");
+    #[cfg(feature = "blob-store")]
+    println!("  --wal-segment-size   Max WAL segment size in MB (default: 64, only with --wal-compress)");
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     println!("                       io_uring (Linux only, maximum performance)");
     println!();
@@ -107,6 +111,12 @@ fn get_flag(args: &[String], name: &str) -> Option<String> {
     None
 }
 
+#[cfg(feature = "blob-store")]
+fn has_flag(args: &[String], name: &str) -> bool {
+    let long = format!("--{}", name);
+    args.iter().any(|a| a == &long)
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -147,6 +157,18 @@ fn run_server(args: &[String]) {
     let mode = get_flag(args, "mode")
         .unwrap_or_else(|| "tokio".into());
 
+    #[cfg(feature = "blob-store")]
+    let wal_compress = has_flag(args, "wal-compress");
+    #[cfg(not(feature = "blob-store"))]
+    let wal_compress = false;
+
+    #[cfg(feature = "blob-store")]
+    let wal_segment_size_mb: u64 = get_flag(args, "wal-segment-size")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    #[cfg(not(feature = "blob-store"))]
+    let wal_segment_size_mb: u64 = 64;
+
     let fsync_policy = match fsync_str.as_str() {
         "always" => FsyncPolicy::Always,
         "never" => FsyncPolicy::Never,
@@ -172,6 +194,9 @@ fn run_server(args: &[String]) {
     println!("  mode:        {}", mode);
     #[cfg(feature = "blob-store")]
     println!("  blob-store:  enabled (zstd compression)");
+    if wal_compress {
+        println!("  wal-compress: enabled (segment size: {} MB)", wal_segment_size_mb);
+    }
 
     // --- Data directory ---
     std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
@@ -180,10 +205,10 @@ fn run_server(args: &[String]) {
 
     // --- Dispatch to the monomorphized server for the chosen inline size ---
     match inline_size {
-        64  => run_server_with_n::<64>(host, port, capacity, data_dir, fsync_policy, mode),
-        128 => run_server_with_n::<128>(host, port, capacity, data_dir, fsync_policy, mode),
-        256 => run_server_with_n::<256>(host, port, capacity, data_dir, fsync_policy, mode),
-        512 => run_server_with_n::<512>(host, port, capacity, data_dir, fsync_policy, mode),
+        64  => run_server_with_n::<64>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb),
+        128 => run_server_with_n::<128>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb),
+        256 => run_server_with_n::<256>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb),
+        512 => run_server_with_n::<512>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb),
         _   => unreachable!(), // validated above
     }
 }
@@ -200,17 +225,58 @@ fn run_server_with_n<const N: usize>(
     data_dir: String,
     fsync_policy: FsyncPolicy,
     mode: String,
+    wal_compress: bool,
+    wal_segment_size_mb: u64,
 ) {
+    // Suppress unused-variable warnings when blob-store is disabled.
+    #[cfg(not(feature = "blob-store"))]
+    let _ = (wal_compress, wal_segment_size_mb);
+
     // --- WAL ---
-    let wal_path = format!("{}/fastkv.wal", data_dir);
-    let wal = match Wal::open(&wal_path, fsync_policy) {
-        Ok(w) => {
-            println!("  WAL:    {} (fsync: {:?})", wal_path, fsync_policy);
-            Some(Arc::new(w))
+    // When wal_compress is enabled (requires blob-store), use WalSegment.
+    // Otherwise, use the legacy v1 Wal.
+    #[cfg(feature = "blob-store")]
+    let (wal, wal_seg): (Option<Arc<Wal>>, Option<Arc<WalSegment>>) = if wal_compress {
+        // Compressed segment WAL.
+        let mut seg_config = SegmentConfig::new(&data_dir);
+        seg_config.fsync_policy = fsync_policy;
+        seg_config.max_segment_size = wal_segment_size_mb * 1024 * 1024;
+        match WalSegment::open(seg_config) {
+            Ok(seg) => {
+                println!("  WAL:    {} (compressed, segment size: {} MB)", data_dir, wal_segment_size_mb);
+                (None, Some(Arc::new(seg)))
+            }
+            Err(e) => {
+                eprintln!("  WAL:    disabled (segment open failed: {})", e);
+                (None, None)
+            }
         }
-        Err(e) => {
-            eprintln!("  WAL:    disabled (open failed: {})", e);
-            None
+    } else {
+        let wal_path = format!("{}/fastkv.wal", data_dir);
+        match Wal::open(&wal_path, fsync_policy) {
+            Ok(w) => {
+                println!("  WAL:    {} (fsync: {:?})", wal_path, fsync_policy);
+                (Some(Arc::new(w)), None)
+            }
+            Err(e) => {
+                eprintln!("  WAL:    disabled (open failed: {})", e);
+                (None, None)
+            }
+        }
+    };
+
+    #[cfg(not(feature = "blob-store"))]
+    let (wal, _wal_seg): (Option<Arc<Wal>>, Option<()>) = {
+        let wal_path = format!("{}/fastkv.wal", data_dir);
+        match Wal::open(&wal_path, fsync_policy) {
+            Ok(w) => {
+                println!("  WAL:    {} (fsync: {:?})", wal_path, fsync_policy);
+                (Some(Arc::new(w)), None)
+            }
+            Err(e) => {
+                eprintln!("  WAL:    disabled (open failed: {})", e);
+                (None, None)
+            }
         }
     };
 
@@ -236,95 +302,120 @@ fn run_server_with_n<const N: usize>(
     let _expiry_handle = spawn_active_expiration(expiry.as_ref().unwrap().clone());
 
     // --- WAL recovery ---
-    if let Some(ref wal_arc) = wal {
-        let entries = match Wal::recover(wal_arc.path()) {
+    #[cfg(feature = "blob-store")]
+    let entries: Vec<fast_kv::WalEntry> = if let Some(ref seg) = wal_seg {
+        // Compressed segment recovery.
+        match recover_segments(seg.data_dir()) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("Warning: segment WAL recovery failed: {}", err);
+                Vec::new()
+            }
+        }
+    } else if let Some(ref wal_arc) = wal {
+        match Wal::recover(wal_arc.path()) {
             Ok(e) => e,
             Err(err) => {
                 eprintln!("Warning: WAL recovery failed: {}", err);
                 Vec::new()
             }
-        };
-        let mut recovered = 0usize;
-        let mut skipped = 0usize;
-        for entry in &entries {
-            match entry.op {
-                WalOp::Set => {
-                    if store.set(&entry.key, &entry.value) {
-                        recovered += 1;
-                    } else {
-                        skipped += 1;
-                    }
+        }
+    } else {
+        Vec::new()
+    };
+
+    #[cfg(not(feature = "blob-store"))]
+    let entries: Vec<fast_kv::WalEntry> = if let Some(ref wal_arc) = wal {
+        match Wal::recover(wal_arc.path()) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("Warning: WAL recovery failed: {}", err);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut recovered = 0usize;
+    let mut skipped = 0usize;
+    for entry in &entries {
+        match entry.op {
+            WalOp::Set => {
+                if store.set(&entry.key, &entry.value) {
+                    recovered += 1;
+                } else {
+                    skipped += 1;
                 }
-                WalOp::Del => {
-                    if store.del(&entry.key) {
-                        recovered += 1;
-                    }
+            }
+            WalOp::Del => {
+                if store.del(&entry.key) {
+                    recovered += 1;
                 }
-                WalOp::Expire => { /* handled below */ }
-                #[cfg(feature = "blob-store")]
-                WalOp::BSet => {
-                    // Replay blob set: compress original value, store in arena,
-                    // put BlobRef in hash table.
-                    if let Some(ref blob_arena) = blob {
-                        if let Some(blob_ref) = blob_arena.store(&entry.value) {
-                            let encoded = blob_ref.encode();
-                            if store.set(&entry.key, &encoded) {
-                                recovered += 1;
-                            } else {
-                                // BlobRef too large for inline — free the slot.
-                                blob_arena.free(&blob_ref);
-                                skipped += 1;
-                            }
+            }
+            WalOp::Expire => { /* handled below */ }
+            #[cfg(feature = "blob-store")]
+            WalOp::BSet => {
+                if let Some(ref blob_arena) = blob {
+                    if let Some(blob_ref) = blob_arena.store(&entry.value) {
+                        let encoded = blob_ref.encode();
+                        if store.set(&entry.key, &encoded) {
+                            recovered += 1;
                         } else {
+                            blob_arena.free(&blob_ref);
                             skipped += 1;
                         }
                     } else {
                         skipped += 1;
                     }
-                }
-                #[cfg(feature = "blob-store")]
-                WalOp::BDel => {
-                    // Replay blob delete: free the arena slot and delete from kv.
-                    if let Some(ref blob_arena) = blob {
-                        if let Some(v) = store.get(&entry.key) {
-                            if fast_kv::core::blob::BlobArena::is_blob_ref(&v) {
-                                if let Some(blob_ref) = fast_kv::core::blob::BlobRef::decode(&v) {
-                                    blob_arena.free(&blob_ref);
-                                }
-                            }
-                        }
-                    }
-                    if store.del(&entry.key) {
-                        recovered += 1;
-                    }
-                }
-                #[cfg(not(feature = "blob-store"))]
-                _ => {
-                    // Skip blob entries when blob-store is not enabled.
+                } else {
                     skipped += 1;
                 }
             }
+            #[cfg(feature = "blob-store")]
+            WalOp::BDel => {
+                if let Some(ref blob_arena) = blob {
+                    if let Some(v) = store.get(&entry.key) {
+                        if fast_kv::core::blob::BlobArena::is_blob_ref(&v) {
+                            if let Some(blob_ref) = fast_kv::core::blob::BlobRef::decode(&v) {
+                                blob_arena.free(&blob_ref);
+                            }
+                        }
+                    }
+                }
+                if store.del(&entry.key) {
+                    recovered += 1;
+                }
+            }
+            WalOp::ListOp => {
+                fast_kv::core::list::replay_list_op(&lists_mgr, &entry.key, &entry.value);
+                recovered += 1;
+            }
+            #[cfg(not(feature = "blob-store"))]
+            _ => {
+                skipped += 1;
+            }
         }
-        if !entries.is_empty() {
-            println!("  Recovered {} entries from WAL (DBSIZE: {}){}",
-                recovered,
-                store.len(),
-                if skipped > 0 { format!(", {} skipped (exceeds inline-size={})", skipped, N) } else { String::new() }
-            );
-        }
+    }
+    if !entries.is_empty() {
+        println!("  Recovered {} entries from WAL (DBSIZE: {}){}",
+            recovered,
+            store.len(),
+            if skipped > 0 { format!(", {} skipped (exceeds inline-size={})", skipped, N) } else { String::new() }
+        );
+    }
 
-        // Phase 2: replay EXPIRE entries (after all keys exist).
-        let expire_entries: Vec<_> = entries.iter().filter(|e| e.op == WalOp::Expire).collect();
-        if let Some(ref exp) = expiry {
-            for entry in &expire_entries {
-                let deadline_ms = u64::from_le_bytes(
-                    entry.value.clone().try_into().unwrap_or([0u8; 8]),
-                );
-                exp.expire_at_deadline_ms(&entry.key, deadline_ms);
-            }
-            if !expire_entries.is_empty() {
-                println!("  Restored {} TTL entries from WAL", expire_entries.len());
-            }
+    // Phase 2: replay EXPIRE entries (after all keys exist).
+    let expire_entries: Vec<_> = entries.iter().filter(|e| e.op == WalOp::Expire).collect();
+    if let Some(ref exp) = expiry {
+        for entry in &expire_entries {
+            let deadline_ms = u64::from_le_bytes(
+                entry.value.clone().try_into().unwrap_or([0u8; 8]),
+            );
+            exp.expire_at_deadline_ms(&entry.key, deadline_ms);
+        }
+        if !expire_entries.is_empty() {
+            println!("  Restored {} TTL entries from WAL", expire_entries.len());
         }
     }
 
@@ -341,15 +432,28 @@ fn run_server_with_n<const N: usize>(
 
     println!();
 
+    // Convert WAL references to trait objects for the server.
+    #[cfg(feature = "blob-store")]
+    let wal_writer: Option<Arc<dyn fast_kv::WalWriter>> = if let Some(ref seg) = wal_seg {
+        Some(Arc::clone(seg) as Arc<dyn fast_kv::WalWriter>)
+    } else if let Some(ref w) = wal {
+        Some(Arc::clone(w) as Arc<dyn fast_kv::WalWriter>)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "blob-store"))]
+    let wal_writer: Option<Arc<dyn fast_kv::WalWriter>> = wal.map(|w| w as Arc<dyn fast_kv::WalWriter>);
+
     match mode.as_str() {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         "io_uring" => {
             use fast_kv::core::server::IoUringServer;
             println!("Starting FastKV io_uring server on {}:{} (inline-size={})...", host, port, N);
             #[cfg(feature = "blob-store")]
-            let server = IoUringServer::<N>::with_components(port, host, store, wal, expiry, lists, blob);
+            let server = IoUringServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob);
             #[cfg(not(feature = "blob-store"))]
-            let server = IoUringServer::<N>::with_components_no_blob(port, host, store, wal, expiry, lists);
+            let server = IoUringServer::<N>::with_components_no_blob(port, host, store, wal_writer, expiry, lists);
             server.run();
         }
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -361,9 +465,9 @@ fn run_server_with_n<const N: usize>(
             use fast_kv::core::server::TokioServer;
             println!("Starting FastKV server on {}:{} (inline-size={})...", host, port, N);
             #[cfg(feature = "blob-store")]
-            let server = TokioServer::<N>::with_components(port, host, store, wal, expiry, lists, blob);
+            let server = TokioServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob);
             #[cfg(not(feature = "blob-store"))]
-            let server = TokioServer::<N>::with_components_no_blob(port, host, store, wal, expiry, lists);
+            let server = TokioServer::<N>::with_components_no_blob(port, host, store, wal_writer, expiry, lists);
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(server.run());
         }

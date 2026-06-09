@@ -29,3 +29,5 @@ pub mod server;
 
 #[cfg(feature = "blob-store")]
 pub mod blob;
+#[cfg(feature = "blob-store")]
+pub mod wal_segment;
