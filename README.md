@@ -499,18 +499,16 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 ```
 SimHash (64-bit near-duplicate detection)
 ┌──────────────────────────────────────────────────────────┐
-│  1. Hash each field with 64-bit wyhash                    │
+│  1. Hash each feature with 64-bit wyhash                  │
 │  2. Weighted vote vector: +weight for 1-bits, -weight     │
 │     for 0-bits                                            │
 │  3. Final hash: bit = 1 if vote > 0 else 0               │
 │  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT│
-│                                                           │
-│  Default weights: user_agent(4), webgl_renderer(3),       │
-│  screen_resolution(2), os(2), fonts(1), timezone(1),     │
-│  locale(1), platform(2), webgl_vendor(2), browser_ver(3) │
+│  5. Configurable per-field weights                        │
+│  6. Default threshold: Hamming distance ≤ 3 = similar     │
 └──────────────────────────────────────────────────────────┘
 
-MinHash (Jaccard similarity for set fields)
+MinHash (Jaccard similarity for set-type data)
 ┌──────────────────────────────────────────────────────────┐
 │  128 hash functions via LCG permutation coefficients      │
 │  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64              │
@@ -521,9 +519,9 @@ MinHash (Jaccard similarity for set fields)
 LSH (O(1) approximate nearest-neighbor search)
 ┌──────────────────────────────────────────────────────────┐
 │  SimHash: 64 bits → 4 bands × 16 bits                    │
-│  Bucket keys: lsh:sim:{band}:{value} → list of profile IDs│
+│  Bucket keys: lsh:sim:{band}:{value} → list of IDs       │
 │  MinHash:  128 values → 4 bands × 32 rows                │
-│  Bucket keys: lsh:min:{band}:{value} → list of profile IDs│
+│  Bucket keys: lsh:min:{band}:{value} → list of IDs       │
 │                                                           │
 │  Search: look up all 4 bands, deduplicate candidates,    │
 │  optionally filter by Hamming distance threshold (≤ 3)    │
@@ -541,7 +539,7 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 6 — List: LPUSH/RPUSH, LPOP/RPOP, LRANGE/LLEN/LINDEX, LREM/LTRIM/LSET, WRONGTYPE
 - [x] Phase 7 — Client SDKs: Go, Python (sync + async), Java (sync + reactive), Node.js, Rust (zero-dependency, pipeline support)
 - [x] Phase 8 — Blob Arena: BSET/BGET/BGETRAW/BSTATS, zstd compression, lock-free arena, WAL persistence, Python client
-- [x] Phase 9 — SimHash/MinHash/LSH: similarity search for profiles (feature: `similarity`)
+- [x] Phase 9 — SimHash/MinHash/LSH: similarity search for near-duplicate detection (feature: `similarity`)
 - [ ] Phase 10 — SCAN/KEYS: cursor-based key iteration, glob MATCH, DBSTATS
 - [ ] Phase 11 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
 - [ ] Phase 12 — List WAL: persistent list operations (LPUSH/RPUSH/LPOP/RPOP/LTRIM)
