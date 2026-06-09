@@ -510,6 +510,10 @@ fn dispatch_command<const N: usize>(
         #[cfg(feature = "similarity")]
         "LSHREM"  => { cmd_lshrem(cmd, ctx, out); false }
 
+        // ----- Scan / Stats -----
+        "SCAN"    => { cmd_scan(cmd, ctx, out); false }
+        "DBSTATS" => { cmd_dbstats(ctx, out); false }
+
         _ => {
             let msg = format!("ERR unknown command '{}'", cmd.name);
             RespEncoder::write_error(out, &msg);
@@ -1798,6 +1802,108 @@ fn cmd_bstats<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
 
     let stats = blob_arena.stats();
     RespEncoder::write_bulk_string(out, stats.to_string().as_bytes());
+}
+
+// ===========================================================================
+// Scan / Stats commands (SCAN, DBSTATS)
+// ===========================================================================
+
+/// Handle `SCAN cursor [COUNT n] [MATCH pattern]` — cursor-based key iteration.
+///
+/// Returns a RESP array: `[next_cursor, [key1, key2, ...]]`.
+/// When `next_cursor` is `"0"`, the iteration is complete.
+fn cmd_scan<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    // SCAN cursor [COUNT count] [MATCH pattern]
+    if cmd.argc() < 2 {
+        return err_wrong_args(out);
+    }
+
+    // Parse cursor.
+    let cursor = match cmd.arg(1) {
+        Some(b"0") => 0,
+        Some(bytes) => {
+            match std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                Some(c) => c,
+                None => {
+                    RespEncoder::write_error(out, "ERR invalid cursor");
+                    return;
+                }
+            }
+        }
+        None => 0,
+    };
+
+    // Parse optional COUNT and MATCH.
+    let mut count: usize = 10;
+    let mut pattern: Option<Vec<u8>> = None;
+
+    let mut i = 2;
+    while i < cmd.argc() {
+        if let Some(arg) = cmd.arg(i) {
+            if arg.eq_ignore_ascii_case(b"COUNT") {
+                i += 1;
+                if let Some(cnt_bytes) = cmd.arg(i) {
+                    count = std::str::from_utf8(cnt_bytes)
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(10);
+                }
+            } else if arg.eq_ignore_ascii_case(b"MATCH") {
+                i += 1;
+                if let Some(pat) = cmd.arg(i) {
+                    pattern = Some(pat.to_vec());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let pat_ref = pattern.as_deref();
+    let (next_cursor, keys) = ctx.store.scan(cursor, count, pat_ref);
+
+    // RESP response: array of [next_cursor, [key1, key2, ...]]
+    RespEncoder::write_array_len(out, 2);
+    let cursor_str = next_cursor.to_string();
+    RespEncoder::write_bulk_string(out, cursor_str.as_bytes());
+    RespEncoder::write_array_len(out, keys.len() as i64);
+    for key in &keys {
+        RespEncoder::write_bulk_string(out, key);
+    }
+}
+
+/// Handle `DBSTATS` — return aggregate store statistics.
+///
+/// Returns a RESP array of key-value pairs with store metrics.
+fn cmd_dbstats<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let stats = ctx.store.dbstats();
+
+    // Pre-compute all string values to satisfy borrow checker.
+    let total_keys = stats.total_keys.to_string();
+    let total_buckets = stats.total_buckets.to_string();
+    let load_factor = format!("{:.4}", stats.load_factor);
+    let entry_size = stats.entry_size.to_string();
+    let total_memory = stats.total_memory.to_string();
+    let blob_count = stats.blob_count.to_string();
+    let inline_size = stats.inline_size.to_string();
+
+    let pairs: &[(&[u8], &[u8])] = &[
+        (b"total_keys", total_keys.as_bytes()),
+        (b"total_buckets", total_buckets.as_bytes()),
+        (b"load_factor", load_factor.as_bytes()),
+        (b"entry_size", entry_size.as_bytes()),
+        (b"total_memory", total_memory.as_bytes()),
+        (b"blob_count", blob_count.as_bytes()),
+        (b"inline_size", inline_size.as_bytes()),
+    ];
+
+    RespEncoder::write_array_len(out, (pairs.len() * 2) as i64);
+    for (k, v) in pairs {
+        RespEncoder::write_bulk_string(out, k);
+        RespEncoder::write_bulk_string(out, v);
+    }
 }
 
 // ===========================================================================

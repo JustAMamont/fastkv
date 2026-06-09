@@ -442,10 +442,11 @@ Operations:
 
 ```
 Blob Ref (inline value with flag 0xFD):
-┌───────────┬──────────┬───────────┬───────────┬──────────────┐
+┌──────────┬──────────┬───────────┬───────────┬──────────────┐
 │ flag: 0xFD│ offset:  │ comp_len: │ orig_len: │ data_hash:   │
 │ 1 byte    │ u64 8B   │ u32 4B    │ u32 4B    │ dual-crc32c  │
-└───────────┴──────────┴───────────┴───────────┴──────────────┘
+│           │          │           │           │ 16B          │
+└──────────┴──────────┴───────────┴───────────┴──────────────┘
 Total: 33 bytes — fits even in N=64 inline size
 
 Architecture:
@@ -497,35 +498,35 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 
 ```
 SimHash (64-bit near-duplicate detection)
-┌───────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │  1. Hash each feature with 64-bit wyhash                  │
 │  2. Weighted vote vector: +weight for 1-bits, -weight     │
 │     for 0-bits                                            │
-│  3. Final hash: bit = 1 if vote > 0 else 0                │
-│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT │
+│  3. Final hash: bit = 1 if vote > 0 else 0               │
+│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT│
 │  5. Configurable per-field weights                        │
 │  6. Default threshold: Hamming distance ≤ 3 = similar     │
-└───────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 
 MinHash (Jaccard similarity for set-type data)
-┌───────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │  128 hash functions via LCG permutation coefficients      │
-│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64                │
-│  Signature: Vec<u32> of 128 minimums (512 bytes)          │
+│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64              │
+│  Signature: Vec<u32> of 128 minimums (512 bytes)         │
 │  Jaccard estimate = fraction of matching components       │
-└───────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 
 LSH (O(1) approximate nearest-neighbor search)
-┌───────────────────────────────────────────────────────────┐
-│  SimHash: 64 bits → 4 bands × 16 bits                     │
-│  Bucket keys: lsh:sim:{band}:{value} → list of IDs        │
-│  MinHash:  128 values → 4 bands × 32 rows                 │
-│  Bucket keys: lsh:min:{band}:{value} → list of IDs        │
+┌──────────────────────────────────────────────────────────┐
+│  SimHash: 64 bits → 4 bands × 16 bits                    │
+│  Bucket keys: lsh:sim:{band}:{value} → list of IDs       │
+│  MinHash:  128 values → 4 bands × 32 rows                │
+│  Bucket keys: lsh:min:{band}:{value} → list of IDs       │
 │                                                           │
-│  Search: look up all 4 bands, deduplicate candidates,     │
+│  Search: look up all 4 bands, deduplicate candidates,    │
 │  optionally filter by Hamming distance threshold (≤ 3)    │
 │  Metadata: lsh:simhash:{id} → stored 64-bit SimHash       │
-└───────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Roadmap

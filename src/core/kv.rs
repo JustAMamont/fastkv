@@ -1109,6 +1109,132 @@ impl<const N: usize> KvStoreLockFree<N> {
     }
 
     // -----------------------------------------------------------------------
+    // SCAN — cursor-based key iteration
+    // -----------------------------------------------------------------------
+
+    /// Iterate over keys in the hash table using a cursor.
+    ///
+    /// Returns `(next_cursor, keys)`. When `next_cursor == 0`, the iteration
+    /// is complete. The caller should call `scan` again with the returned
+    /// cursor until it receives `0`.
+    ///
+    /// * `cursor` — starting bucket index (`0` to start from the beginning).
+    /// * `count` — hint for how many keys to return per call (default 10).
+    ///   The actual number may be slightly different.
+    /// * `pattern` — optional glob pattern (`session:*`, `profile:ru-*`).
+    ///   Only keys matching the pattern are returned.
+    ///
+    /// The implementation does a linear scan of buckets starting at `cursor`,
+    /// collecting up to `count` matching keys. Lock-free: uses the same
+    /// optimistic version-check protocol as `get`.
+    pub fn scan(&self, cursor: usize, count: usize, pattern: Option<&[u8]>) -> (usize, Vec<Vec<u8>>) {
+        let count = if count == 0 { 10 } else { count };
+        let mut keys = Vec::with_capacity(count);
+        let cap = self.capacity;
+
+        if cap == 0 {
+            return (0, keys);
+        }
+
+        let mut idx = cursor.min(cap - 1);
+
+        // Scan through all buckets once.
+        for _ in 0..cap {
+            let entry = &self.buckets[idx];
+
+            // Optimistic read: check version, read key, verify version.
+            let v1 = entry.version.load(Ordering::Acquire);
+            if v1 % 2 == 1 {
+                // Write in progress — skip this entry.
+                idx = (idx + 1) % cap;
+                continue;
+            }
+
+            let entry_hash = entry.hash.load(Ordering::Acquire);
+            if entry_hash != 0 {
+                // Occupied slot — read the key.
+                let key_len = entry.key_len.load(Ordering::Acquire) as usize;
+                if key_len > 0 && key_len <= N {
+                    let mut key_buf = vec![0u8; key_len];
+                    for j in 0..key_len {
+                        key_buf[j] = entry.data[0][j].load(Ordering::Relaxed);
+                    }
+
+                    let v2 = entry.version.load(Ordering::Acquire);
+                    if v1 == v2 {
+                        // Consistent read — check pattern.
+                        let matches = match pattern {
+                            Some(pat) => glob_match(&key_buf, pat),
+                            None => true,
+                        };
+                        if matches {
+                            keys.push(key_buf);
+                            if keys.len() >= count {
+                                let next = (idx + 1) % cap;
+                                return (next, keys);
+                            }
+                        }
+                    }
+                    // Version changed — skip this entry (don't risk stale data).
+                }
+            }
+
+            idx = (idx + 1) % cap;
+        }
+
+        // We've scanned the entire table.
+        (0, keys)
+    }
+
+    // -----------------------------------------------------------------------
+    // DBSTATS — aggregate store statistics
+    // -----------------------------------------------------------------------
+
+    /// Return aggregate statistics about the key-value store.
+    ///
+    /// The returned struct contains counts and memory estimates that can be
+    /// serialized to RESP or JSON for monitoring dashboards.
+    pub fn dbstats(&self) -> DbStats {
+        let total_keys = self.count.load(Ordering::Relaxed);
+        let total_buckets = self.capacity;
+        let load_factor = if total_buckets > 0 {
+            total_keys as f64 / total_buckets as f64
+        } else {
+            0.0
+        };
+
+        // Estimate memory: each entry is cache-line aligned to 64 bytes +
+        // N*2 bytes for inline data (key + value banks).
+        let entry_size = std::mem::size_of::<LockFreeEntry<N>>();
+        let total_memory = total_buckets * entry_size;
+
+        // Count blob refs (0xFD flag in value[0]).
+        let mut blob_count = 0usize;
+        for i in 0..total_buckets {
+            let entry = &self.buckets[i];
+            let h = entry.hash.load(Ordering::Relaxed);
+            if h == 0 { continue; }
+            let vl = entry.value_len.load(Ordering::Relaxed) as usize;
+            if vl > 0 && vl <= N {
+                let first = entry.data[1][0].load(Ordering::Relaxed);
+                if first == 0xFD {
+                    blob_count += 1;
+                }
+            }
+        }
+
+        DbStats {
+            total_keys,
+            total_buckets,
+            load_factor,
+            entry_size,
+            total_memory,
+            blob_count,
+            inline_size: N,
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -1156,8 +1282,88 @@ fn normalize_index(idx: i64, len: i64) -> i64 {
 }
 
 // ============================================================================
-// TYPE ALIASES
+// DbStats — aggregate store statistics
 // ============================================================================
+
+/// Aggregate statistics about the key-value store.
+///
+/// Returned by [`KvStoreLockFree::dbstats`].
+#[derive(Debug, Clone)]
+pub struct DbStats {
+    /// Number of keys currently stored.
+    pub total_keys: usize,
+    /// Total number of hash table buckets (capacity).
+    pub total_buckets: usize,
+    /// Load factor: `total_keys / total_buckets`.
+    pub load_factor: f64,
+    /// Size of a single `LockFreeEntry<N>` in bytes.
+    pub entry_size: usize,
+    /// Total memory used by the hash table in bytes (`total_buckets * entry_size`).
+    pub total_memory: usize,
+    /// Number of keys whose value is a blob ref (0xFD prefix).
+    pub blob_count: usize,
+    /// Per-side inline storage size (compile-time const generic `N`).
+    pub inline_size: usize,
+}
+
+// ============================================================================
+// Glob pattern matching
+// ============================================================================
+
+/// Simple glob pattern matching supporting `*` (any chars) and `?` (one char).
+///
+/// Pattern examples: `session:*`, `profile:ru-*`, `user:??`, `*`
+///
+/// No character class `[...]` support — keeping it simple for performance.
+/// Pattern matching is case-sensitive.
+pub fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
+    glob_match_impl(text, 0, pattern, 0)
+}
+
+fn glob_match_impl(text: &[u8], ti: usize, pattern: &[u8], pi: usize) -> bool {
+    let mut ti = ti;
+    let mut pi = pi;
+
+    loop {
+        if pi == pattern.len() {
+            return ti == text.len();
+        }
+
+        let pc = pattern[pi];
+
+        if pc == b'*' {
+            // Skip consecutive stars.
+            let mut star_pi = pi + 1;
+            while star_pi < pattern.len() && pattern[star_pi] == b'*' {
+                star_pi += 1;
+            }
+
+            // If star is at end of pattern, it matches everything.
+            if star_pi == pattern.len() {
+                return true;
+            }
+
+            // Try matching the remainder after `*` at every position in text.
+            for try_ti in ti..=text.len() {
+                if glob_match_impl(text, try_ti, pattern, star_pi) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if ti == text.len() {
+            return false;
+        }
+
+        if pc == b'?' || pc == text[ti] {
+            ti += 1;
+            pi += 1;
+        } else {
+            return false;
+        }
+    }
+}
 
 /// The production KV store — lock-free and thread-safe with the default
 /// inline size ([`DEFAULT_INLINE_SIZE`] = 64 bytes per side).
@@ -1323,5 +1529,128 @@ mod tests {
         let store = KvStore::with_capacity(100);
         assert!(store.set(b"alias", b"works"));
         assert_eq!(store.get(b"alias"), Some(b"works".to_vec()));
+    }
+
+    // ----- SCAN -----
+
+    #[test]
+    fn test_scan_empty_store() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100);
+        let (cursor, keys) = store.scan(0, 10, None);
+        assert_eq!(cursor, 0);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_keys() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(200);
+        for i in 0..20 {
+            let key = format!("key:{}", i);
+            store.set(key.as_bytes(), b"val");
+        }
+        let mut all_keys = std::collections::HashSet::new();
+        let mut cursor = 0usize;
+        let mut iterations = 0;
+        loop {
+            let (next, keys) = store.scan(cursor, 5, None);
+            for k in keys {
+                all_keys.insert(k);
+            }
+            cursor = next;
+            iterations += 1;
+            if cursor == 0 || iterations > 100 { break; }
+        }
+        assert_eq!(all_keys.len(), 20);
+    }
+
+    #[test]
+    fn test_scan_with_match() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(200);
+        store.set(b"session:1", b"v1");
+        store.set(b"session:2", b"v2");
+        store.set(b"profile:1", b"p1");
+        store.set(b"other", b"o1");
+
+        let mut all_session = Vec::new();
+        let mut cursor = 0usize;
+        let mut iterations = 0;
+        loop {
+            let (next, keys) = store.scan(cursor, 100, Some(b"session:*"));
+            all_session.extend(keys);
+            cursor = next;
+            iterations += 1;
+            if cursor == 0 || iterations > 100 { break; }
+        }
+        assert_eq!(all_session.len(), 2);
+        for k in &all_session {
+            assert!(std::str::from_utf8(k).unwrap().starts_with("session:"));
+        }
+    }
+
+    #[test]
+    fn test_scan_no_match() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(200);
+        store.set(b"hello", b"world");
+        let (cursor, keys) = store.scan(0, 100, Some(b"zzz*"));
+        assert_eq!(cursor, 0);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_glob_match_star() {
+        assert!(glob_match(b"session:1", b"session:*"));
+        assert!(glob_match(b"session:12345", b"session:*"));
+        assert!(!glob_match(b"profile:1", b"session:*"));
+        assert!(glob_match(b"anything", b"*"));
+    }
+
+    #[test]
+    fn test_glob_match_question() {
+        assert!(glob_match(b"ab", b"a?"));
+        assert!(!glob_match(b"abc", b"a?"));
+        assert!(glob_match(b"abc", b"a?c"));
+    }
+
+    #[test]
+    fn test_glob_match_exact() {
+        assert!(glob_match(b"hello", b"hello"));
+        assert!(!glob_match(b"hello", b"world"));
+    }
+
+    #[test]
+    fn test_glob_match_prefix() {
+        assert!(glob_match(b"hello world", b"hello*"));
+        assert!(glob_match(b"hello", b"hello*"));
+    }
+
+    #[test]
+    fn test_glob_match_multiple_stars() {
+        assert!(glob_match(b"abcdefgh", b"a*c*f*h"));
+        assert!(!glob_match(b"abcdefgh", b"a*c*z*h"));
+    }
+
+    // ----- DBSTATS -----
+
+    #[test]
+    fn test_dbstats_empty() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(200);
+        let stats = store.dbstats();
+        assert_eq!(stats.total_keys, 0);
+        assert_eq!(stats.total_buckets, 200);
+        assert_eq!(stats.blob_count, 0);
+        assert_eq!(stats.inline_size, DEFAULT_INLINE_SIZE);
+    }
+
+    #[test]
+    fn test_dbstats_with_data() {
+        let store = KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(200);
+        for i in 0..50 {
+            let key = format!("k{}", i);
+            store.set(key.as_bytes(), b"val");
+        }
+        let stats = store.dbstats();
+        assert_eq!(stats.total_keys, 50);
+        assert!(stats.load_factor > 0.0);
+        assert!(stats.total_memory > 0);
     }
 }

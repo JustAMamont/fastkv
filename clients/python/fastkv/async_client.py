@@ -144,6 +144,76 @@ class FastKVAsyncClient:
         """Return the number of keys in the database."""
         return await self._execute_command("DBSIZE")
 
+    async def scan(
+        self,
+        cursor: int = 0,
+        count: int = 10,
+        match: Optional[str] = None,
+    ) -> tuple:
+        """Iterate over keys using a cursor.
+
+        Parameters
+        ----------
+        cursor : int
+            Starting cursor (0 to start from the beginning).
+        count : int
+            Hint for the number of keys to return per call.
+        match : str | None
+            Optional glob pattern (e.g., ``"session:*"``).
+
+        Returns
+        -------
+        tuple[int, list[str]]
+            A ``(next_cursor, keys)`` pair.  When *next_cursor* is ``0``,
+            iteration is complete.
+        """
+        args: list = ["SCAN", str(cursor)]
+        if count != 10:
+            args.extend(["COUNT", str(count)])
+        if match is not None:
+            args.extend(["MATCH", match])
+        raw = await self._execute_command(*args)
+        # Response is [next_cursor_bytes, [key1_bytes, key2_bytes, ...]]
+        next_cursor_raw, keys_raw = raw[0], raw[1]
+        next_cursor = int(
+            next_cursor_raw.decode("utf-8")
+            if isinstance(next_cursor_raw, bytes)
+            else str(next_cursor_raw)
+        )
+        keys = [
+            k.decode("utf-8") if isinstance(k, bytes) else str(k)
+            for k in keys_raw
+        ]
+        return (next_cursor, keys)
+
+    async def dbstats(self) -> Dict[str, Any]:
+        """Get aggregate store statistics.
+
+        Returns
+        -------
+        dict
+            Statistics including ``total_keys``, ``total_buckets``,
+            ``load_factor``, ``entry_size``, ``total_memory``,
+            ``blob_count``, and ``inline_size``.
+        """
+        raw = await self._execute_command("DBSTATS")
+        if raw is None:
+            return {}
+        # Response is a flat array of key-value pairs
+        result: Dict[str, Any] = {}
+        it = iter(raw)
+        for k, v in zip(it, it):
+            key = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+            val = v.decode("utf-8") if isinstance(v, bytes) else str(v)
+            try:
+                if key == "load_factor":
+                    result[key] = float(val)
+                else:
+                    result[key] = int(val)
+            except ValueError:
+                result[key] = val
+        return result
+
     # =========================================================================
     # String commands
     # =========================================================================
