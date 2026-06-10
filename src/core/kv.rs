@@ -62,6 +62,20 @@ const MAX_VALUE_SIZE: usize = 4096;
 /// `KvStoreLockFree<128>`, `KvStoreLockFree<256>`, etc.
 pub const DEFAULT_INLINE_SIZE: usize = 64;
 
+/// Sentinel hash value marking a deleted slot in the lock-free hash table.
+///
+/// `0` means "never used" (empty), while `TOMBSTONE` means "was used, then
+/// deleted". The distinction is critical for linear probing: a tombstone does
+/// **not** terminate a probe chain, whereas an empty slot does.
+const TOMBSTONE: u64 = u64::MAX; // 0xFFFF_FFFF_FFFF_FFFF
+
+/// Map a hash of 0 (or TOMBSTONE) to a safe value so it never collides with
+/// the "empty slot" sentinel (0) or the tombstone marker (TOMBSTONE).
+#[inline]
+fn normalize_hash(hash: u64) -> u64 {
+    if hash == 0 || hash == TOMBSTONE { 1 } else { hash }
+}
+
 // ---------------------------------------------------------------------------
 // Error types for extended operations
 // ---------------------------------------------------------------------------
@@ -176,6 +190,11 @@ impl Entry {
     fn is_empty(&self) -> bool {
         self.hash == 0
     }
+
+    /// Returns `true` if this slot is a tombstone (deleted).
+    fn is_tombstone(&self) -> bool {
+        self.hash == TOMBSTONE
+    }
 }
 
 /// Custom Hash Table with Linear Probing (single-threaded).
@@ -233,16 +252,27 @@ impl KvStoreCustom {
     /// Probe the bucket array for *key* using linear probing.
     ///
     /// Returns `(slot_index, key_found)`. If the key is not present and a
-    /// vacant slot exists, returns the first vacant slot index.
+    /// vacant slot exists, returns the first vacant slot index (preferring
+    /// tombstone slots for reuse over truly empty slots).
     fn find_slot(&self, key: &[u8], hash: u64) -> (usize, bool) {
         let start = (hash as usize) % self.capacity;
+        let mut first_tombstone: Option<usize> = None;
 
         for i in 0..self.capacity {
             let idx = (start + i) % self.capacity;
             let entry = &self.buckets[idx];
 
             if entry.is_empty() {
-                return (idx, false);
+                // Truly empty slot — key not found.
+                // Return first tombstone for insertion reuse, or this empty slot.
+                return (first_tombstone.unwrap_or(idx), false);
+            }
+
+            if entry.is_tombstone() {
+                if first_tombstone.is_none() {
+                    first_tombstone = Some(idx);
+                }
+                continue;
             }
 
             if entry.hash == hash && entry.key == key {
@@ -250,12 +280,13 @@ impl KvStoreCustom {
             }
         }
 
-        (0, false)
+        // Table is full of occupied/tombstone entries.
+        (first_tombstone.unwrap_or(0), false)
     }
 
     /// Return a clone of the value for *key*, or `None`.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let (idx, found) = self.find_slot(key, hash);
 
         if found {
@@ -273,7 +304,7 @@ impl KvStoreCustom {
             return false;
         }
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let (idx, found) = self.find_slot(key, hash);
 
         if found {
@@ -293,17 +324,42 @@ impl KvStoreCustom {
     /// Remove *key* from the store.
     ///
     /// Returns `true` if the key existed and was removed.
+    /// Uses backward-shift deletion to maintain probe chain integrity
+    /// (no tombstones left behind).
     pub fn del(&mut self, key: &[u8]) -> bool {
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let (idx, found) = self.find_slot(key, hash);
 
-        if found {
-            self.buckets[idx] = Entry::empty();
-            self.count -= 1;
-            true
-        } else {
-            false
+        if !found {
+            return false;
         }
+
+        self.count -= 1;
+
+        // Backward-shift deletion: shift subsequent entries backward
+        // to fill the gap, maintaining probe chain integrity.
+        let mut gap = idx;
+
+        for i in 1..self.capacity {
+            let j = (idx + i) % self.capacity;
+            if self.buckets[j].is_empty() || self.buckets[j].is_tombstone() {
+                break;
+            }
+            let home = (self.buckets[j].hash as usize) % self.capacity;
+            // Distance from home to gap and from home to j (circular).
+            let dist_home_gap = (gap as isize - home as isize)
+                .rem_euclid(self.capacity as isize) as usize;
+            let dist_home_j = (j as isize - home as isize)
+                .rem_euclid(self.capacity as isize) as usize;
+
+            if dist_home_gap < dist_home_j {
+                self.buckets[gap] = self.buckets[j].clone();
+                gap = j;
+            }
+        }
+
+        self.buckets[gap] = Entry::empty();
+        true
     }
 
     /// Return the number of entries currently stored.
@@ -518,7 +574,7 @@ impl<const N: usize> KvStoreLockFree<N> {
             return None;
         }
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let start = (hash as usize) % self.capacity;
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
 
@@ -532,6 +588,7 @@ impl<const N: usize> KvStoreLockFree<N> {
 
                 let entry_hash = entry.hash.load(Ordering::Acquire);
                 if entry_hash == 0 { return None; }
+                if entry_hash == TOMBSTONE { continue; }
                 if entry_hash != hash { continue; }
 
                 let key_len = entry.key_len.load(Ordering::Acquire) as usize;
@@ -574,10 +631,11 @@ impl<const N: usize> KvStoreLockFree<N> {
             return false;
         }
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let start = (hash as usize) % self.capacity;
 
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
+        let mut first_tombstone: Option<usize> = None;
 
         for i in 0..probe_limit {
             let idx = (start + i) % self.capacity;
@@ -585,6 +643,20 @@ impl<const N: usize> KvStoreLockFree<N> {
             let entry_hash = entry.hash.load(Ordering::Acquire);
 
             if entry_hash == 0 {
+                // Empty slot — key not found, try to insert.
+                // Prefer reusing a tombstone slot if we saw one earlier.
+                if let Some(ts_idx) = first_tombstone {
+                    let ts_entry = &self.buckets[ts_idx];
+                    if ts_entry.hash.compare_exchange(
+                        TOMBSTONE, hash, Ordering::AcqRel, Ordering::Acquire,
+                    ).is_ok() {
+                        self.write_entry(ts_entry, key, value);
+                        self.count.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                    // Tombstone CAS failed; fall through to try empty slot.
+                }
+
                 match entry.hash.compare_exchange(
                     0, hash, Ordering::AcqRel, Ordering::Acquire,
                 ) {
@@ -594,8 +666,15 @@ impl<const N: usize> KvStoreLockFree<N> {
                         return true;
                     }
                     Err(actual) if actual != hash => continue,
-                    _ => {}
+                    _ => {} // CAS failed but hash matches, fall through to key check
                 }
+            }
+
+            if entry_hash == TOMBSTONE {
+                if first_tombstone.is_none() {
+                    first_tombstone = Some(idx);
+                }
+                continue;
             }
 
             if entry_hash == hash {
@@ -628,7 +707,7 @@ impl<const N: usize> KvStoreLockFree<N> {
             return false;
         }
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let start = (hash as usize) % self.capacity;
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
 
@@ -638,6 +717,7 @@ impl<const N: usize> KvStoreLockFree<N> {
             let entry_hash = entry.hash.load(Ordering::Acquire);
 
             if entry_hash == 0 { return false; }
+            if entry_hash == TOMBSTONE { continue; }
             if entry_hash == hash {
                 let key_len = entry.key_len.load(Ordering::Acquire) as usize;
                 if key_len == key.len() {
@@ -647,7 +727,7 @@ impl<const N: usize> KvStoreLockFree<N> {
                     }
                     if &entry_key[..key_len] == key {
                         let v = entry.version.fetch_add(1, Ordering::AcqRel);
-                        entry.hash.store(0, Ordering::Release);
+                        entry.hash.store(TOMBSTONE, Ordering::Release);
                         entry.version.store(v + 2, Ordering::Release);
                         self.count.fetch_sub(1, Ordering::Relaxed);
                         return true;
@@ -671,7 +751,7 @@ impl<const N: usize> KvStoreLockFree<N> {
             return false;
         }
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let start = (hash as usize) % self.capacity;
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
 
@@ -681,6 +761,7 @@ impl<const N: usize> KvStoreLockFree<N> {
             let entry_hash = entry.hash.load(Ordering::Acquire);
 
             if entry_hash == 0 { return false; }
+            if entry_hash == TOMBSTONE { continue; }
             if entry_hash != hash { continue; }
 
             let key_len = entry.key_len.load(Ordering::Acquire) as usize;
@@ -715,7 +796,7 @@ impl<const N: usize> KvStoreLockFree<N> {
             return Err(IncrError::KeyTooLong);
         }
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let start = (hash as usize) % self.capacity;
 
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
@@ -728,6 +809,7 @@ impl<const N: usize> KvStoreLockFree<N> {
             if entry_hash == 0 {
                 return Err(IncrError::KeyNotFound);
             }
+            if entry_hash == TOMBSTONE { continue; }
             if entry_hash != hash { continue; }
 
             // Verify key match.
@@ -840,7 +922,7 @@ impl<const N: usize> KvStoreLockFree<N> {
     pub fn append(&self, key: &[u8], suffix: &[u8]) -> Option<usize> {
         if key.len() > N || suffix.len() > N { return None; }
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let start = (hash as usize) % self.capacity;
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
 
@@ -854,6 +936,7 @@ impl<const N: usize> KvStoreLockFree<N> {
                 // Key not found — fall through to create.
                 break;
             }
+            if entry_hash == TOMBSTONE { continue; }
             if entry_hash != hash { continue; }
 
             // Verify key match.
@@ -930,7 +1013,7 @@ impl<const N: usize> KvStoreLockFree<N> {
     pub fn strlen(&self, key: &[u8]) -> usize {
         if key.len() > N { return 0; }
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let start = (hash as usize) % self.capacity;
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
 
@@ -944,6 +1027,7 @@ impl<const N: usize> KvStoreLockFree<N> {
 
                 let entry_hash = entry.hash.load(Ordering::Acquire);
                 if entry_hash == 0 { return 0; }
+                if entry_hash == TOMBSTONE { continue; }
                 if entry_hash != hash { continue; }
 
                 let key_len = entry.key_len.load(Ordering::Acquire) as usize;
@@ -1016,7 +1100,7 @@ impl<const N: usize> KvStoreLockFree<N> {
         }
         let end = offset.checked_add(replacement.len())?;
 
-        let hash = Self::hash_key(key);
+        let hash = normalize_hash(Self::hash_key(key));
         let start = (hash as usize) % self.capacity;
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
 
@@ -1027,6 +1111,7 @@ impl<const N: usize> KvStoreLockFree<N> {
             let entry_hash = entry.hash.load(Ordering::Acquire);
 
             if entry_hash == 0 { break; }
+            if entry_hash == TOMBSTONE { continue; }
             if entry_hash != hash { continue; }
 
             let key_len = entry.key_len.load(Ordering::Acquire) as usize;
@@ -1151,11 +1236,12 @@ impl<const N: usize> KvStoreLockFree<N> {
             }
 
             let entry_hash = entry.hash.load(Ordering::Acquire);
-            if entry_hash != 0 {
+            if entry_hash != 0 && entry_hash != TOMBSTONE {
                 // Occupied slot — read the key.
                 let key_len = entry.key_len.load(Ordering::Acquire) as usize;
                 if key_len > 0 && key_len <= N {
-                    let mut key_buf = vec![0u8; key_len];
+                    // Stack-allocated key buffer — avoids heap allocation per key.
+                    let mut key_buf = [0u8; N];
                     for j in 0..key_len {
                         key_buf[j] = entry.data[0][j].load(Ordering::Relaxed);
                     }
@@ -1164,11 +1250,11 @@ impl<const N: usize> KvStoreLockFree<N> {
                     if v1 == v2 {
                         // Consistent read — check pattern.
                         let matches = match pattern {
-                            Some(pat) => glob_match(&key_buf, pat),
+                            Some(pat) => glob_match(&key_buf[..key_len], pat),
                             None => true,
                         };
                         if matches {
-                            keys.push(key_buf);
+                            keys.push(key_buf[..key_len].to_vec());
                             if keys.len() >= count {
                                 let next = (idx + 1) % cap;
                                 return (next, keys);
@@ -1213,7 +1299,7 @@ impl<const N: usize> KvStoreLockFree<N> {
         for i in 0..total_buckets {
             let entry = &self.buckets[i];
             let h = entry.hash.load(Ordering::Relaxed);
-            if h == 0 { continue; }
+            if h == 0 || h == TOMBSTONE { continue; }
             let vl = entry.value_len.load(Ordering::Relaxed) as usize;
             if vl > 0 && vl <= N {
                 let first = entry.data[1][0].load(Ordering::Relaxed);
@@ -1242,18 +1328,47 @@ impl<const N: usize> KvStoreLockFree<N> {
     ///
     /// Caller must have already "claimed" the entry (via CAS on `hash` or
     /// confirmed key match).
+    ///
+    /// Uses a CAS loop on the version counter to ensure **exclusive** write
+    /// access.  This prevents a critical race where two concurrent `SET`
+    /// operations on the same key could both enter this function and:
+    ///
+    /// 1. Leave the version counter in an odd (writing) state permanently,
+    ///    causing all subsequent readers/writers to spin forever.
+    /// 2. Produce a torn write where the final value is a mix of both
+    ///    concurrent writes.
+    ///
+    /// The CAS guarantees that only one thread transitions the version from
+    /// even → odd at a time; the loser retries until it observes a stable
+    /// even version again.
     #[inline]
     fn write_entry(&self, entry: &LockFreeEntry<N>, key: &[u8], value: &[u8]) {
-        let v = entry.version.fetch_add(1, Ordering::AcqRel);
-        entry.key_len.store(key.len() as u32, Ordering::Release);
-        for (j, &byte) in key.iter().enumerate() {
-            entry.data[0][j].store(byte, Ordering::Relaxed);
+        loop {
+            let v1 = entry.version.load(Ordering::Acquire);
+            if v1 % 2 == 1 {
+                // Another write is in progress — spin-wait.
+                std::hint::spin_loop();
+                continue;
+            }
+            // CAS: even → odd to claim exclusive write access.
+            if entry.version.compare_exchange(
+                v1, v1 + 1, Ordering::AcqRel, Ordering::Acquire,
+            ).is_err() {
+                continue; // Someone else modified the version; retry.
+            }
+            // We hold exclusive access — write the data.
+            entry.key_len.store(key.len() as u32, Ordering::Release);
+            for (j, &byte) in key.iter().enumerate() {
+                entry.data[0][j].store(byte, Ordering::Relaxed);
+            }
+            entry.value_len.store(value.len() as u32, Ordering::Release);
+            for (j, &byte) in value.iter().enumerate() {
+                entry.data[1][j].store(byte, Ordering::Relaxed);
+            }
+            // Release: odd → even + 2 (preserving the version increment).
+            entry.version.store(v1 + 2, Ordering::Release);
+            return;
         }
-        entry.value_len.store(value.len() as u32, Ordering::Release);
-        for (j, &byte) in value.iter().enumerate() {
-            entry.data[1][j].store(byte, Ordering::Relaxed);
-        }
-        entry.version.store(v + 2, Ordering::Release);
     }
 }
 

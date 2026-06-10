@@ -987,6 +987,11 @@ impl WalWriter for WalSegment {
     fn wal_bdel(&self, key: &[u8]) -> Result<(), WalError> { self.bdel(key) }
     fn wal_list_op(&self, key: &[u8], payload: &[u8]) -> Result<(), WalError> { self.list_op(key, payload) }
     fn wal_sync_now(&self) -> Result<(), WalError> { self.sync_now() }
+    fn wal_reopen(&self) -> Result<(), WalError> {
+        // WalSegment doesn't need reopen since it manages its own segments.
+        // This is a no-op for segment-based WAL.
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

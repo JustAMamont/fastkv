@@ -109,6 +109,8 @@ await client.connect();
 | `hvals(key)` | `Promise<string[]>` | All field values |
 | `hmget(key, ...fields)` | `Promise<(string\|null)[]>` | Get multiple fields |
 | `hmset(key, fields)` | `Promise<string>` | Set multiple fields |
+| `hincrBy(key, field, delta)` | `Promise<number>` | Increment hash field |
+| `hsetNx(key, field, value)` | `Promise<number>` | Set if not exists |
 
 ### List
 

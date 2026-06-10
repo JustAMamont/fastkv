@@ -227,6 +227,59 @@ impl Client {
         }
     }
 
+    /// SETNX key value → true if set, false if key already exists
+    pub async fn set_nx(&mut self, key: &str, value: &str) -> Result<bool, Error> {
+        let n = self.request(&[b"SETNX", key.as_bytes(), value.as_bytes()])
+            .await?
+            .to_i64()?;
+        Ok(n == 1)
+    }
+
+    /// GETSET key value → old value (None if key did not exist)
+    pub async fn get_set(&mut self, key: &str, value: &str) -> Result<Option<String>, Error> {
+        self.request(&[b"GETSET", key.as_bytes(), value.as_bytes()])
+            .await?
+            .to_string_opt()
+    }
+
+    /// GETDEL key → value deleted (None if key did not exist)
+    pub async fn get_del(&mut self, key: &str) -> Result<Option<String>, Error> {
+        self.request(&[b"GETDEL", key.as_bytes()])
+            .await?
+            .to_string_opt()
+    }
+
+    /// TYPE key → type string (e.g. "string", "hash", "list")
+    pub async fn type_of(&mut self, key: &str) -> Result<String, Error> {
+        let r = self.request(&[b"TYPE", key.as_bytes()]).await?;
+        match r {
+            Reply::Ok(s) => Ok(s),
+            Reply::Error(e) => Err(Error::Server(e)),
+            other => Err(Error::Unexpected(format!("TYPE: expected status reply, got {other:?}"))),
+        }
+    }
+
+    /// RENAME key new_key → true on success
+    pub async fn rename(&mut self, key: &str, new_key: &str) -> Result<bool, Error> {
+        self.request(&[b"RENAME", key.as_bytes(), new_key.as_bytes()])
+            .await?
+            .expect_ok()?;
+        Ok(true)
+    }
+
+    /// PSETEX key ms value → true on success
+    pub async fn pset_ex(&mut self, key: &str, ms: i64, value: &str) -> Result<bool, Error> {
+        self.request(&[b"PSETEX", key.as_bytes(), ms.to_string().as_bytes(), value.as_bytes()])
+            .await?
+            .expect_ok()?;
+        Ok(true)
+    }
+
+    /// UNLINK key → number of keys removed
+    pub async fn unlink(&mut self, key: &str) -> Result<i64, Error> {
+        self.request(&[b"UNLINK", key.as_bytes()]).await?.to_i64()
+    }
+
     // ── TTL ─────────────────────────────────────────────────────────────
 
     /// EXPIRE key seconds → true if set
@@ -253,6 +306,40 @@ impl Client {
             .await?
             .to_i64()?;
         Ok(n == 1)
+    }
+
+    // ── Server ────────────────────────────────────────────────────────────
+
+    /// FLUSHALL → true on success
+    pub async fn flush_all(&mut self) -> Result<bool, Error> {
+        self.request(&[b"FLUSHALL"]).await?.expect_ok()?;
+        Ok(true)
+    }
+
+    /// FLUSHDB → true on success
+    pub async fn flush_db(&mut self) -> Result<bool, Error> {
+        self.request(&[b"FLUSHDB"]).await?.expect_ok()?;
+        Ok(true)
+    }
+
+    /// AUTH password → true on success
+    pub async fn auth(&mut self, password: &str) -> Result<bool, Error> {
+        self.request(&[b"AUTH", password.as_bytes()])
+            .await?
+            .expect_ok()?;
+        Ok(true)
+    }
+
+    /// SAVE → true on success
+    pub async fn save(&mut self) -> Result<bool, Error> {
+        self.request(&[b"SAVE"]).await?.expect_ok()?;
+        Ok(true)
+    }
+
+    /// BGSAVE → true on success
+    pub async fn bgsave(&mut self) -> Result<bool, Error> {
+        self.request(&[b"BGSAVE"]).await?.expect_ok()?;
+        Ok(true)
     }
 
     // ── Hash ────────────────────────────────────────────────────────────
@@ -339,6 +426,21 @@ impl Client {
             args.push(v.as_bytes());
         }
         self.request(&args).await?.expect_ok()
+    }
+
+    /// HINCRBY key field delta → new value
+    pub async fn h_incr_by(&mut self, key: &str, field: &str, delta: i64) -> Result<i64, Error> {
+        self.request(&[b"HINCRBY", key.as_bytes(), field.as_bytes(), delta.to_string().as_bytes()])
+            .await?
+            .to_i64()
+    }
+
+    /// HSETNX key field value → true if set, false if field already exists
+    pub async fn h_set_nx(&mut self, key: &str, field: &str, value: &str) -> Result<bool, Error> {
+        let n = self.request(&[b"HSETNX", key.as_bytes(), field.as_bytes(), value.as_bytes()])
+            .await?
+            .to_i64()?;
+        Ok(n == 1)
     }
 
     // ── List ────────────────────────────────────────────────────────────

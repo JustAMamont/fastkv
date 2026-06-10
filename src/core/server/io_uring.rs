@@ -14,8 +14,10 @@ use crate::core::server::tcp::{parse_command_bounds, process_command_into, Serve
 use crate::core::wal::WalWriter;
 #[cfg(feature = "blob-store")]
 use crate::core::blob::BlobArena;
+use std::cell::Cell;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Default listen port.
 const DEFAULT_PORT: u16 = 6379;
@@ -31,6 +33,10 @@ pub struct IoUringServer<const N: usize = DEFAULT_INLINE_SIZE> {
     lists: Option<Arc<ListManager<N>>>,
     #[cfg(feature = "blob-store")]
     blob: Option<Arc<BlobArena>>,
+    wal_path: Option<std::path::PathBuf>,
+    password: Option<String>,
+    max_connections: u32,
+    active_connections: Arc<AtomicU32>,
     host: String,
     pub port: u16,
 }
@@ -48,6 +54,10 @@ impl<const N: usize> IoUringServer<N> {
             lists: None,
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            max_connections: 10000,
+            active_connections: Arc::new(AtomicU32::new(0)),
             host: "0.0.0.0".into(),
             port: DEFAULT_PORT,
         }
@@ -65,6 +75,10 @@ impl<const N: usize> IoUringServer<N> {
             lists: None,
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            max_connections: 10000,
+            active_connections: Arc::new(AtomicU32::new(0)),
             host: "0.0.0.0".into(),
             port,
         }
@@ -80,8 +94,11 @@ impl<const N: usize> IoUringServer<N> {
         expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
         blob: Option<Arc<BlobArena>>,
+        wal_path: Option<std::path::PathBuf>,
+        password: Option<String>,
+        max_connections: u32,
     ) -> Self {
-        Self { store, wal, expiry, lists, blob, host, port }
+        Self { store, wal, expiry, lists, blob, wal_path, password, max_connections, active_connections: Arc::new(AtomicU32::new(0)), host, port }
     }
 
     /// Create a fully configured server (no blob-store).
@@ -91,29 +108,33 @@ impl<const N: usize> IoUringServer<N> {
         host: String,
         store: Arc<KvStoreLockFree<N>>,
         wal: Option<Arc<dyn WalWriter>>,
-        expiry: Option<Arc<ExpirationManager<N>>,
+        expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
+        wal_path: Option<std::path::PathBuf>,
+        password: Option<String>,
+        max_connections: u32,
     ) -> Self {
-        Self { store, wal, expiry, lists, host, port }
+        Self { store, wal, expiry, lists, wal_path, password, max_connections, active_connections: Arc::new(AtomicU32::new(0)), host, port }
     }
 
     /// Block the calling thread running the io_uring event loop.
-    pub fn run(&self) {
-        tokio_uring::start(self.run_inner());
+    pub fn run(&self) -> Result<(), String> {
+        tokio_uring::start(self.run_inner())
     }
 
-    async fn run_inner(&self) {
+    async fn run_inner(&self) -> Result<(), String> {
         use tokio_uring::net::TcpListener;
 
         let addr: SocketAddr = format!("{}:{}", self.host, self.port)
             .parse()
-            .expect("invalid address");
+            .map_err(|e| format!("invalid address '{}:{}': {}", self.host, self.port, e))?;
 
         let listener = match TcpListener::bind(addr) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Failed to bind: {}", e);
-                return;
+                let msg = format!("Failed to bind to {}: {}", addr, e);
+                eprintln!("{}", msg);
+                return Err(msg);
             }
         };
 
@@ -125,6 +146,10 @@ impl<const N: usize> IoUringServer<N> {
         let lists = self.lists.clone();
         #[cfg(feature = "blob-store")]
         let blob = self.blob.clone();
+        let wal_path = self.wal_path.clone();
+        let password = self.password.clone();
+        let max_connections = self.max_connections;
+        let active_connections = Arc::clone(&self.active_connections);
 
         loop {
             let (stream, client_addr) = match listener.accept().await {
@@ -135,20 +160,40 @@ impl<const N: usize> IoUringServer<N> {
                 }
             };
 
+            // Check connection limit before spawning.
+            if active_connections.load(Ordering::Relaxed) >= max_connections {
+                let _ = tokio_uring::io::write_all(stream, b"-ERR max number of clients reached\r\n").await;
+                continue;
+            }
+
+            // Increment active connections; the spawned task will decrement via guard.
+            active_connections.fetch_add(1, Ordering::Relaxed);
+
             let store = Arc::clone(&self.store);
             let wal = wal.clone();
             let expiry = expiry.clone();
             let lists = lists.clone();
             #[cfg(feature = "blob-store")]
             let blob = blob.clone();
+            let wal_path = wal_path.clone();
+            let password = password.clone();
+            let active_conn = Arc::clone(&active_connections);
 
             tokio_uring::spawn(async move {
+                // RAII guard: decrements active_connections when the task exits.
+                struct ConnGuard { conn: Arc<AtomicU32> }
+                impl Drop for ConnGuard {
+                    fn drop(&mut self) { self.conn.fetch_sub(1, Ordering::Relaxed); }
+                }
+                let _guard = ConnGuard { conn: active_conn };
+
                 #[cfg(feature = "blob-store")]
-                handle_client(stream, store, wal, expiry, lists, blob, client_addr).await;
+                handle_client(stream, store, wal, expiry, lists, blob, wal_path, client_addr, password).await;
                 #[cfg(not(feature = "blob-store"))]
-                handle_client(stream, store, wal, expiry, lists, client_addr).await;
+                handle_client(stream, store, wal, expiry, lists, wal_path, client_addr, password).await;
             });
         }
+        Ok(())
     }
 }
 
@@ -161,7 +206,9 @@ async fn handle_client<const N: usize>(
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
     blob: Option<Arc<BlobArena>>,
+    wal_path: Option<std::path::PathBuf>,
     addr: SocketAddr,
+    password: Option<String>,
 ) {
     let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
@@ -173,6 +220,9 @@ async fn handle_client<const N: usize>(
         expiry: expiry.as_deref(),
         lists: lists.as_deref(),
         blob: blob.as_deref(),
+        wal_path: wal_path.as_deref(),
+        password: password.as_ref(),
+        authenticated: Cell::new(false),
     };
 
     loop {
@@ -231,7 +281,9 @@ async fn handle_client<const N: usize>(
     wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
+    wal_path: Option<std::path::PathBuf>,
     addr: SocketAddr,
+    password: Option<String>,
 ) {
     let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
@@ -242,6 +294,9 @@ async fn handle_client<const N: usize>(
         wal: wal.as_deref(),
         expiry: expiry.as_deref(),
         lists: lists.as_deref(),
+        wal_path: wal_path.as_deref(),
+        password: password.as_ref(),
+        authenticated: Cell::new(false),
     };
 
     loop {

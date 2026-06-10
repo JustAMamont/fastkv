@@ -1,12 +1,12 @@
 [package]
 name = "fast_kv"
-version = "0.9.1"
+version = "1.1.0"
 edition = "2024"
 description = "High-performance, Redis-compatible key-value store with WAL persistence, TTL expiration, and lock-free concurrency"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
 zerocopy = { version = "0.8", optional = true }
 tokio-uring = { version = "0.5", optional = true }
 crc32c = "0.6"

@@ -45,9 +45,9 @@ const CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 /// zstd compression level (1 = fast, 22 = max; 3 is a good default).
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
-/// Maximum number of free-list nodes. Beyond this, freed slots are simply
-/// discarded (the arena continues to allocate new space from chunks).
-const FREE_LIST_CAPACITY: usize = 10_000;
+/// Maximum number of free-list nodes. Beyond this, the capacity is dynamically
+/// doubled to avoid discarding freed slots (which would cause a memory leak).
+static FREE_LIST_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10_000);
 
 // ---------------------------------------------------------------------------
 // BlobRef — the 33-byte inline reference
@@ -239,11 +239,35 @@ impl FreeList {
     }
 
     /// Insert a freed slot, maintaining sort order by `len`.
-    /// Returns `false` if the capacity limit has been reached.
+    /// Returns `false` if the capacity limit has been reached (after attempting
+    /// to double capacity). When false is returned, the slot was discarded.
     fn push(&self, slot: BlobSlot) -> bool {
-        // Capacity guard — avoid unbounded growth.
-        if self.count.load(Ordering::Relaxed) >= FREE_LIST_CAPACITY {
-            return false;
+        let capacity = FREE_LIST_CAPACITY.load(Ordering::Relaxed);
+
+        // Capacity guard — if at limit, try to double the capacity.
+        if self.count.load(Ordering::Relaxed) >= capacity {
+            // Attempt to grow the capacity limit by 2×.
+            let new_capacity = capacity.saturating_mul(2);
+            if FREE_LIST_CAPACITY.compare_exchange(
+                capacity, new_capacity, Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok() {
+                eprintln!(
+                    "[BlobArena] Free list capacity increased from {} to {} slots",
+                    capacity, new_capacity
+                );
+            } else {
+                // Another thread already changed the capacity; reload.
+                // If still at capacity after the change, discard the slot
+                // with a warning.
+                let current_capacity = FREE_LIST_CAPACITY.load(Ordering::Relaxed);
+                if self.count.load(Ordering::Relaxed) >= current_capacity {
+                    eprintln!(
+                        "[BlobArena] Warning: free list at capacity ({} slots), discarding freed slot at offset {} ({} bytes). Memory may not be reused.",
+                        current_capacity, slot.offset, slot.len
+                    );
+                    return false;
+                }
+            }
         }
 
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
@@ -424,14 +448,30 @@ impl BlobArena {
     ///
     /// The space is added to a sorted free list for potential reuse. This is
     /// the cold path and acquires the free-list mutex.
+    ///
+    /// If the free list is at capacity, the capacity is dynamically doubled.
+    /// If doubling fails (e.g., due to extreme concurrency), a warning is
+    /// logged and the slot is discarded — but `total_used` is still decremented
+    /// so that stats remain correct.
     pub fn free(&self, blob_ref: &BlobRef) {
         // Add to sorted free list (best-fit for future reuse).
-        self.free_list.push(BlobSlot {
+        let pushed = self.free_list.push(BlobSlot {
             offset: blob_ref.offset,
             len: blob_ref.comp_len,
         });
 
-        // Update stats.
+        if !pushed {
+            // Slot was discarded (free list still at capacity after doubling attempt).
+            // Log a warning — the memory at this offset cannot be reused,
+            // but the stats are still updated correctly below.
+            eprintln!(
+                "[BlobArena] Warning: freed blob slot at offset {} ({} bytes) was discarded — free list full. Memory will not be reused.",
+                blob_ref.offset, blob_ref.comp_len
+            );
+        }
+
+        // Update stats — always decrement total_used, even if the slot
+        // was discarded, so that stats stay correct.
         self.total_used.fetch_sub(blob_ref.comp_len as u64, Ordering::Relaxed);
     }
 

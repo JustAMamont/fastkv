@@ -131,6 +131,8 @@ FastKVClient client = new FastKVClient("localhost", 6379, 3000, 10000);
 | `hvals(key)` | `List<String>` | All field values |
 | `hmget(key, fields...)` | `List<String>` | Values |
 | `hmset(key, fields)` | `String` | OK |
+| `hincrBy(key, field, delta)` | `long` | New value |
+| `hsetNx(key, field, value)` | `boolean` | True if new field |
 
 ### List
 

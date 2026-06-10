@@ -19,6 +19,7 @@ pub mod wal;
 pub mod expiration;
 pub mod hash;
 pub mod list;
+pub mod checkpoint;
 #[cfg(feature = "similarity")]
 pub mod simhash;
 #[cfg(feature = "similarity")]

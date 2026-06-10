@@ -256,6 +256,57 @@ public class FastKVClient implements AutoCloseable {
         return result != null ? result : 0L;
     }
 
+    /**
+     * Authenticates the current connection with the given password.
+     *
+     * @param password the password to authenticate with
+     * @return true if authentication was successful
+     */
+    public boolean auth(String password) {
+        Boolean result = requireBoolean(sendCommand("AUTH", password));
+        return result != null && result;
+    }
+
+    /**
+     * Performs a synchronous save of the dataset to disk.
+     *
+     * @return true if the save was successful
+     */
+    public boolean save() {
+        Boolean result = requireBoolean(sendCommand("SAVE"));
+        return result != null && result;
+    }
+
+    /**
+     * Performs an asynchronous save of the dataset to disk (background save).
+     *
+     * @return true if the background save was initiated
+     */
+    public boolean bgSave() {
+        Boolean result = requireBoolean(sendCommand("BGSAVE"));
+        return result != null && result;
+    }
+
+    /**
+     * Removes all keys from all databases.
+     *
+     * @return true if the operation was successful
+     */
+    public boolean flushAll() {
+        Boolean result = requireBoolean(sendCommand("FLUSHALL"));
+        return result != null && result;
+    }
+
+    /**
+     * Removes all keys from the currently selected database.
+     *
+     * @return true if the operation was successful
+     */
+    public boolean flushDb() {
+        Boolean result = requireBoolean(sendCommand("FLUSHDB"));
+        return result != null && result;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // String commands
     // ═══════════════════════════════════════════════════════════════════════
@@ -439,6 +490,85 @@ public class FastKVClient implements AutoCloseable {
         return listToStringList(raw);
     }
 
+    /**
+     * Atomically sets {@code key} to {@code value} and returns the old value
+     * stored at {@code key}. Returns null if the key did not exist.
+     *
+     * @param key   the key to set
+     * @param value the new value
+     * @return the old value, or null if the key did not exist
+     */
+    public String getSet(String key, String value) {
+        return requireString(sendCommand("GETSET", key, value));
+    }
+
+    /**
+     * Gets the value of {@code key} and deletes the key atomically.
+     * Returns null if the key does not exist.
+     *
+     * @param key the key to get and delete
+     * @return the value of the key, or null if the key did not exist
+     */
+    public String getDel(String key) {
+        return requireString(sendCommand("GETDEL", key));
+    }
+
+    /**
+     * Sets {@code key} to hold {@code value} with a TTL of {@code milliseconds}.
+     * This uses the standalone PSETEX command.
+     *
+     * @param key          the key to set
+     * @param milliseconds the time-to-live in milliseconds
+     * @param value        the value to set
+     * @return true if the key was set successfully
+     */
+    public boolean psetEx(String key, long milliseconds, String value) {
+        Boolean result = requireBoolean(sendCommand("PSETEX", key, String.valueOf(milliseconds), value));
+        return result != null && result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Key commands
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Returns the string representation of the type of the value stored at {@code key}.
+     * Possible return values are "string", "hash", "list", "set", "zset", and "none".
+     *
+     * @param key the key to check
+     * @return the type of the value stored at the key
+     */
+    public String typeOf(String key) {
+        return requireString(sendCommand("TYPE", key));
+    }
+
+    /**
+     * Renames {@code key} to {@code newKey}.
+     *
+     * @param key    the key to rename
+     * @param newKey the new key name
+     * @return true if the key was renamed successfully
+     */
+    public boolean rename(String key, String newKey) {
+        Boolean result = requireBoolean(sendCommand("RENAME", key, newKey));
+        return result != null && result;
+    }
+
+    /**
+     * Removes the specified keys asynchronously. Similar to {@link #del} but
+     * the actual memory reclamation happens in a background thread.
+     *
+     * @param keys the keys to unlink
+     * @return the number of keys that were unlinked
+     */
+    public long unlink(String... keys) {
+        String[] args = new String[keys.length + 1];
+        args[0] = "UNLINK";
+        System.arraycopy(keys, 0, args, 1, keys.length);
+        Long result = requireLong(sendCommand(args));
+        return result != null ? result : 0L;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // TTL commands
     // ═══════════════════════════════════════════════════════════════════════
@@ -584,6 +714,33 @@ public class FastKVClient implements AutoCloseable {
             args[i++] = e.getValue();
         }
         return requireString(sendCommand(args));
+    }
+
+    /**
+     * Increments the integer value of {@code field} in the hash stored at
+     * {@code key} by {@code delta}.
+     *
+     * @param key   the hash key
+     * @param field the field to increment
+     * @param delta the amount to increment by
+     * @return the new value of the field after the increment
+     */
+    public long hIncrBy(String key, String field, long delta) {
+        return requireLong(sendCommand("HINCRBY", key, field, String.valueOf(delta)));
+    }
+
+    /**
+     * Sets the field {@code field} in the hash stored at {@code key} to
+     * {@code value} only if the field does not already exist.
+     *
+     * @param key   the hash key
+     * @param field the field to set
+     * @param value the value to set
+     * @return true if the field was set, false if it already existed
+     */
+    public boolean hSetNx(String key, String field, String value) {
+        Boolean result = requireBoolean(sendCommand("HSETNX", key, field, value));
+        return result != null && result;
     }
 
     // ═══════════════════════════════════════════════════════════════════════

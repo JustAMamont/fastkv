@@ -545,13 +545,17 @@ All clients support the same command set:
 
 **Core:** `ping`, `echo`, `info`, `dbsize`
 
-**String:** `set` (NX/XX/EX/PX), `get`, `del`, `exists`, `incr`, `decr`, `incrby`, `decrby`, `append`, `strlen`, `getrange`, `setrange`, `mset`, `mget`
+**String:** `set` (NX/XX/EX/PX), `get`, `del`, `exists`, `incr`, `decr`, `incrby`, `decrby`, `append`, `strlen`, `getrange`, `setrange`, `mset`, `mget`, `setnx`, `psetex`, `getset`, `getdel`
 
 **TTL:** `expire`, `ttl`, `pttl`, `persist`
 
-**Hash:** `hset`, `hget`, `hdel`, `hgetall`, `hexists`, `hlen`, `hkeys`, `hvals`, `hmget`, `hmset`
+**Hash:** `hset`, `hget`, `hdel`, `hgetall`, `hexists`, `hlen`, `hkeys`, `hvals`, `hmget`, `hmset`, `hincrby`, `hsetnx`
 
 **List:** `lpush`, `rpush`, `lpop`, `rpop`, `lrange`, `llen`, `lindex`, `lrem`, `ltrim`, `lset`
+
+**Key management:** `type`, `rename`, `unlink`, `flushall`, `flushdb`
+
+**Server:** `auth`, `save`, `bsave`
 
 ---
 

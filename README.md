@@ -11,10 +11,14 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 - **Redis-compatible RESP protocol** — works with `redis-cli` and any Redis-compatible tooling
 - **Pipeline support** — batch multiple commands in a single round-trip for higher throughput
 - **WAL persistence** — crash-consistent write-ahead log with configurable fsync policy and TTL recovery (including BSET/BDel ops)
+- **Checkpoint / BGSAVE** — automatic or manual WAL compaction via `BGSAVE`/`SAVE` commands; `--checkpoint-interval` flag
 - **TTL / Expiration** — `EXPIRE`, `TTL`, `PTTL`, `PERSIST` with lazy + active key purging, persisted to WAL
-- **Hash data type** — `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HMGET`, `HMSET`
+- **Hash data type** — `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HMGET`, `HMSET`, `HINCRBY`, `HSETNX`
 - **List data type** — `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LREM`, `LTRIM`, `LSET`
-- **String operations** — `INCR`, `DECR`, `INCRBY`, `APPEND`, `STRLEN`, `GETRANGE`, `SETRANGE`, `MGET`, `MSET`, `EXISTS`
+- **String operations** — `INCR`, `DECR`, `INCRBY`, `APPEND`, `STRLEN`, `GETRANGE`, `SETRANGE`, `MGET`, `MSET`, `EXISTS`, `SETNX`, `PSETEX`, `GETSET`, `GETDEL`
+- **Key management** — `TYPE`, `RENAME`, `UNLINK`, `FLUSHALL`, `FLUSHDB`
+- **AUTH / Security** — `--requirepass` for password authentication, `--max-connections` for connection limiting
+- **Graceful shutdown** — SIGTERM/SIGINT handling with 30s drain timeout and WAL sync
 - **io_uring (Linux)** — optional kernel-bypass networking for maximum throughput
 - **Client SDKs** — zero-dependency libraries for Go, Python, Java, and Node.js
 
@@ -94,6 +98,9 @@ FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_INLINE_SIZE=2
 | `--dir <path>` | `./fastkv_data` | Data directory for WAL |
 | `--fsync <policy>` | `everysec` | WAL fsync: `always`, `everysec`, `never` |
 | `--mode <backend>` | `tokio` | Server backend: `tokio` or `io_uring` (Linux only) |
+| `--requirepass <pw>` | (disabled) | Require clients to authenticate with `AUTH` command |
+| `--max-connections <N>` | `10000` | Maximum concurrent client connections |
+| `--checkpoint-interval <secs>` | (disabled) | Auto-checkpoint interval in seconds |
 
 #### Capacity & Memory
 
@@ -196,6 +203,8 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 | `FASTKV_INLINE_SIZE` | `64` | Per-side inline size: `64`, `128`, `256`, `512` (overridden by `--inline-size`) |
 | `FASTKV_DIR` | `./fastkv_data` | Directory for WAL file |
 | `FASTKV_FSYNC` | `everysec` | WAL fsync policy: `always`, `everysec`, or `never` |
+| `FASTKV_REQUIREPASS` | (disabled) | Require password authentication |
+| `FASTKV_MAX_CONNECTIONS` | `10000` | Maximum concurrent client connections |
 
 ## Supported Commands
 
@@ -213,6 +222,18 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 | `INFO` | Server info |
 | `COMMAND` | Command discovery |
 | `QUIT` | Close connection |
+| `AUTH password` | Authenticate (required when `--requirepass` is set) |
+| `TYPE key` | Returns type: `string`, `hash`, `list`, or `none` |
+| `RENAME key newkey` | Rename a key (atomic GET+SET+DEL with TTL transfer) |
+| `GETSET key value` | Set new value, return old value (atomic) |
+| `GETDEL key` | Get value and delete key (atomic) |
+| `SETNX key value` | Set only if key does not exist |
+| `PSETEX key ms value` | Set with millisecond TTL |
+| `UNLINK key [key ...]` | Delete keys (async, same as DEL for compatibility) |
+| `FLUSHALL` | Delete all keys and checkpoint WAL |
+| `FLUSHDB` | Delete all keys and checkpoint WAL |
+| `SAVE` | Synchronous WAL checkpoint |
+| `BGSAVE` | Background WAL checkpoint |
 
 ### String Operations
 
@@ -250,6 +271,8 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 | `HVALS key` | All field values |
 | `HMGET key field [field ...]` | Get multiple fields |
 | `HMSET key f1 v1 f2 v2 ...` | Set multiple fields |
+| `HINCRBY key field delta` | Increment hash field by delta (atomic) |
+| `HSETNX key field value` | Set hash field only if field does not exist |
 
 ### Blob Store (feature: `blob-store`)
 
@@ -313,13 +336,13 @@ See [`clients/README.md`](clients/README.md) for full API reference and usage ex
 ### Server Unit Tests
 
 ```bash
-# Standard tests (121 tests)
+# Standard tests (124 tests)
 cargo test
 
-# With blob-store feature (147 tests)
+# With blob-store feature
 cargo test --features blob-store
 
-# With blob-store + similarity features (164 tests)
+# With blob-store + similarity features
 cargo test --features "blob-store,similarity"
 ```
 
@@ -328,7 +351,7 @@ cargo test --features "blob-store,similarity"
 | `kv.rs` | 39 | GET/SET/DEL, INCR/DECR, MGET/MSET, APPEND, STRLEN, GETRANGE, SETRANGE, SCAN, glob MATCH, DBSTATS, lock-free ops, concurrent |
 | `wal.rs` | 18 | Create/recover, CRC-32C, alignment, binary keys, large values, EXPIRE entry, BSET/BDel entries |
 | `expiration.rs` | 14 | EXPIRE/TTL/PERSIST, lazy/active purging, concurrent, DEL cascade |
-| `hash.rs` | 20 | HSET/HGET/HDEL, HGETALL, HEXISTS, HLEN, HKEYS/HVALS, HMGET/HMSET, edge cases |
+| `hash.rs` | 20 | HSET/HGET/HDEL, HGETALL, HEXISTS, HLEN, HKEYS/HVALS, HMGET/HMSET, HINCRBY, HSETNX, edge cases |
 | `list.rs` | 17 | LPUSH/RPUSH, LPOP/RPOP, LRANGE, LLEN, LINDEX, LREM, LTRIM, LSET, WRONGTYPE |
 | `blob.rs` | 14 | BlobRef encode/decode, store/retrieve, free/reuse, hash integrity, stats, BGETRAW, edge cases |
 | `simhash.rs` | 10 | SimHash 64-bit, weighted features, hamming distance, similarity threshold, KV integration |
@@ -336,6 +359,7 @@ cargo test --features "blob-store,similarity"
 | `lsh.rs` | 9 | LSH band extraction, add/remove/find, SimHash + MinHash bucket indexing, ID list codec |
 | `resp.rs` | 18 | RESP array/inline parse, encode, roundtrip, binary data, error types |
 | `tcp.rs` | 8 | Dispatch handlers, DEL list cleanup, WRONGTYPE, PING, inline parsing |
+| `checkpoint.rs` | 3 | BGSAVE, SAVE, checkpoint on empty store, no-WAL edge case |
 
 ### Integration Tests (all clients)
 
@@ -361,12 +385,51 @@ cargo test --features "blob-store,similarity"
 ## Benchmarks
 
 ```bash
-# In-memory (Criterion)
+# Core benchmarks (always available)
 cargo bench --bench kv_benchmark
+
+# Core + Blob Arena benchmarks
+cargo bench --bench kv_benchmark --features blob-store
+
+# Core + Similarity benchmarks
+cargo bench --bench kv_benchmark --features similarity
+
+# All benchmarks (core + blob arena + similarity)
+cargo bench --bench kv_benchmark --features "blob-store,similarity"
+
+# Filter by name
+cargo bench -- blob          # blob arena benchmarks only
+cargo bench -- simhash       # simhash benchmarks only
+cargo bench -- scan          # scan benchmarks only
 
 # Network (vs Redis)
 cargo run --release --example netbench -- all
 ```
+
+### Benchmark Groups
+
+| Group | Feature Flag | What It Measures |
+|-------|-------------|------------------|
+| `set_operations` | — | SET at 100 / 1K / 10K keys |
+| `get_operations` | — | GET at 100 / 1K / 10K keys |
+| `incr_operations` | — | INCR on 10K keys |
+| `exists_operations` | — | EXISTS on 10K keys |
+| `mget_operations` | — | MGET on 100 keys |
+| `threaded_set` | — | Multi-threaded SET (1/2/4/8 threads) |
+| `threaded_get` | — | Multi-threaded GET (1/2/4/8 threads) |
+| `threaded_incr` | — | Multi-threaded INCR (8 threads, 1K keys) |
+| `wal_write` | — | WAL write 10K entries (fsync=never) |
+| `string_operations` | — | APPEND/STRLEN/GETRANGE/SETRANGE on 10K keys |
+| `wal_recovery` | — | WAL recovery 10K entries |
+| `expiration` | — | EXPIRE/TTL on 10K keys |
+| `scan` | — | SCAN at 1K/10K/50K keys, with/without MATCH |
+| `dbstats` | — | DBSTATS at 1K/10K/50K keys |
+| `blob_arena` | `blob-store` | BSET store/retrieve at 256B/1KB/4KB/10KB, BGETRAW, BlobRef encode/decode, stats, compression ratio |
+| `blob_vs_inline` | `blob-store` | SET (inline) vs BSET (blob) for 10K ops, small vs 4KB payloads |
+| `wal_segment` | `blob-store` | Compressed WAL: SET/BSET write, recovery, raw vs compressed |
+| `simhash` | `similarity` | hash64, simhash (weighted/uniform), hamming_distance, is_similar |
+| `minhash` | `similarity` | MinHash 128/256 hashes, Jaccard similarity, serialization |
+| `lsh` | `similarity` | LSH add/find/remove for 1K profiles |
 
 ## Project Structure
 
@@ -456,10 +519,11 @@ Operations:
 
 ```
 Blob Ref (inline value with flag 0xFD):
-┌───────────┬──────────┬───────────┬───────────┬──────────────┐
+┌──────────┬──────────┬───────────┬───────────┬──────────────┐
 │ flag: 0xFD│ offset:  │ comp_len: │ orig_len: │ data_hash:   │
 │ 1 byte    │ u64 8B   │ u32 4B    │ u32 4B    │ dual-crc32c  │
-└───────────┴──────────┴───────────┴───────────┴──────────────┘
+│           │          │           │           │ 16B          │
+└──────────┴──────────┴───────────┴───────────┴──────────────┘
 Total: 33 bytes — fits even in N=64 inline size
 
 Architecture:
@@ -512,35 +576,35 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 
 ```
 SimHash (64-bit near-duplicate detection)
-┌───────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │  1. Hash each feature with 64-bit wyhash                  │
 │  2. Weighted vote vector: +weight for 1-bits, -weight     │
 │     for 0-bits                                            │
-│  3. Final hash: bit = 1 if vote > 0 else 0                │
-│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT │
+│  3. Final hash: bit = 1 if vote > 0 else 0               │
+│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT│
 │  5. Configurable per-field weights                        │
 │  6. Default threshold: Hamming distance ≤ 3 = similar     │
-└───────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 
 MinHash (Jaccard similarity for set-type data)
-┌───────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │  128 hash functions via LCG permutation coefficients      │
-│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64                │
-│  Signature: Vec<u32> of 128 minimums (512 bytes)          │
+│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64              │
+│  Signature: Vec<u32> of 128 minimums (512 bytes)         │
 │  Jaccard estimate = fraction of matching components       │
-└───────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 
 LSH (O(1) approximate nearest-neighbor search)
-┌───────────────────────────────────────────────────────────┐
-│  SimHash: 64 bits → 4 bands × 16 bits                     │
-│  Bucket keys: lsh:sim:{band}:{value} → list of IDs        │
-│  MinHash:  128 values → 4 bands × 32 rows                 │
-│  Bucket keys: lsh:min:{band}:{value} → list of IDs        │
+┌──────────────────────────────────────────────────────────┐
+│  SimHash: 64 bits → 4 bands × 16 bits                    │
+│  Bucket keys: lsh:sim:{band}:{value} → list of IDs       │
+│  MinHash:  128 values → 4 bands × 32 rows                │
+│  Bucket keys: lsh:min:{band}:{value} → list of IDs       │
 │                                                           │
-│  Search: look up all 4 bands, deduplicate candidates,     │
+│  Search: look up all 4 bands, deduplicate candidates,    │
 │  optionally filter by Hamming distance threshold (≤ 3)    │
 │  Metadata: lsh:simhash:{id} → stored 64-bit SimHash       │
-└───────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Roadmap
@@ -549,7 +613,7 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 2 — Persistence: WAL with CRC-32C, alignment, fsync policies, recovery
 - [x] Phase 3 — String ops: INCR/DECR, APPEND/STRLEN, GETRANGE/SETRANGE, MGET/MSET
 - [x] Phase 4 — Expiration: EXPIRE/TTL/PTTL/PERSIST, lazy + active purging, WAL persistence
-- [x] Phase 5 — Hash: HSET/HGET/HDEL/HGETALL/HEXISTS/HLEN/HKEYS/HVALS/HMGET/HMSET
+- [x] Phase 5 — Hash: HSET/HGET/HDEL/HGETALL/HEXISTS/HLEN/HKEYS/HVALS/HMGET/HMSET/HINCRBY/HSETNX
 - [x] Phase 6 — List: LPUSH/RPUSH, LPOP/RPOP, LRANGE/LLEN/LINDEX, LREM/LTRIM/LSET, WRONGTYPE
 - [x] Phase 7 — Client SDKs: Go, Python (sync + async), Java (sync + reactive), Node.js, Rust (zero-dependency, pipeline support)
 - [x] Phase 8 — Blob Arena: BSET/BGET/BGETRAW/BSTATS, zstd compression, lock-free arena, WAL persistence, Python client
@@ -557,10 +621,12 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 10 — SCAN/KEYS: cursor-based key iteration, glob MATCH, DBSTATS
 - [ ] Phase 11 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
 - [x] Phase 12 — List WAL: persistent list operations (LPUSH/RPUSH/LPOP/RPOP/LTRIM)
-- [ ] Phase 13 — Compressed WAL Segments: segment-based WAL with zstd batch compression
-- [ ] Phase 14 — Sorted Set: ZADD, ZREM, ZRANGE, ZSCORE, ZRANK, ZCARD
-- [ ] Phase 15 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), Lua scripting
+- [x] Phase 13 — Compressed WAL Segments: segment-based WAL with zstd batch compression
+- [x] Phase 14 — Production readiness: AUTH, connection limits, graceful shutdown, checkpoint/BGSAVE, TYPE, RENAME, GETSET, GETDEL, SETNX, PSETEX, UNLINK, FLUSHALL/FLUSHDB, HINCRBY, HSETNX, critical bug fixes
+- [ ] Phase 15 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), BLPOP/BRPOP, Lua scripting
 - [ ] Phase 16 — Cluster: hash-slot sharding, node discovery, failover
+- [ ] Phase 17 — TLS: optional `--tls-cert` / `--tls-key` via tokio-rustls
+- [ ] Phase 18 — CI/CD, Docker, monitoring /metrics endpoint
 
 ## Requirements
 

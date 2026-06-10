@@ -144,6 +144,31 @@ public class FastKVReactiveClient implements AutoCloseable {
         return supplyAsync(delegate::dbsize);
     }
 
+    /** Authenticates the current connection with the given password. */
+    public CompletableFuture<Boolean> auth(String password) {
+        return supplyAsync(() -> delegate.auth(password));
+    }
+
+    /** Performs a synchronous save of the dataset to disk. */
+    public CompletableFuture<Boolean> save() {
+        return supplyAsync(delegate::save);
+    }
+
+    /** Performs an asynchronous background save of the dataset to disk. */
+    public CompletableFuture<Boolean> bgSave() {
+        return supplyAsync(delegate::bgSave);
+    }
+
+    /** Removes all keys from all databases. */
+    public CompletableFuture<Boolean> flushAll() {
+        return supplyAsync(delegate::flushAll);
+    }
+
+    /** Removes all keys from the currently selected database. */
+    public CompletableFuture<Boolean> flushDb() {
+        return supplyAsync(delegate::flushDb);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // String commands
     // ═══════════════════════════════════════════════════════════════════════════
@@ -238,6 +263,40 @@ public class FastKVReactiveClient implements AutoCloseable {
         return supplyAsync(() -> delegate.mget(keys));
     }
 
+    /** Atomically sets a key and returns the old value (null if missing). */
+    public CompletableFuture<String> getSet(String key, String value) {
+        return supplyAsync(() -> delegate.getSet(key, value));
+    }
+
+    /** Gets the value of a key and deletes it atomically. */
+    public CompletableFuture<String> getDel(String key) {
+        return supplyAsync(() -> delegate.getDel(key));
+    }
+
+    /** Sets a key with a TTL in milliseconds using PSETEX. */
+    public CompletableFuture<Boolean> psetEx(String key, long milliseconds, String value) {
+        return supplyAsync(() -> delegate.psetEx(key, milliseconds, value));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Key commands
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /** Returns the type of the value stored at a key. */
+    public CompletableFuture<String> typeOf(String key) {
+        return supplyAsync(() -> delegate.typeOf(key));
+    }
+
+    /** Renames a key. */
+    public CompletableFuture<Boolean> rename(String key, String newKey) {
+        return supplyAsync(() -> delegate.rename(key, newKey));
+    }
+
+    /** Asynchronously removes keys (like del but non-blocking reclaim). Returns count. */
+    public CompletableFuture<Long> unlink(String... keys) {
+        return supplyAsync(() -> delegate.unlink(keys));
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // TTL commands
     // ═══════════════════════════════════════════════════════════════════════════
@@ -314,6 +373,16 @@ public class FastKVReactiveClient implements AutoCloseable {
     /** Sets multiple hash fields. */
     public CompletableFuture<String> hmset(String key, Map<String, String> fields) {
         return supplyAsync(() -> delegate.hmset(key, fields));
+    }
+
+    /** Increments a hash field by the given delta. Returns the new value. */
+    public CompletableFuture<Long> hIncrBy(String key, String field, long delta) {
+        return supplyAsync(() -> delegate.hIncrBy(key, field, delta));
+    }
+
+    /** Sets a hash field only if it does not already exist. */
+    public CompletableFuture<Boolean> hSetNx(String key, String field, String value) {
+        return supplyAsync(() -> delegate.hSetNx(key, field, value));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

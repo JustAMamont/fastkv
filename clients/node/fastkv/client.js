@@ -362,6 +362,41 @@ class FastKVClient extends EventEmitter {
     return this._command(['MGET', ...keys]);
   }
 
+  /** @param {string} key @param {string|number|Buffer} value @returns {Promise<boolean>} */
+  setnx(key, value) {
+    return this._command(['SETNX', key, value]);
+  }
+
+  /** @param {string} key @param {string|number|Buffer} value @returns {Promise<string|null>} */
+  getset(key, value) {
+    return this._command(['GETSET', key, value]);
+  }
+
+  /** @param {string} key @returns {Promise<string|null>} */
+  getdel(key) {
+    return this._command(['GETDEL', key]);
+  }
+
+  /** @param {string} key @returns {Promise<string>} */
+  type(key) {
+    return this._command(['TYPE', key]);
+  }
+
+  /** @param {string} key @param {string} newkey @returns {Promise<string>} */
+  rename(key, newkey) {
+    return this._command(['RENAME', key, newkey]);
+  }
+
+  /** @param {string} key @param {number} milliseconds @param {string|number|Buffer} value @returns {Promise<string>} */
+  psetex(key, milliseconds, value) {
+    return this._command(['PSETEX', key, milliseconds, value]);
+  }
+
+  /** @param {...string} keys @returns {Promise<number>} */
+  unlink(...keys) {
+    return this._command(['UNLINK', ...keys]);
+  }
+
   // ── TTL ──────────────────────────────────────────────────────────────────
 
   /** @param {string} key @param {number} seconds @returns {Promise<number>} */
@@ -382,6 +417,33 @@ class FastKVClient extends EventEmitter {
   /** @param {string} key @returns {Promise<number>} */
   persist(key) {
     return this._command(['PERSIST', key]);
+  }
+
+  // ── Key management / server commands ─────────────────────────────────────
+
+  /** @returns {Promise<string>} */
+  flushall() {
+    return this._command(['FLUSHALL']);
+  }
+
+  /** @returns {Promise<string>} */
+  flushdb() {
+    return this._command(['FLUSHDB']);
+  }
+
+  /** @param {string} password @returns {Promise<string>} */
+  auth(password) {
+    return this._command(['AUTH', password]);
+  }
+
+  /** @returns {Promise<string>} */
+  save() {
+    return this._command(['SAVE']);
+  }
+
+  /** @returns {Promise<string>} */
+  bgsave() {
+    return this._command(['BGSAVE']);
   }
 
   // ── Hash ─────────────────────────────────────────────────────────────────
@@ -451,6 +513,16 @@ class FastKVClient extends EventEmitter {
       args.push(f, v);
     }
     return this._command(args);
+  }
+
+  /** @param {string} key @param {string} field @param {number} delta @returns {Promise<number>} */
+  hincrby(key, field, delta) {
+    return this._command(['HINCRBY', key, field, delta]);
+  }
+
+  /** @param {string} key @param {string} field @param {string|number|Buffer} value @returns {Promise<number>} */
+  hsetnx(key, field, value) {
+    return this._command(['HSETNX', key, field, value]);
   }
 
   // ── List ─────────────────────────────────────────────────────────────────

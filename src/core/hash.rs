@@ -19,22 +19,23 @@
 //!
 //! ## Size constraints
 //!
-//! The total encoded value must fit within the KV store's `INLINE_SIZE` (64 bytes).
+//! The total encoded value must fit within the KV store's `INLINE_SIZE` (up to 256 bytes).
 //! Individual limits:
-//! - Max field name: 32 bytes
-//! - Max field value: 28 bytes
+//! - Max encoded size: 256 bytes
+//! - Max field name: 128 bytes
+//! - Max field value: 128 bytes
 
 /// Magic byte prefix that identifies a hash-type value.
 pub const HASH_MAGIC: u8 = 0xFF;
 
 /// Maximum encoded hash size (must fit in the KV store's inline value).
-pub const MAX_ENCODED_SIZE: usize = 64;
+pub const MAX_ENCODED_SIZE: usize = 256;
 
 /// Maximum length of a single field name.
-pub const MAX_FIELD_NAME: usize = 32;
+pub const MAX_FIELD_NAME: usize = 128;
 
 /// Maximum length of a single field value.
-pub const MAX_FIELD_VALUE: usize = 28;
+pub const MAX_FIELD_VALUE: usize = 128;
 
 /// WRONGTYPE error message (matches Redis exactly).
 pub const WRONGTYPE_ERR: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
@@ -471,25 +472,25 @@ mod tests {
 
     #[test]
     fn test_hash_max_size() {
-        // A field name of 33 bytes should be rejected.
-        let long_field = vec![b'x'; 33];
+        // A field name of 129 bytes should be rejected.
+        let long_field = vec![b'x'; 129];
         let err = hash_set(b"", &long_field, b"v").unwrap_err();
         assert_eq!(err, HashError::FieldTooLong);
 
-        // A field value of 29 bytes should be rejected.
-        let long_val = vec![b'y'; 29];
+        // A field value of 129 bytes should be rejected.
+        let long_val = vec![b'y'; 129];
         let err = hash_set(b"", b"f", &long_val).unwrap_err();
         assert_eq!(err, HashError::ValueTooLong);
 
-        // Filling up to the 64-byte limit should succeed for small fields.
+        // Filling up to the 256-byte limit should succeed for small fields.
         let mut data = Vec::new();
-        for i in 0u8..7 {
-            // Each pair: 2+1 + 2+1 = 6 bytes, total ~3 + 6*7 = 45 bytes → fits
+        for i in 0u8..20 {
+            // Each pair: 2+1 + 2+1 = 6 bytes, total ~3 + 6*20 = 123 bytes → fits
             let field = [b'k', i];
             let value = [b'v', i];
             data = hash_set(&data, &field, &value).unwrap();
         }
-        assert_eq!(hash_len(&data), 7);
+        assert_eq!(hash_len(&data), 20);
         assert!(data.len() <= MAX_ENCODED_SIZE);
     }
 

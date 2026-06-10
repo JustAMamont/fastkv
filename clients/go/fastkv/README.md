@@ -109,6 +109,8 @@ func main() {
 | `HVals(key)` | `([]string, error)` | All field values |
 | `HMGet(key, fields...)` | `([]string, error)` | Get multiple fields |
 | `HMSet(key, map)` | `error` | Set multiple fields |
+| `HIncrBy(key, field, delta)` | `(int, error)` | Increment hash field |
+| `HSetNx(key, field, value)` | `(bool, error)` | Set if not exists |
 
 ### List
 

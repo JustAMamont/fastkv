@@ -17,9 +17,13 @@ use crate::core::expiration::ExpirationManager;
 use crate::core::list::{self, ListManager};
 use crate::core::resp::{write_usize_buf, RespEncoder, RespParser};
 use crate::core::wal::WalWriter;
+use crate::core::checkpoint;
 #[cfg(feature = "blob-store")]
 use crate::core::blob::BlobArena;
+use std::cell::Cell;
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -47,6 +51,12 @@ pub struct ServerContext<'a, const N: usize = DEFAULT_INLINE_SIZE> {
     pub lists: Option<&'a ListManager<N>>,
     #[cfg(feature = "blob-store")]
     pub blob: Option<&'a BlobArena>,
+    pub wal_path: Option<&'a Path>,
+    /// Server password for AUTH. If set, clients must authenticate before
+    /// issuing other commands.
+    pub password: Option<&'a String>,
+    /// Whether this connection has successfully authenticated.
+    pub authenticated: Cell<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +79,16 @@ pub struct TokioServer<const N: usize = DEFAULT_INLINE_SIZE> {
     /// Optional blob arena for large-value storage.
     #[cfg(feature = "blob-store")]
     blob: Option<Arc<BlobArena>>,
+    /// Path to the WAL file (for BGSAVE/checkpoint).
+    wal_path: Option<std::path::PathBuf>,
+    /// Authentication password (if set, clients must AUTH before other commands).
+    password: Option<String>,
+    /// Maximum number of concurrent connections.
+    max_connections: u32,
+    /// Active connection counter.
+    active_connections: Arc<AtomicU32>,
+    /// Graceful shutdown flag — set to true when SIGINT/SIGTERM received.
+    shutting_down: Arc<AtomicBool>,
     /// Host to bind to.
     host: String,
     /// Port to listen on.
@@ -88,6 +108,11 @@ impl<const N: usize> TokioServer<N> {
             lists: None,
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            max_connections: 10000,
+            active_connections: Arc::new(AtomicU32::new(0)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             host: "0.0.0.0".into(),
             port: DEFAULT_PORT,
         }
@@ -105,6 +130,11 @@ impl<const N: usize> TokioServer<N> {
             lists: None,
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            max_connections: 10000,
+            active_connections: Arc::new(AtomicU32::new(0)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             host: "0.0.0.0".into(),
             port,
         }
@@ -120,10 +150,19 @@ impl<const N: usize> TokioServer<N> {
         expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
         blob: Option<Arc<BlobArena>>,
+        wal_path: Option<std::path::PathBuf>,
+        password: Option<String>,
+        max_connections: u32,
+        shutting_down: Arc<AtomicBool>,
     ) -> Self {
         Self {
             store, wal, expiry, lists,
             blob,
+            wal_path,
+            password,
+            max_connections,
+            active_connections: Arc::new(AtomicU32::new(0)),
+            shutting_down,
             host, port,
         }
     }
@@ -137,9 +176,18 @@ impl<const N: usize> TokioServer<N> {
         wal: Option<Arc<dyn WalWriter>>,
         expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
+        wal_path: Option<std::path::PathBuf>,
+        password: Option<String>,
+        max_connections: u32,
+        shutting_down: Arc<AtomicBool>,
     ) -> Self {
         Self {
             store, wal, expiry, lists,
+            wal_path,
+            password,
+            max_connections,
+            active_connections: Arc::new(AtomicU32::new(0)),
+            shutting_down,
             host, port,
         }
     }
@@ -150,14 +198,18 @@ impl<const N: usize> TokioServer<N> {
     }
 
     /// Run the accept loop (async — call inside a Tokio runtime).
-    pub async fn run(&self) {
+    ///
+    /// Handles SIGINT/SIGTERM for graceful shutdown: stops accepting new
+    /// connections, waits for existing ones to finish (up to 30 s), then exits.
+    pub async fn run(&self) -> Result<(), String> {
         let addr = format!("{}:{}", self.host, self.port);
 
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Failed to bind to {}: {}", addr, e);
-                return;
+                let msg = format!("Failed to bind to {}: {}", addr, e);
+                eprintln!("{}", msg);
+                return Err(msg);
             }
         };
 
@@ -170,9 +222,60 @@ impl<const N: usize> TokioServer<N> {
         let lists = self.lists.clone();
         #[cfg(feature = "blob-store")]
         let blob = self.blob.clone();
+        let wal_path = self.wal_path.clone();
+        let password = self.password.clone();
+        let max_connections = self.max_connections;
+        let active_connections = Arc::clone(&self.active_connections);
+        let shutting_down = Arc::clone(&self.shutting_down);
 
+        // --- Spawn signal handler task ---
+        {
+            let shutting_down = Arc::clone(&shutting_down);
+            let wal = wal.clone();
+            tokio::spawn(async move {
+                // Wait for SIGINT (Ctrl+C) or SIGTERM.
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .expect("Failed to install SIGTERM handler");
+                    let mut sigint = signal(SignalKind::interrupt())
+                        .expect("Failed to install SIGINT handler");
+                    tokio::select! {
+                        _ = sigint.recv() => {},
+                        _ = sigterm.recv() => {},
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    tokio::signal::ctrl_c().await.ok();
+                }
+
+                println!("\nReceived shutdown signal, shutting down gracefully...");
+                shutting_down.store(true, Ordering::SeqCst);
+                // Flush WAL to ensure durability.
+                if let Some(w) = wal {
+                    let _ = w.wal_sync_now();
+                }
+                println!("WAL flushed.");
+            });
+        }
+
+        // --- Accept loop ---
         loop {
-            let (socket, peer_addr) = match listener.accept().await {
+            if shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let accept_result = tokio::select! {
+                result = listener.accept() => result,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    // Periodic re-check of the shutting_down flag.
+                    continue;
+                }
+            };
+
+            let (mut socket, peer_addr) = match accept_result {
                 Ok(conn) => conn,
                 Err(e) => {
                     eprintln!("Accept error: {}", e);
@@ -180,20 +283,57 @@ impl<const N: usize> TokioServer<N> {
                 }
             };
 
+            // Check connection limit before spawning.
+            if active_connections.load(Ordering::Relaxed) >= max_connections {
+                let _ = socket.write_all(b"-ERR max number of clients reached\r\n").await;
+                continue;
+            }
+
+            // Increment active connections; the spawned task will decrement via guard.
+            active_connections.fetch_add(1, Ordering::Relaxed);
+
             let store = Arc::clone(&self.store);
-            let wal = wal.clone();
-            let expiry = expiry.clone();
-            let lists = lists.clone();
+            let wal_c = wal.clone();
+            let expiry_c = expiry.clone();
+            let lists_c = lists.clone();
             #[cfg(feature = "blob-store")]
-            let blob = blob.clone();
+            let blob_c = blob.clone();
+            let wal_path_c = wal_path.clone();
+            let password_c = password.clone();
+            let active_conn = Arc::clone(&active_connections);
+            let shutting_down_c = Arc::clone(&shutting_down);
 
             tokio::spawn(async move {
+                // RAII guard: decrements active_connections when the task exits.
+                struct ConnGuard { conn: Arc<AtomicU32> }
+                impl Drop for ConnGuard {
+                    fn drop(&mut self) { self.conn.fetch_sub(1, Ordering::Relaxed); }
+                }
+                let _guard = ConnGuard { conn: active_conn };
+
                 #[cfg(feature = "blob-store")]
-                handle_client(socket, store, wal, expiry, lists, blob, peer_addr).await;
+                handle_client(socket, store, wal_c, expiry_c, lists_c, blob_c, wal_path_c, peer_addr, password_c, shutting_down_c).await;
                 #[cfg(not(feature = "blob-store"))]
-                handle_client(socket, store, wal, expiry, lists, peer_addr).await;
+                handle_client(socket, store, wal_c, expiry_c, lists_c, wal_path_c, peer_addr, password_c, shutting_down_c).await;
             });
         }
+
+        // --- Graceful shutdown: wait for existing connections ---
+        let active = active_connections.load(Ordering::SeqCst);
+        if active > 0 {
+            println!("Waiting for {} active connection(s) to finish...", active);
+            let timeout = std::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
+            while active_connections.load(Ordering::SeqCst) > 0 && start.elapsed() < timeout {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let remaining = active_connections.load(Ordering::SeqCst);
+            if remaining > 0 {
+                println!("Timeout reached, forcing shutdown with {} connection(s) still active.", remaining);
+            }
+        }
+        println!("Server shut down gracefully.");
+        Ok(())
     }
 }
 
@@ -216,7 +356,10 @@ async fn handle_client<const N: usize>(
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
     blob: Option<Arc<BlobArena>>,
+    wal_path: Option<std::path::PathBuf>,
     addr: std::net::SocketAddr,
+    password: Option<String>,
+    shutting_down: Arc<AtomicBool>,
 ) {
     let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
@@ -228,9 +371,17 @@ async fn handle_client<const N: usize>(
         expiry: expiry.as_deref(),
         lists: lists.as_deref(),
         blob: blob.as_deref(),
+        wal_path: wal_path.as_deref(),
+        password: password.as_ref(),
+        authenticated: Cell::new(false),
     };
 
     loop {
+        // Stop processing when the server is shutting down.
+        if shutting_down.load(Ordering::SeqCst) {
+            break;
+        }
+
         let n = match socket.read(&mut read_buf).await {
             Ok(0) => break,
             Ok(n) => n,
@@ -272,7 +423,10 @@ async fn handle_client<const N: usize>(
     wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
+    wal_path: Option<std::path::PathBuf>,
     addr: std::net::SocketAddr,
+    password: Option<String>,
+    shutting_down: Arc<AtomicBool>,
 ) {
     let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
@@ -283,9 +437,17 @@ async fn handle_client<const N: usize>(
         wal: wal.as_deref(),
         expiry: expiry.as_deref(),
         lists: lists.as_deref(),
+        wal_path: wal_path.as_deref(),
+        password: password.as_ref(),
+        authenticated: Cell::new(false),
     };
 
     loop {
+        // Stop processing when the server is shutting down.
+        if shutting_down.load(Ordering::SeqCst) {
+            break;
+        }
+
         let n = match socket.read(&mut read_buf).await {
             Ok(0) => break,
             Ok(n) => n,
@@ -336,7 +498,7 @@ pub fn parse_command_bounds(data: &[u8]) -> Option<(usize, bool)> {
         b'*' => find_resp_array_end(data).map(|end| (end, false)),
 
         // Inline commands — recognized by their first letter.
-        b'G' | b'S' | b'D' | b'P' | b'I' | b'H' | b'L' | b'E' | b'C'
+        b'A' | b'G' | b'S' | b'D' | b'P' | b'I' | b'H' | b'L' | b'E' | b'C'
         | b'Q' | b'F' | b'K' | b'M' | b'T' | b'X' | b'R' | b'O' | b'U'
         | b'Z' | b'N' | b'B' => {
             for i in 0..data.len() {
@@ -431,8 +593,24 @@ fn dispatch_command<const N: usize>(
     ctx: &ServerContext<N>,
     out: &mut Vec<u8>,
 ) -> bool {
-    match cmd.name.as_str() {
+    let cmd_name = cmd.name.as_str();
+
+    // ----- AUTH enforcement -----
+    // If a password is set and the connection is not yet authenticated,
+    // only allow AUTH, PING, and QUIT commands.
+    if ctx.password.is_some() && !ctx.authenticated.get() {
+        match cmd_name {
+            "AUTH" | "PING" | "QUIT" => {}, // allowed without auth
+            _ => {
+                out.extend_from_slice(b"-NOAUTH Authentication required\r\n");
+                return false;
+            }
+        }
+    }
+
+    match cmd_name {
         // ----- Core -----
+        "AUTH"   => { cmd_auth(cmd, ctx, out); false }
         "GET" => { cmd_get(cmd, ctx, out); false }
         "SET" => { cmd_set(cmd, ctx, out); false }
         "DEL" => { cmd_del(cmd, ctx, out); false }
@@ -459,6 +637,15 @@ fn dispatch_command<const N: usize>(
         "MGET"    => { cmd_mget(cmd, ctx, out); false }
         "MSET"    => { cmd_mset(cmd, ctx, out); false }
         "EXISTS"  => { cmd_exists(cmd, ctx, out); false }
+        "TYPE"    => { cmd_type(cmd, ctx, out); false }
+        "RENAME"  => { cmd_rename(cmd, ctx, out); false }
+        "GETSET"  => { cmd_getset(cmd, ctx, out); false }
+        "GETDEL"  => { cmd_getdel(cmd, ctx, out); false }
+        "SETNX"   => { cmd_setnx(cmd, ctx, out); false }
+        "PSETEX"  => { cmd_psetex(cmd, ctx, out); false }
+        "UNLINK"  => { cmd_del(cmd, ctx, out); false }
+        "FLUSHALL" => { cmd_flushall(ctx, out); false }
+        "FLUSHDB"  => { cmd_flushall(ctx, out); false }
 
         // ----- Expiration -----
         "EXPIRE"  => { cmd_expire(cmd, ctx, out); false }
@@ -477,6 +664,8 @@ fn dispatch_command<const N: usize>(
         "HVALS"   => { cmd_hvals(cmd, ctx, out); false }
         "HMGET"   => { cmd_hmget(cmd, ctx, out); false }
         "HMSET"   => { cmd_hmset(cmd, ctx, out); false }
+        "HINCRBY" => { cmd_hincrby(cmd, ctx, out); false }
+        "HSETNX"  => { cmd_hsetnx(cmd, ctx, out); false }
 
         // ----- List -----
         "LPUSH"  => { cmd_lpush(cmd, ctx, out); false }
@@ -514,6 +703,10 @@ fn dispatch_command<const N: usize>(
         "SCAN"    => { cmd_scan(cmd, ctx, out); false }
         "DBSTATS" => { cmd_dbstats(ctx, out); false }
 
+        // ----- Checkpoint -----
+        "BGSAVE"  => { cmd_bgsave(ctx, out); false }
+        "SAVE"    => { cmd_bgsave(ctx, out); false }
+
         _ => {
             let msg = format!("ERR unknown command '{}'", cmd.name);
             RespEncoder::write_error(out, &msg);
@@ -526,6 +719,33 @@ fn dispatch_command<const N: usize>(
 #[inline]
 fn err_wrong_args(out: &mut Vec<u8>) {
     out.extend_from_slice(b"-ERR wrong number of arguments\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// AUTH command
+// ---------------------------------------------------------------------------
+
+/// Handle `AUTH <password>` — authenticate the connection.
+///
+/// If no password is configured on the server, returns an error.
+/// If the password matches, marks the connection as authenticated.
+fn cmd_auth<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    // No password configured on the server.
+    let Some(expected) = ctx.password else {
+        out.extend_from_slice(b"-ERR Client sent AUTH, but no password is set\r\n");
+        return;
+    };
+
+    let Some(provided) = cmd.arg(1) else {
+        return err_wrong_args(out);
+    };
+
+    if provided == expected.as_bytes() {
+        ctx.authenticated.set(true);
+        out.extend_from_slice(b"+OK\r\n");
+    } else {
+        out.extend_from_slice(b"-ERR invalid password\r\n");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1239,398 @@ fn cmd_exists<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerCont
 }
 
 // ---------------------------------------------------------------------------
+// TYPE / RENAME / GETSET / GETDEL / SETNX / PSETEX / FLUSHALL
+// ---------------------------------------------------------------------------
+
+/// Handle `TYPE key` — return the type of value stored at key.
+fn cmd_type<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    // Check expiration first.
+    if let Some(exp) = ctx.expiry {
+        if exp.check_and_purge_if_expired(key) {
+            out.extend_from_slice(b"+none\r\n");
+            return;
+        }
+    }
+
+    match ctx.store.get(key) {
+        None => out.extend_from_slice(b"+none\r\n"),
+        Some(v) if hash::is_hash_value(&v) => out.extend_from_slice(b"+hash\r\n"),
+        Some(v) if list::is_list_value(&v) => out.extend_from_slice(b"+list\r\n"),
+        Some(_) => out.extend_from_slice(b"+string\r\n"),
+    }
+}
+
+/// Handle `RENAME key newkey` — atomically rename a key.
+fn cmd_rename<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let (Some(key), Some(newkey)) = (cmd.key(), cmd.arg(2)) else { return err_wrong_args(out); };
+
+    // If oldkey == newkey, do nothing.
+    if key == newkey {
+        out.extend_from_slice(b"+OK\r\n");
+        return;
+    }
+
+    // Check expiration on old key.
+    if let Some(exp) = ctx.expiry {
+        if exp.check_and_purge_if_expired(key) {
+            out.extend_from_slice(b"-ERR no such key\r\n");
+            return;
+        }
+    }
+
+    // GET old key value.
+    let Some(value) = ctx.store.get(key) else {
+        out.extend_from_slice(b"-ERR no such key\r\n");
+        return;
+    };
+
+    // If the newkey held a list, clean up the list data.
+    if let Some(lists) = ctx.lists {
+        if list::is_list_value(&ctx.store.get(newkey).unwrap_or_default()) {
+            lists.remove_key(newkey);
+        }
+    }
+
+    // Remove old TTL from newkey if it existed.
+    if let Some(exp) = ctx.expiry {
+        exp.remove(newkey);
+    }
+
+    // SET newkey with the value.
+    if !ctx.store.set(newkey, &value) {
+        out.extend_from_slice(b"-ERR value too large\r\n");
+        return;
+    }
+
+    // Transfer TTL from old key to new key.
+    let old_ttl = ctx.expiry.and_then(|exp| exp.ttl(key));
+    if let Some(exp) = ctx.expiry {
+        exp.remove(key);
+        if let Some(ttl) = old_ttl {
+            let _ = exp.expire_with_deadline(newkey, ttl);
+        }
+    }
+
+    // DEL oldkey.
+    ctx.store.del(key);
+
+    // WAL: SET newkey, DEL oldkey.
+    if let Some(w) = ctx.wal {
+        // Check if the value is a blob ref for proper WAL entry.
+        #[cfg(feature = "blob-store")]
+        let is_blob = crate::core::blob::BlobArena::is_blob_ref(&value);
+        #[cfg(feature = "blob-store")]
+        if is_blob {
+            let _ = w.wal_bset(newkey, &value);
+        } else {
+            let _ = w.wal_set(newkey, &value);
+        }
+        #[cfg(not(feature = "blob-store"))]
+        let _ = w.wal_set(newkey, &value);
+        let _ = w.wal_del(key);
+    }
+
+    // Write EXPIRE for newkey to WAL if TTL was transferred.
+    if let Some(exp) = ctx.expiry {
+        if let Some(ttl) = old_ttl {
+            if let Some(deadline_ms) = exp.expire_with_deadline(newkey, ttl) {
+                if let Some(w) = ctx.wal {
+                    let _ = w.wal_expire(newkey, deadline_ms);
+                }
+            }
+        }
+    }
+
+    out.extend_from_slice(b"+OK\r\n");
+}
+
+/// Handle `GETSET key value` — atomically set new value and return old value.
+fn cmd_getset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let (Some(key), Some(value)) = (cmd.key(), cmd.value()) else { return err_wrong_args(out); };
+
+    // GET old value (check expiration).
+    if let Some(exp) = ctx.expiry {
+        if exp.check_and_purge_if_expired(key) {
+            // Key expired — return nil for old value, but still set new value.
+            // Fall through to set.
+        }
+    }
+
+    let old_value = ctx.store.get(key);
+
+    // Check WRONGTYPE for old value.
+    if let Some(ref v) = old_value {
+        if hash::is_hash_value(v) || list::is_list_value(v) {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+    }
+
+    // If the key held a list, clean up the list data.
+    if let Some(lists) = ctx.lists {
+        if list::is_list_value(&ctx.store.get(key).unwrap_or_default()) {
+            lists.remove_key(key);
+        }
+    }
+
+    // Remove old TTL.
+    if let Some(exp) = ctx.expiry {
+        exp.remove(key);
+    }
+
+    // SET new value.
+    if ctx.store.set(key, value) {
+        if let Some(w) = ctx.wal {
+            if w.wal_set(key, value).is_err() {
+                out.extend_from_slice(b"-ERR WAL write failed\r\n");
+                return;
+            }
+        }
+    } else {
+        out.extend_from_slice(b"-ERR value too large\r\n");
+        return;
+    }
+
+    // Return old value.
+    match old_value {
+        Some(v) => {
+            // Auto-decompress blob references for transparent GETSET.
+            #[cfg(feature = "blob-store")]
+            if crate::core::blob::BlobArena::is_blob_ref(&v) {
+                if let Some(blob_arena) = ctx.blob {
+                    if let Some(blob_ref) = crate::core::blob::BlobRef::decode(&v) {
+                        if let Some(decompressed) = blob_arena.retrieve(&blob_ref) {
+                            RespEncoder::write_bulk_string(out, &decompressed);
+                            return;
+                        }
+                    }
+                }
+            }
+            RespEncoder::write_bulk_string(out, &v)
+        }
+        None => RespEncoder::write_null(out),
+    }
+}
+
+/// Handle `GETDEL key` — get value and delete the key atomically.
+fn cmd_getdel<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(key) = cmd.key() else { return err_wrong_args(out); };
+
+    // Check expiration.
+    if let Some(exp) = ctx.expiry {
+        if exp.check_and_purge_if_expired(key) {
+            RespEncoder::write_null(out);
+            return;
+        }
+    }
+
+    let value = ctx.store.get(key);
+
+    match value {
+        Some(ref v) if hash::is_hash_value(v) || list::is_list_value(v) => {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+        _ => {}
+    }
+
+    if let Some(ref v) = value {
+        // Free blob ref if applicable.
+        #[cfg(feature = "blob-store")]
+        if crate::core::blob::BlobArena::is_blob_ref(v) {
+            if let Some(blob_arena) = ctx.blob {
+                if let Some(blob_ref) = crate::core::blob::BlobRef::decode(v) {
+                    blob_arena.free(&blob_ref);
+                }
+            }
+        }
+
+        // DEL the key.
+        ctx.store.del(key);
+        if let Some(w) = ctx.wal {
+            #[cfg(feature = "blob-store")]
+            if crate::core::blob::BlobArena::is_blob_ref(v) {
+                let _ = w.wal_bdel(key);
+            } else {
+                let _ = w.wal_del(key);
+            }
+            #[cfg(not(feature = "blob-store"))]
+            let _ = w.wal_del(key);
+        }
+        if let Some(exp) = ctx.expiry { exp.remove(key); }
+        if let Some(lists) = ctx.lists { lists.remove_key(key); }
+
+        // Auto-decompress blob references for transparent GETDEL.
+        #[cfg(feature = "blob-store")]
+        if crate::core::blob::BlobArena::is_blob_ref(v) {
+            if let Some(blob_arena) = ctx.blob {
+                if let Some(blob_ref) = crate::core::blob::BlobRef::decode(v) {
+                    if let Some(decompressed) = blob_arena.retrieve(&blob_ref) {
+                        RespEncoder::write_bulk_string(out, &decompressed);
+                        return;
+                    }
+                }
+            }
+        }
+
+        RespEncoder::write_bulk_string(out, v);
+    } else {
+        RespEncoder::write_null(out);
+    }
+}
+
+/// Handle `SETNX key value` — set if not exists.
+fn cmd_setnx<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let (Some(key), Some(value)) = (cmd.key(), cmd.value()) else { return err_wrong_args(out); };
+
+    // Check expiration.
+    if let Some(exp) = ctx.expiry {
+        if exp.check_and_purge_if_expired(key) {
+            // Key expired — treat as not existing.
+        }
+    }
+
+    if ctx.store.exists(key) {
+        out.extend_from_slice(b":0\r\n");
+        return;
+    }
+
+    // If the key held a list, clean up the list data.
+    if let Some(lists) = ctx.lists {
+        if list::is_list_value(&ctx.store.get(key).unwrap_or_default()) {
+            lists.remove_key(key);
+        }
+    }
+
+    if ctx.store.set(key, value) {
+        if let Some(w) = ctx.wal {
+            if w.wal_set(key, value).is_err() {
+                out.extend_from_slice(b"-ERR WAL write failed\r\n");
+                return;
+            }
+        }
+        out.extend_from_slice(b":1\r\n");
+    } else {
+        out.extend_from_slice(b"-ERR value too large\r\n");
+    }
+}
+
+/// Handle `PSETEX key ms value` — set with expiry in milliseconds.
+fn cmd_psetex<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let (Some(key), Some(ms_bytes), Some(value)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
+        return err_wrong_args(out);
+    };
+
+    let ms: u64 = match std::str::from_utf8(ms_bytes).ok().and_then(|s| s.parse().ok()) {
+        Some(m) => m,
+        None => {
+            RespEncoder::write_error(out, "ERR value is not an integer or out of range");
+            return;
+        }
+    };
+
+    // If the key held a list, clean up the list data.
+    if let Some(lists) = ctx.lists {
+        if list::is_list_value(&ctx.store.get(key).unwrap_or_default()) {
+            lists.remove_key(key);
+        }
+    }
+
+    // Remove old TTL if overwriting.
+    if let Some(exp) = ctx.expiry {
+        exp.remove(key);
+    }
+
+    if ctx.store.set(key, value) {
+        if let Some(w) = ctx.wal {
+            if w.wal_set(key, value).is_err() {
+                out.extend_from_slice(b"-ERR WAL write failed\r\n");
+                return;
+            }
+        }
+
+        // Apply TTL.
+        if let Some(exp) = ctx.expiry {
+            let ttl = std::time::Duration::from_millis(ms);
+            if let Some(deadline_ms) = exp.expire_with_deadline(key, ttl) {
+                if let Some(w) = ctx.wal {
+                    let _ = w.wal_expire(key, deadline_ms);
+                }
+            }
+        }
+
+        out.extend_from_slice(b"+OK\r\n");
+    } else {
+        out.extend_from_slice(b"-ERR value too large\r\n");
+    }
+}
+
+/// Handle `FLUSHALL` / `FLUSHDB` — clear all data.
+fn cmd_flushall<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    // Collect all keys.
+    let mut all_keys: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = 0usize;
+    loop {
+        let (next_cursor, batch) = ctx.store.scan(cursor, 1000, None);
+        all_keys.extend(batch);
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    // Delete each key.
+    for key in &all_keys {
+        // Free blob ref if applicable.
+        #[cfg(feature = "blob-store")]
+        if let Some(v) = ctx.store.get(key) {
+            if crate::core::blob::BlobArena::is_blob_ref(&v) {
+                if let Some(blob_arena) = ctx.blob {
+                    if let Some(blob_ref) = crate::core::blob::BlobRef::decode(&v) {
+                        blob_arena.free(&blob_ref);
+                    }
+                }
+            }
+        }
+
+        ctx.store.del(key);
+        if let Some(w) = ctx.wal {
+            let _ = w.wal_del(key);
+        }
+        if let Some(lists) = ctx.lists { lists.remove_key(key); }
+    }
+
+    // Clear all TTL entries.
+    if let Some(exp) = ctx.expiry {
+        // Collect all keys with TTLs and remove them.
+        let (mut cursor, mut done) = (0usize, false);
+        while !done {
+            let (next_cursor, batch) = ctx.store.scan(cursor, 1000, None);
+            for key in &batch {
+                exp.remove(key);
+            }
+            if next_cursor == 0 {
+                done = true;
+            } else {
+                cursor = next_cursor;
+            }
+        }
+    }
+
+    // WAL checkpoint if available.
+    if let Some(wal_path) = ctx.wal_path {
+        let _ = checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path);
+        if let Some(w) = ctx.wal {
+            let _ = w.wal_reopen();
+        }
+    }
+
+    out.extend_from_slice(b"+OK\r\n");
+}
+
+// ---------------------------------------------------------------------------
 // Expiration commands
 // ---------------------------------------------------------------------------
 
@@ -1411,6 +2023,126 @@ fn cmd_hmset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerConte
             }
         }
         RespEncoder::write_simple_string(out, "OK");
+    } else {
+        RespEncoder::write_error(out, "ERR hash value too large for inline storage");
+    }
+}
+
+/// Handle `HINCRBY key field delta` — increment hash field by delta.
+fn cmd_hincrby<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let (Some(key), Some(field), Some(delta_bytes)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
+        return err_wrong_args(out);
+    };
+
+    let delta: i64 = match std::str::from_utf8(delta_bytes).ok().and_then(|s| s.parse().ok()) {
+        Some(d) => d,
+        None => { RespEncoder::write_error(out, "ERR value is not an integer"); return; }
+    };
+
+    let mut current = get_current_value(key, ctx);
+
+    if !current.is_empty() && !hash::is_hash_value(&current) {
+        if list::is_list_value(&current) {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+        RespEncoder::write_error(out, WRONGTYPE_ERR);
+        return;
+    }
+
+    // Get current field value (or "0" if not exists).
+    let cur_val = hash::hash_get(&current, field).unwrap_or_else(|| b"0".to_vec());
+    let cur_num: i64 = match std::str::from_utf8(&cur_val).ok().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => {
+            RespEncoder::write_error(out, "ERR hash value is not an integer");
+            return;
+        }
+    };
+
+    let new_val = match cur_num.checked_add(delta) {
+        Some(v) => v,
+        None => {
+            RespEncoder::write_error(out, "ERR increment or decrement would overflow");
+            return;
+        }
+    };
+
+    let new_val_bytes = new_val.to_string().into_bytes();
+
+    match hash::hash_set(&current, field, &new_val_bytes) {
+        Ok(new_data) => {
+            current = new_data;
+        }
+        Err(hash::HashError::NotAHash) => {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+        Err(e) => {
+            RespEncoder::write_error(out, &format!("ERR {}", e));
+            return;
+        }
+    }
+
+    if ctx.store.set(key, &current) {
+        if let Some(w) = ctx.wal {
+            if w.wal_set(key, &current).is_err() {
+                RespEncoder::write_error(out, "ERR WAL write failed");
+                return;
+            }
+        }
+        RespEncoder::write_integer(out, new_val);
+    } else {
+        RespEncoder::write_error(out, "ERR hash value too large for inline storage");
+    }
+}
+
+/// Handle `HSETNX key field value` — set hash field only if field doesn't exist.
+fn cmd_hsetnx<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let (Some(key), Some(field), Some(value)) = (cmd.key(), cmd.arg(2), cmd.arg(3)) else {
+        return err_wrong_args(out);
+    };
+
+    let mut current = get_current_value(key, ctx);
+
+    if !current.is_empty() && !hash::is_hash_value(&current) {
+        if list::is_list_value(&current) {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+        RespEncoder::write_error(out, WRONGTYPE_ERR);
+        return;
+    }
+
+    // If field already exists, return 0.
+    if hash::hash_exists(&current, field) {
+        out.extend_from_slice(b":0\r\n");
+        return;
+    }
+
+    // Field doesn't exist — set it.
+    match hash::hash_set(&current, field, value) {
+        Ok(new_data) => {
+            current = new_data;
+        }
+        Err(hash::HashError::NotAHash) => {
+            RespEncoder::write_error(out, WRONGTYPE_ERR);
+            return;
+        }
+        Err(e) => {
+            RespEncoder::write_error(out, &format!("ERR {}", e));
+            return;
+        }
+    }
+
+    if ctx.store.set(key, &current) {
+        if let Some(w) = ctx.wal {
+            if w.wal_set(key, &current).is_err() {
+                RespEncoder::write_error(out, "ERR WAL write failed");
+                return;
+            }
+        }
+        out.extend_from_slice(b":1\r\n");
     } else {
         RespEncoder::write_error(out, "ERR hash value too large for inline storage");
     }
@@ -1907,6 +2639,41 @@ fn cmd_dbstats<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
 }
 
 // ===========================================================================
+// Checkpoint command (BGSAVE / SAVE)
+// ===========================================================================
+
+/// Handle `BGSAVE` / `SAVE` — perform a checkpoint (compact the WAL).
+///
+/// Writes a new compact WAL containing only the current state and atomically
+/// replaces the old WAL. Also reopens the live WAL writer so that subsequent
+/// writes go to the new compact file.
+fn cmd_bgsave<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
+    let Some(wal_path) = ctx.wal_path else {
+        RespEncoder::write_error(out, "ERR BGSAVE failed: WAL path not available (WAL disabled?)");
+        return;
+    };
+
+    match checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path) {
+        Ok(count) => {
+            // Reopen the live WAL writer so it writes to the new compact file.
+            if let Some(w) = ctx.wal {
+                if let Err(e) = w.wal_reopen() {
+                    eprintln!("[BGSAVE] Warning: WAL reopen failed after checkpoint: {}", e);
+                    // The checkpoint file was still written successfully,
+                    // but the live writer is still pointing to the old file.
+                    // New writes may be lost on crash until server restart.
+                }
+            }
+            let msg = format!("BGSAVE: {} entries written to compact WAL", count);
+            RespEncoder::write_simple_string(out, &msg);
+        }
+        Err(e) => {
+            RespEncoder::write_error(out, &format!("ERR BGSAVE failed: {}", e));
+        }
+    }
+}
+
+// ===========================================================================
 // Similarity commands (SIMHASH, FINDSIM, LSHADD, LSHREM)
 // ===========================================================================
 
@@ -2129,6 +2896,9 @@ mod tests {
             lists: None,
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            authenticated: Cell::new(false),
         };
         let mut out = Vec::new();
 
@@ -2154,6 +2924,9 @@ mod tests {
         let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None,
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            authenticated: Cell::new(false),
         };
         let mut out = Vec::new();
 
@@ -2176,6 +2949,9 @@ mod tests {
             lists: Some(&lists),
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            authenticated: Cell::new(false),
         };
         let mut out = Vec::new();
 
@@ -2215,6 +2991,9 @@ mod tests {
             lists: Some(&lists),
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            authenticated: Cell::new(false),
         };
         let mut out = Vec::new();
 
@@ -2250,6 +3029,9 @@ mod tests {
             lists: Some(&lists),
             #[cfg(feature = "blob-store")]
             blob: None,
+            wal_path: None,
+            password: None,
+            authenticated: Cell::new(false),
         };
         let mut out = Vec::new();
 

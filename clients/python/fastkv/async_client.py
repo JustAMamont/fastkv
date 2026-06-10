@@ -305,6 +305,75 @@ class FastKVAsyncClient:
             keys = (keys,)
         return await self._execute_command("MGET", *keys)
 
+    async def set_nx(self, key: str, value: str) -> bool:
+        """Set *key* to *value* only if *key* does not exist.
+
+        Returns ``True`` if the key was set, ``False`` if it already existed.
+        """
+        result = await self._execute_command("SETNX", key, value)
+        return result == 1
+
+    async def get_set(self, key: str, value: str) -> Optional[bytes]:
+        """Atomically set *key* to *value* and return the old value."""
+        return await self._execute_command("GETSET", key, value)
+
+    async def get_del(self, key: str) -> Optional[bytes]:
+        """Atomically get the value of *key* and delete the key."""
+        return await self._execute_command("GETDEL", key)
+
+    async def type_of(self, key: str) -> str:
+        """Return the type of value stored at *key*.
+
+        Returns one of ``"string"``, ``"hash"``, ``"list"``, or ``"none"``.
+        """
+        result = await self._execute_command("TYPE", key)
+        return result.decode("utf-8") if isinstance(result, bytes) else str(result)
+
+    async def rename(self, key: str, new_key: str) -> bool:
+        """Rename *key* to *new_key*.  Returns ``True`` on success."""
+        result = await self._execute_command("RENAME", key, new_key)
+        return result == b"OK" or result == "OK"
+
+    async def pset_ex(self, key: str, value: str, milliseconds: int) -> bool:
+        """Set *key* to *value* with an expiry of *milliseconds*."""
+        result = await self._execute_command("PSETEX", key, milliseconds, value)
+        return result == b"OK" or result == "OK"
+
+    async def unlink(self, keys: Any) -> int:
+        """Asynchronously delete one or more keys.  Returns count removed."""
+        if isinstance(keys, (str, bytes)):
+            keys = (keys,)
+        return await self._execute_command("UNLINK", *keys)
+
+    # =========================================================================
+    # Key management / server commands
+    # =========================================================================
+
+    async def flush_all(self) -> bool:
+        """Remove all keys from all databases.  Returns ``True`` on success."""
+        result = await self._execute_command("FLUSHALL")
+        return result == b"OK" or result == "OK"
+
+    async def flush_db(self) -> bool:
+        """Remove all keys from current database.  Returns ``True`` on success."""
+        result = await self._execute_command("FLUSHDB")
+        return result == b"OK" or result == "OK"
+
+    async def auth(self, password: str) -> bool:
+        """Authenticate to the server.  Returns ``True`` on success."""
+        result = await self._execute_command("AUTH", password)
+        return result == b"OK" or result == "OK"
+
+    async def save(self) -> bool:
+        """Synchronously save the dataset to disk.  Returns ``True`` on success."""
+        result = await self._execute_command("SAVE")
+        return result == b"OK" or result == "OK"
+
+    async def bgsave(self) -> bool:
+        """Asynchronously save the dataset to disk.  Returns ``True`` on success."""
+        result = await self._execute_command("BGSAVE")
+        return result == b"OK" or result == "OK"
+
     # =========================================================================
     # TTL commands
     # =========================================================================
@@ -379,6 +448,18 @@ class FastKVAsyncClient:
             flat += [f, v]
         result = await self._execute_command("HMSET", key, *flat)
         return result == b"OK" or result == "OK"
+
+    async def h_incr_by(self, key: str, field: str, delta: int) -> int:
+        """Increment the integer value of *field* in hash at *key* by *delta*."""
+        return await self._execute_command("HINCRBY", key, field, delta)
+
+    async def h_set_nx(self, key: str, field: str, value: str) -> bool:
+        """Set *field* in hash at *key* only if *field* does not exist.
+
+        Returns ``True`` if the field was set, ``False`` if it already existed.
+        """
+        result = await self._execute_command("HSETNX", key, field, value)
+        return result == 1
 
     # =========================================================================
     # List commands

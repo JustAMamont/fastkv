@@ -384,6 +384,106 @@ class FastKVClient:
             keys = (keys,)
         return self._execute_command("MGET", *keys)
 
+    def set_nx(self, key: str, value: str) -> bool:
+        """Set *key* to *value* only if *key* does not exist.
+
+        Returns ``True`` if the key was set, ``False`` if it already existed.
+        """
+        result = self._execute_command("SETNX", key, value)
+        return result == 1
+
+    def get_set(self, key: str, value: str) -> Optional[bytes]:
+        """Atomically set *key* to *value* and return the old value.
+
+        Returns ``None`` if the key did not exist.
+        """
+        return self._execute_command("GETSET", key, value)
+
+    def get_del(self, key: str) -> Optional[bytes]:
+        """Atomically get the value of *key* and delete the key.
+
+        Returns ``None`` if the key did not exist.
+        """
+        return self._execute_command("GETDEL", key)
+
+    def type_of(self, key: str) -> str:
+        """Return the type of value stored at *key*.
+
+        Returns one of ``"string"``, ``"hash"``, ``"list"``, or ``"none"``.
+        """
+        result = self._execute_command("TYPE", key)
+        return result.decode("utf-8") if isinstance(result, bytes) else str(result)
+
+    def rename(self, key: str, new_key: str) -> bool:
+        """Rename *key* to *new_key*.
+
+        Returns ``True`` on success.
+        """
+        result = self._execute_command("RENAME", key, new_key)
+        return result == b"OK" or result == "OK"
+
+    def pset_ex(self, key: str, value: str, milliseconds: int) -> bool:
+        """Set *key* to *value* with an expiry of *milliseconds*.
+
+        Returns ``True`` on success.
+        """
+        result = self._execute_command("PSETEX", key, milliseconds, value)
+        return result == b"OK" or result == "OK"
+
+    def unlink(self, keys: Any) -> int:
+        """Asynchronously delete one or more keys.
+
+        *keys* can be a single string or an iterable of strings.
+        Returns the number of keys that were removed.
+        """
+        if isinstance(keys, (str, bytes)):
+            keys = (keys,)
+        return self._execute_command("UNLINK", *keys)
+
+    # =========================================================================
+    # Key management / server commands
+    # =========================================================================
+
+    def flush_all(self) -> bool:
+        """Remove all keys from all databases.
+
+        Returns ``True`` on success.
+        """
+        result = self._execute_command("FLUSHALL")
+        return result == b"OK" or result == "OK"
+
+    def flush_db(self) -> bool:
+        """Remove all keys from the current database.
+
+        Returns ``True`` on success.
+        """
+        result = self._execute_command("FLUSHDB")
+        return result == b"OK" or result == "OK"
+
+    def auth(self, password: str) -> bool:
+        """Authenticate to the server.
+
+        Returns ``True`` on success.
+        """
+        result = self._execute_command("AUTH", password)
+        return result == b"OK" or result == "OK"
+
+    def save(self) -> bool:
+        """Synchronously save the dataset to disk (checkpoint).
+
+        Returns ``True`` on success.
+        """
+        result = self._execute_command("SAVE")
+        return result == b"OK" or result == "OK"
+
+    def bgsave(self) -> bool:
+        """Asynchronously save the dataset to disk (background checkpoint).
+
+        Returns ``True`` on success.
+        """
+        result = self._execute_command("BGSAVE")
+        return result == b"OK" or result == "OK"
+
     # =========================================================================
     # TTL commands
     # =========================================================================
@@ -484,6 +584,21 @@ class FastKVClient:
             flat.append(v)
         result = self._execute_command("HMSET", key, *flat)
         return result == b"OK" or result == "OK"
+
+    def h_incr_by(self, key: str, field: str, delta: int) -> int:
+        """Increment the integer value of *field* in the hash at *key* by *delta*.
+
+        Returns the new value of the field.
+        """
+        return self._execute_command("HINCRBY", key, field, delta)
+
+    def h_set_nx(self, key: str, field: str, value: str) -> bool:
+        """Set *field* in the hash at *key* to *value* only if *field* does not exist.
+
+        Returns ``True`` if the field was set, ``False`` if it already existed.
+        """
+        result = self._execute_command("HSETNX", key, field, value)
+        return result == 1
 
     # =========================================================================
     # List commands

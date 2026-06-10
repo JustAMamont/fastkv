@@ -13,6 +13,7 @@ use fast_kv::{
 use fast_kv::{BlobArena, WalSegment, SegmentConfig, recover_segments};
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Instant;
 
@@ -50,6 +51,7 @@ fn print_usage() {
     println!("  help                 Show this help");
     println!();
     println!("Server options:");
+    println!("  server <port>        Shorthand: fast_kv server 8379");
     println!("  --host <addr>        Bind address (default: 0.0.0.0)");
     println!("  --port <port>        Listen port (default: 6379)");
     println!("  --capacity <num>     Hash table buckets (default: 100000)");
@@ -57,7 +59,10 @@ fn print_usage() {
     println!("                       Supported: 64, 128, 256, 512");
     println!("  --dir <path>         Data directory for WAL (default: ./fastkv_data)");
     println!("  --fsync <policy>     fsync policy: always | everysec | never (default: everysec)");
+    println!("  --checkpoint-interval <seconds>  Auto-checkpoint interval in seconds (default: disabled)");
     println!("  --mode <backend>     Server backend: tokio (default)");
+    println!("  --requirepass <pw>   Require clients to authenticate with AUTH");
+    println!("  --max-connections <N>  Max concurrent clients (default: 10000)");
     #[cfg(feature = "blob-store")]
     println!("  --wal-compress       Enable compressed segment-based WAL (saves disk for high-volume)");
     #[cfg(feature = "blob-store")]
@@ -75,7 +80,9 @@ fn print_usage() {
     println!();
     println!("Examples:");
     println!("  fast_kv server                        # 0.0.0.0:6379, WAL in ./fastkv_data");
-    println!("  fast_kv server --port 6380             # custom port");
+    println!("  fast_kv server 8379                   # shorthand: listen on port 8379");
+    println!("  fast_kv server --port 6380             # custom port (long form)");
+    println!("  fast_kv server 8379 --host 127.0.0.1   # positional port + flags");
     println!("  fast_kv server --host 127.0.0.1 --port 6380");
     println!("  fast_kv server --dir /var/lib/fastkv --fsync always");
     println!("  fast_kv server --capacity 1000000      # 1M buckets for high-cardinality workloads");
@@ -126,6 +133,10 @@ fn has_flag(args: &[String], name: &str) -> bool {
 const SUPPORTED_INLINE_SIZES: &[usize] = &[64, 128, 256, 512];
 
 fn run_server(args: &[String]) {
+    // --- Positional port: if the first arg after "server" is a bare number, use it as port ---
+    let positional_port: Option<u16> = args.first()
+        .and_then(|s| s.parse::<u16>().ok());
+
     // --- Parse flags, fall back to env vars, then defaults ---
     let host = get_flag(args, "host")
         .or_else(|| env::var("FASTKV_HOST").ok())
@@ -134,6 +145,7 @@ fn run_server(args: &[String]) {
     let port: u16 = get_flag(args, "port")
         .or_else(|| env::var("FASTKV_PORT").ok())
         .and_then(|s| s.parse().ok())
+        .or(positional_port)
         .unwrap_or(6379);
 
     let data_dir = get_flag(args, "dir")
@@ -169,6 +181,18 @@ fn run_server(args: &[String]) {
     #[cfg(not(feature = "blob-store"))]
     let wal_segment_size_mb: u64 = 64;
 
+    let password: Option<String> = get_flag(args, "requirepass")
+        .or_else(|| env::var("FASTKV_REQUIREPASS").ok());
+
+    let max_connections: u32 = get_flag(args, "max-connections")
+        .or_else(|| env::var("FASTKV_MAX_CONNECTIONS").ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10000);
+
+    let checkpoint_interval: Option<u64> = get_flag(args, "checkpoint-interval")
+        .or_else(|| env::var("FASTKV_CHECKPOINT_INTERVAL").ok())
+        .and_then(|s| s.parse().ok());
+
     let fsync_policy = match fsync_str.as_str() {
         "always" => FsyncPolicy::Always,
         "never" => FsyncPolicy::Never,
@@ -192,10 +216,21 @@ fn run_server(args: &[String]) {
     println!("  dir:         {}", data_dir);
     println!("  fsync:       {:?}", fsync_policy);
     println!("  mode:        {}", mode);
+    if password.is_some() {
+        println!("  requirepass: *******");
+    } else {
+        println!("  requirepass: (disabled)");
+    }
+    println!("  max-connections: {}", max_connections);
     #[cfg(feature = "blob-store")]
     println!("  blob-store:  enabled (zstd compression)");
     if wal_compress {
         println!("  wal-compress: enabled (segment size: {} MB)", wal_segment_size_mb);
+    }
+    if let Some(interval) = checkpoint_interval {
+        println!("  checkpoint-interval: {} seconds", interval);
+    } else {
+        println!("  checkpoint-interval: disabled");
     }
 
     // --- Data directory ---
@@ -205,10 +240,10 @@ fn run_server(args: &[String]) {
 
     // --- Dispatch to the monomorphized server for the chosen inline size ---
     match inline_size {
-        64  => run_server_with_n::<64>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb),
-        128 => run_server_with_n::<128>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb),
-        256 => run_server_with_n::<256>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb),
-        512 => run_server_with_n::<512>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb),
+        64  => run_server_with_n::<64>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, checkpoint_interval, password, max_connections),
+        128 => run_server_with_n::<128>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, checkpoint_interval, password, max_connections),
+        256 => run_server_with_n::<256>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, checkpoint_interval, password, max_connections),
+        512 => run_server_with_n::<512>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, checkpoint_interval, password, max_connections),
         _   => unreachable!(), // validated above
     }
 }
@@ -227,6 +262,9 @@ fn run_server_with_n<const N: usize>(
     mode: String,
     wal_compress: bool,
     wal_segment_size_mb: u64,
+    checkpoint_interval: Option<u64>,
+    password: Option<String>,
+    max_connections: u32,
 ) {
     // Suppress unused-variable warnings when blob-store is disabled.
     #[cfg(not(feature = "blob-store"))]
@@ -432,6 +470,34 @@ fn run_server_with_n<const N: usize>(
 
     println!();
 
+    // Determine the WAL file path for checkpoint/BGSAVE.
+    let wal_path_buf: Option<std::path::PathBuf> = if wal_compress {
+        // Segment-based WAL — checkpoint uses the data directory.
+        Some(std::path::PathBuf::from(&data_dir))
+    } else if wal.is_some() {
+        Some(std::path::PathBuf::from(format!("{}/fastkv.wal", data_dir)))
+    } else {
+        None
+    };
+
+    // --- Periodic checkpoint thread ---
+    if let Some(interval) = checkpoint_interval {
+        if let Some(ref wp) = wal_path_buf {
+            let store_clone = Arc::clone(&store);
+            let expiry_clone = expiry.as_ref().map(Arc::clone);
+            let wp_clone = wp.clone();
+            let _checkpoint_handle = fast_kv::core::checkpoint::spawn_checkpoint_thread(
+                store_clone,
+                expiry_clone,
+                wp_clone,
+                interval,
+            );
+            println!("  Checkpoint thread started (interval: {}s)", interval);
+        } else {
+            eprintln!("  Warning: --checkpoint-interval set but no WAL path available; checkpoint disabled");
+        }
+    }
+
     // Convert WAL references to trait objects for the server.
     #[cfg(feature = "blob-store")]
     let wal_writer: Option<Arc<dyn fast_kv::WalWriter>> = if let Some(ref seg) = wal_seg {
@@ -451,10 +517,13 @@ fn run_server_with_n<const N: usize>(
             use fast_kv::core::server::IoUringServer;
             println!("Starting FastKV io_uring server on {}:{} (inline-size={})...", host, port, N);
             #[cfg(feature = "blob-store")]
-            let server = IoUringServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob);
+            let server = IoUringServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob, wal_path_buf, password, max_connections);
             #[cfg(not(feature = "blob-store"))]
-            let server = IoUringServer::<N>::with_components_no_blob(port, host, store, wal_writer, expiry, lists);
-            server.run();
+            let server = IoUringServer::<N>::with_components_no_blob(port, host, store, wal_writer, expiry, lists, wal_path_buf, password, max_connections);
+            if let Err(e) = server.run() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
         #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
         "io_uring" => {
@@ -464,12 +533,19 @@ fn run_server_with_n<const N: usize>(
         _ => {
             use fast_kv::core::server::TokioServer;
             println!("Starting FastKV server on {}:{} (inline-size={})...", host, port, N);
+
+            // Graceful shutdown flag — shared between the signal handler and the server.
+            let shutting_down = Arc::new(AtomicBool::new(false));
+
             #[cfg(feature = "blob-store")]
-            let server = TokioServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob);
+            let server = TokioServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob, wal_path_buf, password, max_connections, Arc::clone(&shutting_down));
             #[cfg(not(feature = "blob-store"))]
-            let server = TokioServer::<N>::with_components_no_blob(port, host, store, wal_writer, expiry, lists);
+            let server = TokioServer::<N>::with_components_no_blob(port, host, store, wal_writer, expiry, lists, wal_path_buf, password, max_connections, Arc::clone(&shutting_down));
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(server.run());
+            if let Err(e) = rt.block_on(server.run()) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }

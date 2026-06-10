@@ -286,6 +286,31 @@ impl<const N: usize> ExpirationManager<N> {
         self.len() == 0
     }
 
+    /// Return all keys with TTLs and their absolute deadlines as milliseconds
+    /// since UNIX epoch.
+    ///
+    /// This is used by the checkpoint/BGSAVE mechanism to persist TTL state
+    /// into the compact WAL. Expired entries are filtered out and purged.
+    pub fn get_all_deadlines_ms(&self) -> Vec<(Vec<u8>, u64)> {
+        let now = Instant::now();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let map = self.deadlines.read().unwrap_or_else(|e| e.into_inner());
+        let mut result = Vec::with_capacity(map.len());
+        for (key, deadline) in map.iter() {
+            if let Some(remaining) = deadline.checked_duration_since(now) {
+                let deadline_ms = now_ms.saturating_add(remaining.as_millis() as u64);
+                result.push((key.clone(), deadline_ms));
+            }
+            // If the deadline is in the past, we skip it — the active expiry
+            // thread or lazy check will clean it up.
+        }
+        result
+    }
+
     /// Signal the active-expiration thread (if any) to stop.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);

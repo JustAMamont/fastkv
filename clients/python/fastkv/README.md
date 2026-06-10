@@ -80,6 +80,8 @@ with FastKVClient("localhost", 6379) as c:
 | `hkeys(key)` / `hvals(key)` | All fields / all values |
 | `hmget(key, *fields)` | Get multiple fields |
 | `hmset(key, mapping)` | Set multiple fields |
+| `hincrby(key, field, delta)` | Increment hash field by delta |
+| `hsetnx(key, field, value)` | Set hash field only if not exists |
 
 ### List
 

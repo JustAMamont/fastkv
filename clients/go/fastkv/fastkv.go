@@ -616,6 +616,65 @@ func (c *Client) MGet(keys ...string) ([]string, error) {
         return c.doStringSlice(args...)
 }
 
+// SetNx sets key to value only if the key does not already exist. It sends the
+// SETNX command and returns true if the key was set, false otherwise.
+func (c *Client) SetNx(key, value string) (bool, error) {
+        return c.doBool("SETNX", key, value)
+}
+
+// GetSet atomically sets key to value and returns the old value stored at key.
+// If the key did not exist, ErrNil is returned.
+func (c *Client) GetSet(key, value string) (string, error) {
+        return c.doString("GETSET", key, value)
+}
+
+// GetDel returns the value of key and deletes the key. If the key does not exist
+// ErrNil is returned.
+func (c *Client) GetDel(key string) (string, error) {
+        return c.doString("GETDEL", key)
+}
+
+// Type returns the string representation of the type of the value stored at key.
+// The possible return values are "string", "list", "hash", "set", "zset", or "none".
+func (c *Client) Type(key string) (string, error) {
+        return c.doString("TYPE", key)
+}
+
+// Rename renames key to newKey. It returns an error if the key does not exist.
+func (c *Client) Rename(key, newKey string) error {
+        r, err := c.do("RENAME", key, newKey)
+        if err != nil {
+                return err
+        }
+        if r.Type == respError {
+                return &RespError{Msg: r.Str}
+        }
+        return nil
+}
+
+// PsetEx sets key to hold the string value and sets the key to timeout after the
+// given number of milliseconds.
+func (c *Client) PsetEx(key string, ms int, value string) error {
+        r, err := c.do("PSETEX", key, strconv.Itoa(ms), value)
+        if err != nil {
+                return err
+        }
+        if r.Type == respError {
+                return &RespError{Msg: r.Str}
+        }
+        return nil
+}
+
+// Unlink removes the specified keys. It is similar to Del but performs the
+// actual memory reclaiming in a different thread. It returns the number of keys
+// that were removed.
+func (c *Client) Unlink(keys ...string) (int64, error) {
+        args := make([]string, 1+len(keys))
+        args[0] = "UNLINK"
+        copy(args[1:], keys)
+        return c.doInt(args...)
+}
+
 // ---------------------------------------------------------------------------
 // TTL commands
 // ---------------------------------------------------------------------------
@@ -740,6 +799,19 @@ func (c *Client) HMSet(key string, fields map[string]string) error {
         return nil
 }
 
+// HIncrBy increments the integer value of field in the hash stored at key by
+// delta. If key or field do not exist, they are created with a value of 0
+// before the operation. It returns the new value of field.
+func (c *Client) HIncrBy(key, field string, delta int64) (int64, error) {
+        return c.doInt("HINCRBY", key, field, strconv.FormatInt(delta, 10))
+}
+
+// HSetNx sets field in the hash stored at key to value only if the field does
+// not already exist. It returns true if the field was set, false otherwise.
+func (c *Client) HSetNx(key, field, value string) (bool, error) {
+        return c.doBool("HSETNX", key, field, value)
+}
+
 // ---------------------------------------------------------------------------
 // List commands
 // ---------------------------------------------------------------------------
@@ -824,6 +896,70 @@ func (c *Client) LTrim(key string, start, stop int) error {
 // LSet sets the element at index to element in the list stored at key.
 func (c *Client) LSet(key string, index int, element string) error {
         r, err := c.do("LSET", key, strconv.Itoa(index), element)
+        if err != nil {
+                return err
+        }
+        if r.Type == respError {
+                return &RespError{Msg: r.Str}
+        }
+        return nil
+}
+
+// ---------------------------------------------------------------------------
+// Server commands
+// ---------------------------------------------------------------------------
+
+// FlushAll removes all keys from all databases.
+func (c *Client) FlushAll() error {
+        r, err := c.do("FLUSHALL")
+        if err != nil {
+                return err
+        }
+        if r.Type == respError {
+                return &RespError{Msg: r.Str}
+        }
+        return nil
+}
+
+// FlushDB removes all keys from the currently selected database.
+func (c *Client) FlushDB() error {
+        r, err := c.do("FLUSHDB")
+        if err != nil {
+                return err
+        }
+        if r.Type == respError {
+                return &RespError{Msg: r.Str}
+        }
+        return nil
+}
+
+// Auth authenticates the connection using the given password.
+func (c *Client) Auth(password string) error {
+        r, err := c.do("AUTH", password)
+        if err != nil {
+                return err
+        }
+        if r.Type == respError {
+                return &RespError{Msg: r.Str}
+        }
+        return nil
+}
+
+// Save performs a synchronous save of the dataset to disk.
+func (c *Client) Save() error {
+        r, err := c.do("SAVE")
+        if err != nil {
+                return err
+        }
+        if r.Type == respError {
+                return &RespError{Msg: r.Str}
+        }
+        return nil
+}
+
+// BgSave starts an asynchronous save of the dataset to disk in the background.
+func (c *Client) BgSave() error {
+        r, err := c.do("BGSAVE")
         if err != nil {
                 return err
         }

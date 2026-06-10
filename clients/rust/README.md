@@ -65,6 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `hkeys(k)` / `hvals(k)` | `Vec<String>` | Field names / values |
 | `hmget(k, fields)` | `Vec<Option<String>>` | Get multiple fields |
 | `hmset(k, pairs)` | `()` | Set multiple fields |
+| `hincr_by(k, f, delta)` | `i64` | Increment hash field |
+| `hset_nx(k, f, v)` | `i64` | Set if not exists |
 | `lpush(k, elems)` / `rpush(k, elems)` | `i64` | Push to list |
 | `lpop(k)` / `rpop(k)` | `Option<String>` | Pop from list |
 | `llen(k)` | `i64` | List length |

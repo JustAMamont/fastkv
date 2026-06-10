@@ -542,6 +542,26 @@ impl Wal {
         file.sync_data()?;
         Ok(())
     }
+
+    /// Re-open the WAL file at the same path in append mode.
+    ///
+    /// This is used after a checkpoint/BGSAVE replaces the WAL file on disk.
+    /// The current file handle is closed and a new one is opened, so that
+    /// subsequent writes go to the new (compact) WAL file.
+    pub fn reopen(&self) -> Result<(), WalError> {
+        let mut file = self.file.lock().map_err(|e| {
+            WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })?;
+        // Sync and close the old file.
+        let _ = file.sync_data();
+        // Open the file at the same path in append mode.
+        let new_file = OpenOptions::new()
+            .append(true)
+            .read(true)
+            .open(&self.path)?;
+        *file = new_file;
+        Ok(())
+    }
 }
 
 impl Drop for Wal {
@@ -572,6 +592,8 @@ pub trait WalWriter: Send + Sync {
     fn wal_list_op(&self, key: &[u8], payload: &[u8]) -> Result<(), WalError>;
     /// Force an fsync.
     fn wal_sync_now(&self) -> Result<(), WalError>;
+    /// Re-open the WAL file (after checkpoint rotation).
+    fn wal_reopen(&self) -> Result<(), WalError>;
 }
 
 impl WalWriter for Wal {
@@ -582,6 +604,7 @@ impl WalWriter for Wal {
     fn wal_bdel(&self, key: &[u8]) -> Result<(), WalError> { self.bdel(key) }
     fn wal_list_op(&self, key: &[u8], payload: &[u8]) -> Result<(), WalError> { self.list_op(key, payload) }
     fn wal_sync_now(&self) -> Result<(), WalError> { self.sync_now() }
+    fn wal_reopen(&self) -> Result<(), WalError> { self.reopen() }
 }
 
 // ---------------------------------------------------------------------------
