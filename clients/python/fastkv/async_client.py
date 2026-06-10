@@ -48,12 +48,14 @@ class FastKVAsyncClient:
         host: str = "localhost",
         port: int = 6379,
         socket_timeout: Optional[float] = 5,
+        auto_connect: bool = False,
     ) -> None:
         self._host = host
         self._port = port
         self._socket_timeout = socket_timeout
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
+        self._auto_connect = auto_connect
 
     # -- connection lifecycle -------------------------------------------------
 
@@ -80,10 +82,18 @@ class FastKVAsyncClient:
                 pass
             self._reader = self._writer = None
 
+    async def aclose(self) -> None:
+        """Async close — alias for :meth:`close`.  Compatible with ``async with``
+        and frameworks that expect ``aclose()`` (e.g. ``anyio``, ``trio``)."""
+        await self.close()
+
     async def _ensure_connected(self) -> None:
-        """Raise if not connected."""
+        """Ensure we are connected, auto-connecting if configured."""
         if self._reader is None or self._writer is None:
-            raise FastKVConnectionError("Not connected — call connect() first")
+            if self._auto_connect:
+                await self.connect()
+            else:
+                raise FastKVConnectionError("Not connected — call connect() first")
 
     async def _send_all(self, data: bytes) -> None:
         """Send all *data* bytes."""

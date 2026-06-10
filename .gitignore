@@ -7,4 +7,3 @@ criterion/
 /fastkv_data
 *.o
 *.d
-TODO-checkpoints.md
