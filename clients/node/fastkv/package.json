@@ -1,6 +1,6 @@
 {
   "name": "fastkv-client",
-  "version": "1.0.0",
+  "version": "1.2.1",
   "description": "Lightweight Node.js client for FastKV — a Redis-compatible KV store speaking RESP over TCP",
   "main": "index.js",
   "scripts": {

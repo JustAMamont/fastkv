@@ -20,7 +20,6 @@ use crate::core::wal::WalWriter;
 use crate::core::checkpoint;
 #[cfg(feature = "blob-store")]
 use crate::core::blob::BlobArena;
-use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -56,7 +55,11 @@ pub struct ServerContext<'a, const N: usize = DEFAULT_INLINE_SIZE> {
     /// issuing other commands.
     pub password: Option<&'a String>,
     /// Whether this connection has successfully authenticated.
-    pub authenticated: Cell<bool>,
+    ///
+    /// Uses `Arc<AtomicBool>` so the authentication state can be shared
+    /// safely across `spawn_blocking` invocations (each command batch may
+    /// run on a different blocking thread).
+    pub authenticated: &'a AtomicBool,
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +350,129 @@ impl<const N: usize> Default for TokioServer<N> {
 // Client handler
 // ---------------------------------------------------------------------------
 
+/// Owned bundle of shared components passed into `spawn_blocking` so that
+/// command processing (which includes synchronous WAL writes) runs on a
+/// blocking thread instead of an async worker thread.
+///
+/// This is the key fix for the concurrency issue where heavy write load
+/// (e.g. from a farmer process making many BSET/SET calls) would starve
+/// read commands (SCAN, GET) by blocking all tokio worker threads on WAL
+/// `std::sync::Mutex` + synchronous `file.write_all()` / `fsync`.
+#[cfg(feature = "blob-store")]
+struct OwnedCtx<const N: usize> {
+    store: Arc<KvStoreLockFree<N>>,
+    wal: Option<Arc<dyn WalWriter>>,
+    expiry: Option<Arc<ExpirationManager<N>>>,
+    lists: Option<Arc<ListManager<N>>>,
+    blob: Option<Arc<BlobArena>>,
+    wal_path: Option<std::path::PathBuf>,
+    password: Option<String>,
+    authenticated: Arc<AtomicBool>,
+}
+
+/// Owned bundle (no blob-store variant).
+#[cfg(not(feature = "blob-store"))]
+struct OwnedCtx<const N: usize> {
+    store: Arc<KvStoreLockFree<N>>,
+    wal: Option<Arc<dyn WalWriter>>,
+    expiry: Option<Arc<ExpirationManager<N>>>,
+    lists: Option<Arc<ListManager<N>>>,
+    wal_path: Option<std::path::PathBuf>,
+    password: Option<String>,
+    authenticated: Arc<AtomicBool>,
+}
+
+/// Process all complete commands in *buffer* on a blocking thread.
+///
+/// Returns `(response_bytes, should_close, remaining_bytes)`.
+///
+/// This function is designed to be called via `tokio::task::spawn_blocking`.
+/// It builds a transient [`ServerContext`] from the owned [`OwnedCtx`] and
+/// processes every complete command in *buffer*, accumulating responses.
+/// Incomplete trailing bytes (partial command) are returned as `remaining_bytes`
+/// so the caller can carry them over to the next read.
+#[cfg(feature = "blob-store")]
+fn process_buffer<const N: usize>(
+    ctx_owned: OwnedCtx<N>,
+    mut buffer: Vec<u8>,
+) -> (Vec<u8>, bool, Vec<u8>) {
+    let ctx = ServerContext::<N> {
+        store: &ctx_owned.store,
+        wal: ctx_owned.wal.as_deref(),
+        expiry: ctx_owned.expiry.as_deref(),
+        lists: ctx_owned.lists.as_deref(),
+        blob: ctx_owned.blob.as_deref(),
+        wal_path: ctx_owned.wal_path.as_deref(),
+        password: ctx_owned.password.as_ref(),
+        authenticated: &ctx_owned.authenticated,
+    };
+
+    let mut resp_buf = Vec::with_capacity(INITIAL_RESPONSE_SIZE);
+    let mut consumed = 0;
+    let mut should_close = false;
+
+    while consumed < buffer.len() {
+        match parse_command_bounds(&buffer[consumed..]) {
+            Some((len, is_inline)) => {
+                let cmd_data = &buffer[consumed..consumed + len];
+                should_close = process_command_into(cmd_data, &ctx, &mut resp_buf, is_inline);
+                consumed += len;
+                if should_close { break; }
+            }
+            None => break,
+        }
+    }
+
+    // Drain consumed bytes; keep the unconsumed tail (partial command).
+    buffer.drain(..consumed);
+
+    (resp_buf, should_close, buffer)
+}
+
+/// Process all complete commands in *buffer* on a blocking thread (no blob-store).
+#[cfg(not(feature = "blob-store"))]
+fn process_buffer<const N: usize>(
+    ctx_owned: OwnedCtx<N>,
+    mut buffer: Vec<u8>,
+) -> (Vec<u8>, bool, Vec<u8>) {
+    let ctx = ServerContext::<N> {
+        store: &ctx_owned.store,
+        wal: ctx_owned.wal.as_deref(),
+        expiry: ctx_owned.expiry.as_deref(),
+        lists: ctx_owned.lists.as_deref(),
+        wal_path: ctx_owned.wal_path.as_deref(),
+        password: ctx_owned.password.as_ref(),
+        authenticated: &ctx_owned.authenticated,
+    };
+
+    let mut resp_buf = Vec::with_capacity(INITIAL_RESPONSE_SIZE);
+    let mut consumed = 0;
+    let mut should_close = false;
+
+    while consumed < buffer.len() {
+        match parse_command_bounds(&buffer[consumed..]) {
+            Some((len, is_inline)) => {
+                let cmd_data = &buffer[consumed..consumed + len];
+                should_close = process_command_into(cmd_data, &ctx, &mut resp_buf, is_inline);
+                consumed += len;
+                if should_close { break; }
+            }
+            None => break,
+        }
+    }
+
+    buffer.drain(..consumed);
+
+    (resp_buf, should_close, buffer)
+}
+
 /// Per-connection state and main read/write loop (with blob-store).
+///
+/// **Concurrency model**: socket I/O (read/write) runs on the async worker
+/// thread, but command processing (which may do synchronous WAL writes) is
+/// dispatched to `tokio::task::spawn_blocking`. This ensures that heavy
+/// write load from one connection cannot starve read commands (SCAN, GET)
+/// on other connections by blocking all async worker threads on WAL I/O.
 #[cfg(feature = "blob-store")]
 async fn handle_client<const N: usize>(
     mut socket: TcpStream,
@@ -363,18 +488,7 @@ async fn handle_client<const N: usize>(
 ) {
     let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
-    let mut resp_buf = Vec::with_capacity(INITIAL_RESPONSE_SIZE);
-
-    let ctx = ServerContext::<N> {
-        store: &store,
-        wal: wal.as_deref(),
-        expiry: expiry.as_deref(),
-        lists: lists.as_deref(),
-        blob: blob.as_deref(),
-        wal_path: wal_path.as_deref(),
-        password: password.as_ref(),
-        authenticated: Cell::new(false),
-    };
+    let authenticated = Arc::new(AtomicBool::new(false));
 
     loop {
         // Stop processing when the server is shutting down.
@@ -389,22 +503,44 @@ async fn handle_client<const N: usize>(
         };
 
         leftover.extend_from_slice(&read_buf[..n]);
-        resp_buf.clear();
 
-        let mut consumed = 0;
-        let mut should_close = false;
-        while consumed < leftover.len() {
-            match parse_command_bounds(&leftover[consumed..]) {
-                Some((len, is_inline)) => {
-                    let cmd_data = &leftover[consumed..consumed + len];
-                    should_close = process_command_into(cmd_data, &ctx, &mut resp_buf, is_inline);
-                    consumed += len;
-                    if should_close { break; }
-                }
-                None => break,
-            }
+        // Skip the spawn_blocking round-trip if there is nothing to process yet.
+        if leftover.is_empty() {
+            continue;
         }
-        leftover.drain(..consumed);
+
+        // Build the owned context for the blocking closure.
+        let ctx_owned = OwnedCtx::<N> {
+            store: Arc::clone(&store),
+            wal: wal.clone(),
+            expiry: expiry.clone(),
+            lists: lists.clone(),
+            blob: blob.clone(),
+            wal_path: wal_path.clone(),
+            password: password.clone(),
+            authenticated: Arc::clone(&authenticated),
+        };
+
+        // Move command processing to a blocking thread so that synchronous
+        // WAL writes (std::sync::Mutex + file.write_all + optional fsync)
+        // do not block the async worker thread. This is critical for
+        // concurrent read commands (SCAN, GET) to make progress while
+        // other connections are doing heavy writes.
+        let buffer_to_process = std::mem::take(&mut leftover);
+        let process_result = tokio::task::spawn_blocking(move || {
+            process_buffer(ctx_owned, buffer_to_process)
+        }).await;
+
+        let (resp_buf, should_close, remaining) = match process_result {
+            Ok(result) => result,
+            Err(join_err) => {
+                eprintln!("[{}] Command processing task panicked: {}", addr, join_err);
+                break;
+            }
+        };
+
+        // Carry over unconsumed bytes (partial command) to the next iteration.
+        leftover = remaining;
 
         if !resp_buf.is_empty() {
             if let Err(e) = socket.write_all(&resp_buf).await {
@@ -430,17 +566,7 @@ async fn handle_client<const N: usize>(
 ) {
     let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
-    let mut resp_buf = Vec::with_capacity(INITIAL_RESPONSE_SIZE);
-
-    let ctx = ServerContext::<N> {
-        store: &store,
-        wal: wal.as_deref(),
-        expiry: expiry.as_deref(),
-        lists: lists.as_deref(),
-        wal_path: wal_path.as_deref(),
-        password: password.as_ref(),
-        authenticated: Cell::new(false),
-    };
+    let authenticated = Arc::new(AtomicBool::new(false));
 
     loop {
         // Stop processing when the server is shutting down.
@@ -455,22 +581,35 @@ async fn handle_client<const N: usize>(
         };
 
         leftover.extend_from_slice(&read_buf[..n]);
-        resp_buf.clear();
 
-        let mut consumed = 0;
-        let mut should_close = false;
-        while consumed < leftover.len() {
-            match parse_command_bounds(&leftover[consumed..]) {
-                Some((len, is_inline)) => {
-                    let cmd_data = &leftover[consumed..consumed + len];
-                    should_close = process_command_into(cmd_data, &ctx, &mut resp_buf, is_inline);
-                    consumed += len;
-                    if should_close { break; }
-                }
-                None => break,
-            }
+        if leftover.is_empty() {
+            continue;
         }
-        leftover.drain(..consumed);
+
+        let ctx_owned = OwnedCtx::<N> {
+            store: Arc::clone(&store),
+            wal: wal.clone(),
+            expiry: expiry.clone(),
+            lists: lists.clone(),
+            wal_path: wal_path.clone(),
+            password: password.clone(),
+            authenticated: Arc::clone(&authenticated),
+        };
+
+        let buffer_to_process = std::mem::take(&mut leftover);
+        let process_result = tokio::task::spawn_blocking(move || {
+            process_buffer(ctx_owned, buffer_to_process)
+        }).await;
+
+        let (resp_buf, should_close, remaining) = match process_result {
+            Ok(result) => result,
+            Err(join_err) => {
+                eprintln!("[{}] Command processing task panicked: {}", addr, join_err);
+                break;
+            }
+        };
+
+        leftover = remaining;
 
         if !resp_buf.is_empty() {
             if let Err(e) = socket.write_all(&resp_buf).await {
@@ -598,7 +737,7 @@ fn dispatch_command<const N: usize>(
     // ----- AUTH enforcement -----
     // If a password is set and the connection is not yet authenticated,
     // only allow AUTH, PING, and QUIT commands.
-    if ctx.password.is_some() && !ctx.authenticated.get() {
+    if ctx.password.is_some() && !ctx.authenticated.load(Ordering::SeqCst) {
         match cmd_name {
             "AUTH" | "PING" | "QUIT" => {}, // allowed without auth
             _ => {
@@ -741,7 +880,7 @@ fn cmd_auth<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
     };
 
     if provided == expected.as_bytes() {
-        ctx.authenticated.set(true);
+        ctx.authenticated.store(true, Ordering::SeqCst);
         out.extend_from_slice(b"+OK\r\n");
     } else {
         out.extend_from_slice(b"-ERR invalid password\r\n");
@@ -2889,6 +3028,7 @@ mod tests {
     #[test]
     fn test_dispatch_get_set() {
         let store: KvStoreLockFree = KvStoreLockFree::with_capacity(100);
+        let authenticated = AtomicBool::new(false);
         let ctx = ServerContext {
             store: &store,
             wal: None,
@@ -2898,7 +3038,7 @@ mod tests {
             blob: None,
             wal_path: None,
             password: None,
-            authenticated: Cell::new(false),
+            authenticated: &authenticated,
         };
         let mut out = Vec::new();
 
@@ -2921,12 +3061,13 @@ mod tests {
     #[test]
     fn test_dispatch_ping() {
         let store: KvStoreLockFree = KvStoreLockFree::with_capacity(100);
+        let authenticated = AtomicBool::new(false);
         let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None,
             #[cfg(feature = "blob-store")]
             blob: None,
             wal_path: None,
             password: None,
-            authenticated: Cell::new(false),
+            authenticated: &authenticated,
         };
         let mut out = Vec::new();
 
@@ -2942,6 +3083,7 @@ mod tests {
     fn test_dispatch_lpush_lrange_lpop() {
         let store: Arc<KvStoreLockFree> = Arc::new(KvStoreLockFree::with_capacity(100));
         let lists = ListManager::new(Arc::clone(&store));
+        let authenticated = AtomicBool::new(false);
         let ctx = ServerContext {
             store: &store,
             wal: None,
@@ -2951,7 +3093,7 @@ mod tests {
             blob: None,
             wal_path: None,
             password: None,
-            authenticated: Cell::new(false),
+            authenticated: &authenticated,
         };
         let mut out = Vec::new();
 
@@ -2984,6 +3126,7 @@ mod tests {
     fn test_dispatch_del_removes_list() {
         let store: Arc<KvStoreLockFree> = Arc::new(KvStoreLockFree::with_capacity(100));
         let lists = ListManager::new(Arc::clone(&store));
+        let authenticated = AtomicBool::new(false);
         let ctx = ServerContext {
             store: &store,
             wal: None,
@@ -2993,7 +3136,7 @@ mod tests {
             blob: None,
             wal_path: None,
             password: None,
-            authenticated: Cell::new(false),
+            authenticated: &authenticated,
         };
         let mut out = Vec::new();
 
@@ -3022,6 +3165,7 @@ mod tests {
     fn test_dispatch_wrong_type_get_on_list() {
         let store: Arc<KvStoreLockFree> = Arc::new(KvStoreLockFree::with_capacity(100));
         let lists = ListManager::new(Arc::clone(&store));
+        let authenticated = AtomicBool::new(false);
         let ctx = ServerContext {
             store: &store,
             wal: None,
@@ -3031,7 +3175,7 @@ mod tests {
             blob: None,
             wal_path: None,
             password: None,
-            authenticated: Cell::new(false),
+            authenticated: &authenticated,
         };
         let mut out = Vec::new();
 

@@ -14,10 +14,9 @@ use crate::core::server::tcp::{parse_command_bounds, process_command_into, Serve
 use crate::core::wal::WalWriter;
 #[cfg(feature = "blob-store")]
 use crate::core::blob::BlobArena;
-use std::cell::Cell;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Default listen port.
 const DEFAULT_PORT: u16 = 6379;
@@ -213,6 +212,7 @@ async fn handle_client<const N: usize>(
     let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
     let mut response: Vec<u8> = Vec::with_capacity(4096);
+    let authenticated = Arc::new(AtomicBool::new(false));
 
     let ctx = ServerContext::<N> {
         store: &store,
@@ -222,7 +222,7 @@ async fn handle_client<const N: usize>(
         blob: blob.as_deref(),
         wal_path: wal_path.as_deref(),
         password: password.as_ref(),
-        authenticated: Cell::new(false),
+        authenticated: &authenticated,
     };
 
     loop {
@@ -288,6 +288,7 @@ async fn handle_client<const N: usize>(
     let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
     let mut response: Vec<u8> = Vec::with_capacity(4096);
+    let authenticated = Arc::new(AtomicBool::new(false));
 
     let ctx = ServerContext::<N> {
         store: &store,
@@ -296,7 +297,7 @@ async fn handle_client<const N: usize>(
         lists: lists.as_deref(),
         wal_path: wal_path.as_deref(),
         password: password.as_ref(),
-        authenticated: Cell::new(false),
+        authenticated: &authenticated,
     };
 
     loop {

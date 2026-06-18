@@ -20,6 +20,7 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 - **AUTH / Security** — `--requirepass` for password authentication, `--max-connections` for connection limiting
 - **Graceful shutdown** — SIGTERM/SIGINT handling with 30s drain timeout and WAL sync
 - **io_uring (Linux)** — optional kernel-bypass networking for maximum throughput
+- **Non-blocking command dispatch** — heavy writes (WAL `fsync`, BSET compression) run on `spawn_blocking` threads so reads (SCAN, GET) never starve under concurrent write load (v1.2.1+)
 - **Client SDKs** — zero-dependency libraries for Go, Python, Java, and Node.js
 
 ## Performance
@@ -493,6 +494,38 @@ fastkv/
 
 ## Architecture
 
+### Concurrency Model (v1.2.1+)
+
+FastKV separates **socket I/O** (async, on tokio worker threads) from **command processing** (sync, on `spawn_blocking` threads). This division is critical for read/write isolation under heavy concurrent load.
+
+```
+                   ┌──────────────────────────────────┐
+   Client A ─────► │ tokio worker thread              │
+   (writes)        │  ├─ socket.read()                │
+                   │  └─ spawn_blocking(process_buf) ─┼──► blocking pool thread
+                   │                                  │      ├─ WAL Mutex + write_all
+                   │                                  │      └─ optional fsync
+                   └──────────────────────────────────┘
+                                                              ▲ does NOT block worker
+   Client B ─────► ┌──────────────────────────────────┐       │   threads
+   (reads,         │ tokio worker thread              │       │
+    SCAN)          │  ├─ socket.read()                │       │
+                   │  └─ spawn_blocking(process_buf) ─┼───────┘
+                   │      ├─ lock-free hash scan      │
+                   │      └─ return keys              │
+                   └──────────────────────────────────┘
+```
+
+**Before v1.2.1**: command processing ran inline on tokio worker threads. A heavy write load (e.g. thousands of `BSET` calls with `fsync=always`) would saturate all worker threads on `std::sync::Mutex<File>` contention, causing `SCAN` / `GET` from other clients to hang for seconds.
+
+**After v1.2.1**: every command batch is dispatched to `tokio::task::spawn_blocking`. The tokio runtime grows its blocking thread pool on demand (up to 512 threads by default), so:
+
+* Heavy writes block only blocking-pool threads — async worker threads stay free to accept new connections and read more socket data.
+* `SCAN` commands get their own blocking thread immediately and return results even while other connections are doing heavy WAL writes.
+* The `authenticated` flag was changed from `Cell<bool>` (thread-local) to `Arc<AtomicBool>` (shared across the blocking thread boundary).
+
+The trade-off is a small per-read overhead (one channel send + thread wake-up), which is dwarfed by the WAL I/O cost it isolates. For pure in-memory workloads (no WAL, no blob arena), the inline path is still faster — but correctness under concurrent writes wins.
+
 ### Lock-free Hash Table
 
 ```
@@ -643,6 +676,8 @@ LSH (O(1) approximate nearest-neighbor search)
 | io_uring build error | Requires Linux kernel 5.1+: `uname -r` |
 | Stale WAL data | Delete WAL to start fresh: `rm ./fastkv_data/fastkv.wal` |
 | WAL recovery skips entries | Entry exceeds current `--inline-size` — use the same inline-size as when WAL was created |
+| SCAN / GET hangs under heavy writes | Upgrade to v1.2.1+ — command dispatch now uses `spawn_blocking` so async worker threads are never blocked on WAL I/O. If you still see hangs, lower `--fsync` to `everysec` (default) or `never` |
+| `connection reset by peer` under load | Client socket timeout too low for WAL-fsync latency. Increase client timeout to 30s+, or upgrade server to v1.2.1+ where reads are not blocked by writes |
 
 ## License
 

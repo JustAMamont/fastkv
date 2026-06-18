@@ -12,7 +12,7 @@ Both synchronous and asynchronous clients are provided:
   any async event loop.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 from .client import FastKVClient
 from .async_client import FastKVAsyncClient
