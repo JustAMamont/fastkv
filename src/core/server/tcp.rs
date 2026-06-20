@@ -1760,6 +1760,9 @@ fn cmd_flushall<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
 
     // WAL checkpoint if available.
     if let Some(wal_path) = ctx.wal_path {
+        #[cfg(feature = "blob-store")]
+        let _ = checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path, ctx.blob);
+        #[cfg(not(feature = "blob-store"))]
         let _ = checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path);
         if let Some(w) = ctx.wal {
             let _ = w.wal_reopen();
@@ -2792,7 +2795,16 @@ fn cmd_bgsave<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
         return;
     };
 
-    match checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path) {
+    match {
+        #[cfg(feature = "blob-store")]
+        {
+            checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path, ctx.blob)
+        }
+        #[cfg(not(feature = "blob-store"))]
+        {
+            checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path)
+        }
+    } {
         Ok(count) => {
             // Reopen the live WAL writer so it writes to the new compact file.
             if let Some(w) = ctx.wal {

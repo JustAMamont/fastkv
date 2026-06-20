@@ -596,6 +596,34 @@ Recovery:
   Corrupted trailing entries are silently discarded
 ```
 
+#### Checkpoint / BGSAVE and blob keys (v1.2.2+)
+
+The WAL is append-only. Periodically (every `--checkpoint-interval` seconds),
+on `BGSAVE`/`SAVE`, and on `FLUSHALL`, FastKV writes a fresh compact WAL
+containing only the current live state and atomically swaps it in for the
+old WAL.
+
+For blob keys the compact WAL must contain a `BSET` entry with the
+**original uncompressed** payload, so that on recovery the existing
+BSET-replay path (`WalOp::BSet` in `main.rs`) can rebuild the blob arena
+(compress → arena.store → BlobRef in hash table).
+
+Versions **prior to v1.2.2 had a bug** where checkpoint wrote blob keys
+as plain `SET` entries carrying the 33-byte `BlobRef` as the value. After
+recovery the hash table held a `BlobRef` pointing into a freshly
+initialized (empty) blob arena, so `BGET` returned `nil` and raw
+`redis-cli GET` reported `blob decompression failed`. v1.2.2 threads
+`Option<&BlobArena>` through `checkpoint()` and `spawn_checkpoint_thread()`
+so each blob key is correctly decoded, decompressed from the arena, and
+written as a proper `BSET` entry to the compact WAL.
+
+> **Upgrading from v1.2.1 or earlier**: existing WAL files are still
+> readable, but blob keys whose data was already clobbered by a v1.2.1
+> checkpoint cannot be recovered (the original payload was never
+> persisted). After upgrading, re-issue `BSET` for any blob keys whose
+> data must survive future restarts, then call `BGSAVE` to capture a
+> correct compact WAL.
+
 ### Expiration
 
 Two strategies work together:
@@ -656,6 +684,7 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 12 — List WAL: persistent list operations (LPUSH/RPUSH/LPOP/RPOP/LTRIM)
 - [x] Phase 13 — Compressed WAL Segments: segment-based WAL with zstd batch compression
 - [x] Phase 14 — Production readiness: AUTH, connection limits, graceful shutdown, checkpoint/BGSAVE, TYPE, RENAME, GETSET, GETDEL, SETNX, PSETEX, UNLINK, FLUSHALL/FLUSHDB, HINCRBY, HSETNX, critical bug fixes
+- [x] Phase 14.1 — v1.2.2 hotfix: WAL checkpoint now correctly persists blob keys as `BSET` entries (was: `SET` with bare `BlobRef`, causing `BGET` to return `nil` after restart)
 - [ ] Phase 15 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), BLPOP/BRPOP, Lua scripting
 - [ ] Phase 16 — Cluster: hash-slot sharding, node discovery, failover
 - [ ] Phase 17 — TLS: optional `--tls-cert` / `--tls-key` via tokio-rustls

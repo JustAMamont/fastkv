@@ -486,12 +486,29 @@ fn run_server_with_n<const N: usize>(
             let store_clone = Arc::clone(&store);
             let expiry_clone = expiry.as_ref().map(Arc::clone);
             let wp_clone = wp.clone();
-            let _checkpoint_handle = fast_kv::core::checkpoint::spawn_checkpoint_thread(
-                store_clone,
-                expiry_clone,
-                wp_clone,
-                interval,
-            );
+            #[cfg(feature = "blob-store")]
+            let blob_clone = blob.as_ref().map(Arc::clone);
+            let _checkpoint_handle = {
+                #[cfg(feature = "blob-store")]
+                {
+                    fast_kv::core::checkpoint::spawn_checkpoint_thread(
+                        store_clone,
+                        expiry_clone,
+                        wp_clone,
+                        interval,
+                        blob_clone,
+                    )
+                }
+                #[cfg(not(feature = "blob-store"))]
+                {
+                    fast_kv::core::checkpoint::spawn_checkpoint_thread(
+                        store_clone,
+                        expiry_clone,
+                        wp_clone,
+                        interval,
+                    )
+                }
+            };
             println!("  Checkpoint thread started (interval: {}s)", interval);
         } else {
             eprintln!("  Warning: --checkpoint-interval set but no WAL path available; checkpoint disabled");
