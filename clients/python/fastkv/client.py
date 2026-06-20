@@ -305,6 +305,19 @@ class FastKVClient:
         """Get the value of *key*.  Returns ``None`` if the key does not exist."""
         return self._execute_command("GET", key)
 
+    def get_str(self, key: str) -> Optional[str]:
+        """Get the value of *key* as a UTF-8 string.  Returns ``None`` if missing."""
+        v = self._execute_command("GET", key)
+        if v is None:
+            return None
+        if isinstance(v, bytes):
+            return v.decode("utf-8", errors="replace")
+        return str(v)
+
+    def set_str(self, key: str, value: str) -> Optional[bool]:
+        """Set *key* to hold string *value*.  Returns ``True`` if set."""
+        return self.set(key, value)
+
     def delete(self, keys: Any) -> int:
         """Remove one or more keys.  Returns the number of keys removed.
 

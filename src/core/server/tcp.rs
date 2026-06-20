@@ -1761,9 +1761,9 @@ fn cmd_flushall<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     // WAL checkpoint if available.
     if let Some(wal_path) = ctx.wal_path {
         #[cfg(feature = "blob-store")]
-        let _ = checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path, ctx.blob);
+        let _ = checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path, ctx.lists, ctx.blob);
         #[cfg(not(feature = "blob-store"))]
-        let _ = checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path);
+        let _ = checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path, ctx.lists);
         if let Some(w) = ctx.wal {
             let _ = w.wal_reopen();
         }
@@ -2308,7 +2308,14 @@ fn cmd_lpush<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerConte
     let elements: Vec<&[u8]> = (2..cmd.argc()).filter_map(|i| cmd.arg(i)).collect();
 
     match lists.lpush(key, &elements) {
-        Ok(len) => RespEncoder::write_integer(out, len as i64),
+        Ok(len) => {
+            // Persist to WAL so list state survives restarts.
+            if let Some(w) = ctx.wal {
+                let payload = list::encode_list_push(list::ListSubOp::LPush, &elements);
+                let _ = w.wal_list_op(key, &payload);
+            }
+            RespEncoder::write_integer(out, len as i64);
+        }
         Err(_) => RespEncoder::write_error(out, WRONGTYPE_ERR),
     }
 }
@@ -2327,7 +2334,14 @@ fn cmd_rpush<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerConte
     let elements: Vec<&[u8]> = (2..cmd.argc()).filter_map(|i| cmd.arg(i)).collect();
 
     match lists.rpush(key, &elements) {
-        Ok(len) => RespEncoder::write_integer(out, len as i64),
+        Ok(len) => {
+            // Persist to WAL so list state survives restarts.
+            if let Some(w) = ctx.wal {
+                let payload = list::encode_list_push(list::ListSubOp::RPush, &elements);
+                let _ = w.wal_list_op(key, &payload);
+            }
+            RespEncoder::write_integer(out, len as i64);
+        }
         Err(_) => RespEncoder::write_error(out, WRONGTYPE_ERR),
     }
 }
@@ -2354,6 +2368,14 @@ fn cmd_lpop<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
         .unwrap_or(1);
 
     let elements = lists.lpop(key, count);
+
+    // Persist to WAL only if we actually popped something.
+    if !elements.is_empty() {
+        if let Some(w) = ctx.wal {
+            let payload = list::encode_list_pop(list::ListSubOp::LPop, elements.len());
+            let _ = w.wal_list_op(key, &payload);
+        }
+    }
 
     if cmd.argc() >= 3 && count > 1 {
         // Multi-element reply.
@@ -2393,6 +2415,14 @@ fn cmd_rpop<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
         .unwrap_or(1);
 
     let elements = lists.rpop(key, count);
+
+    // Persist to WAL only if we actually popped something.
+    if !elements.is_empty() {
+        if let Some(w) = ctx.wal {
+            let payload = list::encode_list_pop(list::ListSubOp::RPop, elements.len());
+            let _ = w.wal_list_op(key, &payload);
+        }
+    }
 
     if cmd.argc() >= 3 && count > 1 {
         out.push(b'*');
@@ -2482,6 +2512,13 @@ fn cmd_lrem<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
     let count: i64 = std::str::from_utf8(count_s).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let removed = lists.lrem(key, count, element);
+    // Persist to WAL only if we actually removed something.
+    if removed > 0 {
+        if let Some(w) = ctx.wal {
+            let payload = list::encode_list_rem(count, element);
+            let _ = w.wal_list_op(key, &payload);
+        }
+    }
     RespEncoder::write_integer(out, removed as i64);
 }
 
@@ -2499,6 +2536,11 @@ fn cmd_ltrim<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerConte
     let stop: i64 = std::str::from_utf8(stop_s).ok().and_then(|s| s.parse().ok()).unwrap_or(-1);
 
     lists.ltrim(key, start, stop);
+    // Persist to WAL.
+    if let Some(w) = ctx.wal {
+        let payload = list::encode_list_trim(start, stop);
+        let _ = w.wal_list_op(key, &payload);
+    }
     RespEncoder::write_simple_string(out, "OK");
 }
 
@@ -2515,6 +2557,11 @@ fn cmd_lset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
     let index: i64 = std::str::from_utf8(idx_s).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     if lists.lset(key, index, element) {
+        // Persist to WAL.
+        if let Some(w) = ctx.wal {
+            let payload = list::encode_list_set(index, element);
+            let _ = w.wal_list_op(key, &payload);
+        }
         RespEncoder::write_simple_string(out, "OK");
     } else {
         RespEncoder::write_error(out, "ERR index out of range");
@@ -2798,11 +2845,11 @@ fn cmd_bgsave<const N: usize>(ctx: &ServerContext<N>, out: &mut Vec<u8>) {
     match {
         #[cfg(feature = "blob-store")]
         {
-            checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path, ctx.blob)
+            checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path, ctx.lists, ctx.blob)
         }
         #[cfg(not(feature = "blob-store"))]
         {
-            checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path)
+            checkpoint::checkpoint(ctx.store, ctx.expiry, wal_path, ctx.lists)
         }
     } {
         Ok(count) => {

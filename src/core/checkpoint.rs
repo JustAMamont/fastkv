@@ -30,6 +30,7 @@ use std::sync::Arc;
 use crate::core::kv::KvStoreLockFree;
 use crate::core::wal::{FsyncPolicy, Wal};
 use crate::core::expiration::ExpirationManager;
+use crate::core::list::{ListManager, LIST_MAGIC, ListSubOp};
 #[cfg(feature = "blob-store")]
 use crate::core::blob::{BlobArena, BlobRef};
 
@@ -105,6 +106,7 @@ pub fn checkpoint<const N: usize>(
     store: &KvStoreLockFree<N>,
     expiry: Option<&ExpirationManager<N>>,
     wal_path: &Path,
+    lists: Option<&ListManager<N>>,
     #[cfg(feature = "blob-store")] blob_arena: Option<&BlobArena>,
 ) -> Result<usize, CheckpointError> {
     let wal_dir = wal_path.parent().unwrap_or_else(|| Path::new("."));
@@ -116,23 +118,7 @@ pub fn checkpoint<const N: usize>(
     let new_path = wal_dir.join(format!("{}.new", wal_file_name));
     let bak_path = wal_dir.join(format!("{}.bak", wal_file_name));
 
-    // Phase 1: Collect all live keys and their values.
-    let mut keys_values: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut cursor = 0usize;
-    loop {
-        let (next_cursor, batch) = store.scan(cursor, 1000, None);
-        for key in &batch {
-            if let Some(value) = store.get(key) {
-                keys_values.push((key.clone(), value));
-            }
-        }
-        if next_cursor == 0 || batch.is_empty() {
-            break;
-        }
-        cursor = next_cursor;
-    }
-
-    // Phase 2: Collect all TTL entries (key → deadline_ms).
+    // Phase 2 (collect TTL entries first — small, safe to hold in memory).
     let ttl_entries: Vec<(Vec<u8>, u64)> = if let Some(exp) = expiry {
         exp.get_all_deadlines_ms()
     } else {
@@ -145,6 +131,7 @@ pub fn checkpoint<const N: usize>(
 
     let new_wal = Wal::open(&new_path, FsyncPolicy::Always)?;
     let mut written = 0usize;
+    let mut total_keys_seen = 0usize;
 
     // Counters for the final log line.
     #[cfg(feature = "blob-store")]
@@ -152,60 +139,89 @@ pub fn checkpoint<const N: usize>(
     #[cfg(feature = "blob-store")]
     let mut blob_keys_degraded = 0usize;
 
-    // Write SET entries for all live keys.
-    for (key, value) in &keys_values {
-        #[cfg(feature = "blob-store")]
-        {
-            if BlobArena::is_blob_ref(value) {
-                // This is a blob key. We must write a BSET entry to the
-                // compact WAL with the **original uncompressed** data so
-                // that recovery can rebuild the blob arena (compress →
-                // arena.store → BlobRef in hash table).
-                //
-                // Without the arena we cannot retrieve the original data,
-                // so we fall back to writing the bare BlobRef as a SET —
-                // the key will survive but BGET will return None after
-                // recovery. This is the legacy behaviour and is logged.
-                if let Some(arena) = blob_arena {
-                    if let Some(blob_ref) = BlobRef::decode(value) {
-                        if let Some(original) = arena.retrieve(&blob_ref) {
-                            new_wal.bset(key, &original)?;
-                            blob_keys_written += 1;
-                            written += 1;
-                            continue;
-                        } else {
-                            eprintln!(
-                                "[CHECKPOINT] Warning: blob retrieve failed for key {:?} (offset={}, comp_len={}) — writing degraded SET",
-                                String::from_utf8_lossy(key),
-                                blob_ref.offset,
-                                blob_ref.comp_len
-                            );
-                        }
-                    } else {
-                        eprintln!(
-                            "[CHECKPOINT] Warning: blob ref decode failed for key {:?} — writing degraded SET",
-                            String::from_utf8_lossy(key)
-                        );
-                    }
-                    blob_keys_degraded += 1;
-                } else {
-                    // No arena provided — legacy degraded path.
-                    eprintln!(
-                        "[CHECKPOINT] Warning: blob key {:?} written as degraded SET (no blob_arena passed to checkpoint) — BGET will fail after recovery",
-                        String::from_utf8_lossy(key)
-                    );
-                    blob_keys_degraded += 1;
-                }
-                // Fall through to write as SET (degraded).
-                new_wal.set(key, value)?;
-                written += 1;
-                continue;
-            }
+    // STREAM keys in batches of 1000, writing each to the new WAL immediately.
+    // This avoids holding all keys + all decompressed blob payloads in memory
+    // at once (which previously caused OOM with ~18000 blob keys × ~100KB
+    // decompressed each = ~1.8GB peak RSS for the checkpoint thread).
+    let mut cursor = 0usize;
+    loop {
+        let (next_cursor, batch) = store.scan(cursor, 1000, None);
+        if batch.is_empty() {
+            break;
         }
-        // Regular key — write as SET.
-        new_wal.set(key, value)?;
-        written += 1;
+
+        // Process this batch — values are dropped at the end of the iteration.
+        for key in &batch {
+            let value = match store.get(key) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // List key: write SET(magic) to mark the key as a list, then
+            // write a single RPUSH LIST_OP entry containing all current
+            // elements. On recovery, replay_list_op() rebuilds the list
+            // contents. Without this, list keys would survive restart
+            // (the magic byte is restored) but their contents would be
+            // empty.
+            if value.len() == 1 && value[0] == LIST_MAGIC {
+                if let Some(lists) = lists {
+                    // Write SET(magic) first so the key exists in the hash
+                    // table when the LIST_OP entry is replayed.
+                    new_wal.set(key, &value)?;
+                    written += 1;
+                    // Read all elements and write as a single RPUSH.
+                    let elements = lists.lrange(key, 0, -1);
+                    if !elements.is_empty() {
+                        let elem_refs: Vec<&[u8]> = elements.iter().map(|e| e.as_slice()).collect();
+                        let payload = crate::core::list::encode_list_push(ListSubOp::RPush, &elem_refs);
+                        new_wal.list_op(key, &payload)?;
+                        written += 1;
+                    }
+                    total_keys_seen += 1;
+                    continue;
+                }
+                // No ListManager — fall through to write as plain SET
+                // (key survives, but list contents will be empty after recovery).
+            }
+
+            #[cfg(feature = "blob-store")]
+            {
+                if BlobArena::is_blob_ref(&value) {
+                    if let Some(arena) = blob_arena {
+                        if let Some(blob_ref) = BlobRef::decode(&value) {
+                            // Retrieve the original (decompressed) payload,
+                            // write BSET to the compact WAL, then drop it.
+                            if let Some(original) = arena.retrieve(&blob_ref) {
+                                new_wal.bset(key, &original)?;
+                                blob_keys_written += 1;
+                                written += 1;
+                                total_keys_seen += 1;
+                                // `original` dropped here
+                                continue;
+                            }
+                        }
+                    }
+                    // Degraded path: write bare BlobRef as SET.
+                    new_wal.set(key, &value)?;
+                    blob_keys_degraded += 1;
+                    written += 1;
+                    total_keys_seen += 1;
+                    continue;
+                }
+            }
+            // Regular key — write as SET.
+            new_wal.set(key, &value)?;
+            written += 1;
+            total_keys_seen += 1;
+            // `value` dropped here
+        }
+
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
     }
+    // Drop the cursor loop — keys_values no longer exists.
 
     // Write EXPIRE entries.
     for (key, deadline_ms) in &ttl_entries {
@@ -238,7 +254,7 @@ pub fn checkpoint<const N: usize>(
         if blob_keys_written > 0 || blob_keys_degraded > 0 {
             eprintln!(
                 "[CHECKPOINT] Compacted WAL: {} keys ({} blob, {} TTL), {} total entries written | blob keys: {} preserved, {} degraded",
-                keys_values.len(),
+                total_keys_seen,
                 blob_keys_written + blob_keys_degraded,
                 ttl_entries.len(),
                 written,
@@ -248,7 +264,7 @@ pub fn checkpoint<const N: usize>(
         } else {
             eprintln!(
                 "[CHECKPOINT] Compacted WAL: {} keys, {} TTL entries ({} total entries written)",
-                keys_values.len(),
+                total_keys_seen,
                 ttl_entries.len(),
                 written
             );
@@ -258,7 +274,7 @@ pub fn checkpoint<const N: usize>(
     {
         eprintln!(
             "[CHECKPOINT] Compacted WAL: {} keys, {} TTL entries ({} total entries written)",
-            keys_values.len(),
+            total_keys_seen,
             ttl_entries.len(),
             written
         );
@@ -276,6 +292,7 @@ pub fn spawn_checkpoint_thread<const N: usize>(
     expiry: Option<Arc<ExpirationManager<N>>>,
     wal_path: PathBuf,
     interval_secs: u64,
+    lists: Option<Arc<ListManager<N>>>,
     #[cfg(feature = "blob-store")] blob_arena: Option<Arc<BlobArena>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -290,6 +307,7 @@ pub fn spawn_checkpoint_thread<const N: usize>(
                             &store,
                             expiry.as_deref(),
                             &wal_path,
+                            lists.as_deref(),
                             blob_arena.as_deref(),
                         )
                     }
@@ -299,6 +317,7 @@ pub fn spawn_checkpoint_thread<const N: usize>(
                             &store,
                             expiry.as_deref(),
                             &wal_path,
+                            lists.as_deref(),
                         )
                     }
                 };
@@ -360,9 +379,9 @@ mod tests {
 
         // Run checkpoint.
         #[cfg(feature = "blob-store")]
-        let count = checkpoint(&store, Some(&expiry), &wal_path, None).unwrap();
+        let count = checkpoint(&store, Some(&expiry), &wal_path, None, None).unwrap();
         #[cfg(not(feature = "blob-store"))]
-        let count = checkpoint(&store, Some(&expiry), &wal_path).unwrap();
+        let count = checkpoint(&store, Some(&expiry), &wal_path, None).unwrap();
         // Should have 2 SET + 1 EXPIRE = 3 entries.
         assert_eq!(count, 3);
 
@@ -399,9 +418,9 @@ mod tests {
         drop(wal);
 
         #[cfg(feature = "blob-store")]
-        let count = checkpoint(&store, None, &wal_path, None).unwrap();
+        let count = checkpoint(&store, None, &wal_path, None, None).unwrap();
         #[cfg(not(feature = "blob-store"))]
-        let count = checkpoint(&store, None, &wal_path).unwrap();
+        let count = checkpoint(&store, None, &wal_path, None).unwrap();
         assert_eq!(count, 0);
 
         let entries = Wal::recover(&wal_path).unwrap();
@@ -418,9 +437,9 @@ mod tests {
 
         // WAL file doesn't exist yet — checkpoint should still work.
         #[cfg(feature = "blob-store")]
-        let count = checkpoint(&store, None, &wal_path, None).unwrap();
+        let count = checkpoint(&store, None, &wal_path, None, None).unwrap();
         #[cfg(not(feature = "blob-store"))]
-        let count = checkpoint(&store, None, &wal_path).unwrap();
+        let count = checkpoint(&store, None, &wal_path, None).unwrap();
         assert_eq!(count, 1);
 
         let entries = Wal::recover(&wal_path).unwrap();
@@ -453,7 +472,7 @@ mod tests {
         store.set(b"blob:2", &blob_ref_2.encode());
 
         // Run checkpoint WITH the arena — should write BSET entries.
-        let count = checkpoint(&store, None, &wal_path, Some(&arena)).unwrap();
+        let count = checkpoint(&store, None, &wal_path, None, Some(&arena)).unwrap();
         assert_eq!(count, 2, "both blob keys should be written");
 
         // Recover the compact WAL.
@@ -516,7 +535,7 @@ mod tests {
         assert_eq!(arena.retrieve(&br).unwrap(), b"large cookie data for session 1");
 
         // --- Phase 3: run checkpoint (the previously buggy code path) ---
-        let _ = checkpoint(&store, None, &wal_path, Some(&arena)).unwrap();
+        let _ = checkpoint(&store, None, &wal_path, None, Some(&arena)).unwrap();
 
         // The compact WAL should contain BSET entries (not SET with bare BlobRef).
         let compact_entries = Wal::recover(&wal_path).unwrap();

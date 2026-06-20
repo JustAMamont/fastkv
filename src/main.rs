@@ -486,6 +486,7 @@ fn run_server_with_n<const N: usize>(
             let store_clone = Arc::clone(&store);
             let expiry_clone = expiry.as_ref().map(Arc::clone);
             let wp_clone = wp.clone();
+            let lists_clone = lists.as_ref().map(Arc::clone);
             #[cfg(feature = "blob-store")]
             let blob_clone = blob.as_ref().map(Arc::clone);
             let _checkpoint_handle = {
@@ -496,6 +497,7 @@ fn run_server_with_n<const N: usize>(
                         expiry_clone,
                         wp_clone,
                         interval,
+                        lists_clone,
                         blob_clone,
                     )
                 }
@@ -506,6 +508,7 @@ fn run_server_with_n<const N: usize>(
                         expiry_clone,
                         wp_clone,
                         interval,
+                        lists_clone,
                     )
                 }
             };

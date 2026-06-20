@@ -14,7 +14,7 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 - **Checkpoint / BGSAVE** — automatic or manual WAL compaction via `BGSAVE`/`SAVE` commands; `--checkpoint-interval` flag
 - **TTL / Expiration** — `EXPIRE`, `TTL`, `PTTL`, `PERSIST` with lazy + active key purging, persisted to WAL
 - **Hash data type** — `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HMGET`, `HMSET`, `HINCRBY`, `HSETNX`
-- **List data type** — `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LREM`, `LTRIM`, `LSET`
+- **List data type** — `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LREM`, `LTRIM`, `LSET` (all persisted to WAL since v1.2.3)
 - **String operations** — `INCR`, `DECR`, `INCRBY`, `APPEND`, `STRLEN`, `GETRANGE`, `SETRANGE`, `MGET`, `MSET`, `EXISTS`, `SETNX`, `PSETEX`, `GETSET`, `GETDEL`
 - **Key management** — `TYPE`, `RENAME`, `UNLINK`, `FLUSHALL`, `FLUSHDB`
 - **AUTH / Security** — `--requirepass` for password authentication, `--max-connections` for connection limiting
@@ -553,9 +553,9 @@ Operations:
 ```
 Blob Ref (inline value with flag 0xFD):
 ┌──────────┬──────────┬───────────┬───────────┬──────────────┐
-│ flag: 0xFD│ offset:  │ comp_len: │ orig_len: │ data_hash:   │
-│ 1 byte    │ u64 8B   │ u32 4B    │ u32 4B    │ dual-crc32c  │
-│           │          │           │           │ 16B          │
+│ flag: 0xFD│ offset:  │ comp_len: │ orig_len: │ data_hash:  │
+│ 1 byte    │ u64 8B   │ u32 4B    │ u32 4B    │ dual-crc32c │
+│           │          │           │           │ 16B         │
 └──────────┴──────────┴───────────┴───────────┴──────────────┘
 Total: 33 bytes — fits even in N=64 inline size
 
@@ -637,35 +637,35 @@ EXPIRE entries are written to WAL and restored on recovery after keys are loaded
 
 ```
 SimHash (64-bit near-duplicate detection)
-┌──────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────┐
 │  1. Hash each feature with 64-bit wyhash                  │
 │  2. Weighted vote vector: +weight for 1-bits, -weight     │
 │     for 0-bits                                            │
-│  3. Final hash: bit = 1 if vote > 0 else 0               │
-│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT│
+│  3. Final hash: bit = 1 if vote > 0 else 0                │
+│  4. Hamming distance: popcnt(a XOR b) — single x86 POPCNT │
 │  5. Configurable per-field weights                        │
 │  6. Default threshold: Hamming distance ≤ 3 = similar     │
-└──────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────┘
 
 MinHash (Jaccard similarity for set-type data)
-┌──────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────┐
 │  128 hash functions via LCG permutation coefficients      │
-│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64              │
-│  Signature: Vec<u32> of 128 minimums (512 bytes)         │
+│  h_i(x) = (a[i] * hash(x) + b[i]) mod 2^64                │
+│  Signature: Vec<u32> of 128 minimums (512 bytes)          │
 │  Jaccard estimate = fraction of matching components       │
-└──────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────┘
 
 LSH (O(1) approximate nearest-neighbor search)
-┌──────────────────────────────────────────────────────────┐
-│  SimHash: 64 bits → 4 bands × 16 bits                    │
-│  Bucket keys: lsh:sim:{band}:{value} → list of IDs       │
-│  MinHash:  128 values → 4 bands × 32 rows                │
-│  Bucket keys: lsh:min:{band}:{value} → list of IDs       │
+┌───────────────────────────────────────────────────────────┐
+│  SimHash: 64 bits → 4 bands × 16 bits                     │
+│  Bucket keys: lsh:sim:{band}:{value} → list of IDs        │
+│  MinHash:  128 values → 4 bands × 32 rows                 │
+│  Bucket keys: lsh:min:{band}:{value} → list of IDs        │
 │                                                           │
-│  Search: look up all 4 bands, deduplicate candidates,    │
+│  Search: look up all 4 bands, deduplicate candidates,     │
 │  optionally filter by Hamming distance threshold (≤ 3)    │
 │  Metadata: lsh:simhash:{id} → stored 64-bit SimHash       │
-└──────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────┘
 ```
 
 ## Roadmap
@@ -685,6 +685,7 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 13 — Compressed WAL Segments: segment-based WAL with zstd batch compression
 - [x] Phase 14 — Production readiness: AUTH, connection limits, graceful shutdown, checkpoint/BGSAVE, TYPE, RENAME, GETSET, GETDEL, SETNX, PSETEX, UNLINK, FLUSHALL/FLUSHDB, HINCRBY, HSETNX, critical bug fixes
 - [x] Phase 14.1 — v1.2.2 hotfix: WAL checkpoint now correctly persists blob keys as `BSET` entries (was: `SET` with bare `BlobRef`, causing `BGET` to return `nil` after restart)
+- [x] Phase 14.2 — v1.2.3 hotfix: LIST operations (LPUSH/RPUSH/LPOP/RPOP/LREM/LTRIM/LSET) now persist to WAL (were in-memory only, lost on restart); checkpoint streaming rewrite (v1.2.2) avoids OOM under high blob-key count; Python client gains `get_str`/`set_str` helpers
 - [ ] Phase 15 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), BLPOP/BRPOP, Lua scripting
 - [ ] Phase 16 — Cluster: hash-slot sharding, node discovery, failover
 - [ ] Phase 17 — TLS: optional `--tls-cert` / `--tls-key` via tokio-rustls

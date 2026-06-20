@@ -903,4 +903,81 @@ mod tests {
         assert_eq!(entries[0].value.len(), 4096);
     }
 
+    #[test]
+    fn test_wal_list_op_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("list.wal");
+
+        // Write a sequence of LIST_OP entries.
+        let wal = Wal::open(&path, FsyncPolicy::Never).unwrap();
+        // RPUSH three elements
+        let payload = crate::core::list::encode_list_push(
+            crate::core::list::ListSubOp::RPush,
+            &[b"elem1", b"elem2", b"elem3"],
+        );
+        wal.list_op(b"mylist", &payload).unwrap();
+        // LREM 1 elem2
+        let payload = crate::core::list::encode_list_rem(
+            1,
+            b"elem2",
+        );
+        wal.list_op(b"mylist", &payload).unwrap();
+        // LSET 0 newfirst
+        let payload = crate::core::list::encode_list_set(
+            0,
+            b"newfirst",
+        );
+        wal.list_op(b"mylist", &payload).unwrap();
+        drop(wal);
+
+        let entries = Wal::recover(&path).unwrap();
+        assert_eq!(entries.len(), 3);
+        for e in &entries {
+            assert_eq!(e.op, WalOp::ListOp, "all entries should be ListOp");
+            assert_eq!(e.key, b"mylist");
+        }
+        // Verify the payloads decode to the expected sub-ops.
+        assert_eq!(entries[0].value[0], crate::core::list::ListSubOp::RPush as u8);
+        assert_eq!(entries[1].value[0], crate::core::list::ListSubOp::LRem as u8);
+        assert_eq!(entries[2].value[0], crate::core::list::ListSubOp::LSet as u8);
+    }
+
+    #[test]
+    fn test_wal_list_replay_roundtrip() {
+        use crate::core::kv::DEFAULT_INLINE_SIZE;
+        use crate::core::list::{ListManager, replay_list_op};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("list_rt.wal");
+
+        // Write a sequence of LIST_OPs to the WAL.
+        let wal = Wal::open(&path, FsyncPolicy::Never).unwrap();
+        wal.list_op(b"mylist", &crate::core::list::encode_list_push(
+            crate::core::list::ListSubOp::RPush, &[b"a", b"b", b"c", b"d"],
+        )).unwrap();
+        wal.list_op(b"mylist", &crate::core::list::encode_list_rem(
+            1, b"b",
+        )).unwrap();
+        wal.list_op(b"mylist", &crate::core::list::encode_list_set(
+            0, b"AAA",
+        )).unwrap();
+        drop(wal);
+
+        // Replay into a fresh ListManager.
+        let store = Arc::new(crate::core::kv::KvStoreLockFree::<DEFAULT_INLINE_SIZE>::with_capacity(100));
+        let mgr = ListManager::new(Arc::clone(&store));
+        // Mark the key as a list value (cmd_rpush does this internally).
+        store.set(b"mylist", &[crate::core::list::LIST_MAGIC]);
+
+        let entries = Wal::recover(&path).unwrap();
+        for e in &entries {
+            replay_list_op(&mgr, &e.key, &e.value);
+        }
+
+        // Expected state: [AAA, c, d] (was [a,b,c,d], removed b, set idx 0 to AAA).
+        let all = mgr.lrange(b"mylist", 0, -1);
+        assert_eq!(all, vec![b"AAA".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+    }
+
 }

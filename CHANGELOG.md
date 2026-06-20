@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] — 2026-06-21
+
+### Fixed
+
+- **Critical: LIST operations (LPUSH/RPUSH/LPOP/RPOP/LREM/LTRIM/LSET) were
+  not persisted to the WAL.** All list mutations were applied in-memory but
+  never written to the WAL, so list state was completely lost on every
+  server restart. After restart, list keys (`LLEN`, `LRANGE`, etc.) returned
+  empty results even though the keys still existed in the hash table
+  (because the `0xFE` magic marker value was restored via the regular SET
+  path, but the actual list contents were gone). This broke any
+  application that used lists for indexes, queues, or any persistent list
+  data structure.
+
+  The fix adds `wal_list_op()` calls to all six LIST mutation commands in
+  `core::server/tcp.rs`. Each command encodes its sub-operation using the
+  existing `encode_list_push/pop/trim/set/rem` helpers from
+  `core::list.rs`, and the existing `WalOp::ListOp` WAL entry type plus
+  `replay_list_op()` recovery path (already present in `main.rs`) rebuild
+  the list state correctly on restart.
+
+  LPOP/RPOP only write to the WAL if elements were actually popped
+  (no-op pops are not persisted). LREM only writes if `removed > 0`.
+  LPUSH/RPUSH/LTRIM/LSET always write (they are idempotent on replay).
+
+- **Checkpoint (BGSAVE) now persists list keys correctly.** Previously,
+  when the checkpoint thread compacted the WAL, list keys were written
+  as plain `SET(key, [0xFE])` entries — the magic byte survived restart
+  but the list contents were lost. The fix threads `Option<&ListManager>`
+  through `checkpoint()` and `spawn_checkpoint_thread()`. When the
+  checkpoint encounters a list key, it now writes:
+  1. `SET(key, [0xFE])` — to mark the key as a list in the hash table
+  2. `LIST_OP(key, RPUSH(all_elements))` — to rebuild the contents on
+     recovery via the existing `replay_list_op()` path.
+
+  The three checkpoint call sites (`main.rs` periodic thread,
+  `cmd_bgsave`, `cmd_flushall`) were updated to pass the list manager
+  through.
+
+### Added
+
+- Python client: `get_str(key)` and `set_str(key, value)` helper methods
+  on both `FastKVClient` (sync) and `FastKVAsyncClient` (async). These
+  are thin wrappers around `get()` + UTF-8 decode and `set()` that
+  return/accept `str` instead of `bytes`. Convenient for storing
+  counters, flags, and other small string values without manual
+  `.decode()` / `.encode()` boilerplate at every call site.
+
+### Compatibility
+
+- **Wire protocol unchanged** — no client changes required for the
+  LIST WAL fix.
+- **WAL format unchanged** — `WalOp::ListOp` (0x06) was already defined
+  and handled by the recovery code; it just wasn't being written by
+  the command handlers. Existing WAL files replay correctly.
+- Old WAL files written by v1.2.2 or earlier that contain list keys
+  will still have **empty lists after recovery** because the LIST_OP
+  entries were never written. **Action required**: after upgrading,
+  rebuild any list indexes from their source-of-truth.
+- Client library versions bumped to `1.2.3` to stay in sync with the
+  server; no behavioural changes in any client except the new
+  `get_str`/`set_str` helpers.
+
 ## [1.2.2] — 2026-06-21
 
 ### Fixed

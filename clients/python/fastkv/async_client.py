@@ -257,6 +257,19 @@ class FastKVAsyncClient:
         """Get the value of *key*.  Returns ``None`` if missing."""
         return await self._execute_command("GET", key)
 
+    async def get_str(self, key: str) -> Optional[str]:
+        """Get the value of *key* as a UTF-8 string.  Returns ``None`` if missing."""
+        v = await self._execute_command("GET", key)
+        if v is None:
+            return None
+        if isinstance(v, bytes):
+            return v.decode("utf-8", errors="replace")
+        return str(v)
+
+    async def set_str(self, key: str, value: str) -> Optional[bool]:
+        """Set *key* to hold string *value*.  Returns ``True`` if set."""
+        return await self.set(key, value)
+
     async def delete(self, keys: Any) -> int:
         """Remove one or more keys.  Returns count removed."""
         if isinstance(keys, (str, bytes)):
