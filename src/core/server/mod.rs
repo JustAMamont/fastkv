@@ -1,6 +1,6 @@
 //! Server implementations.
 //!
-//! TCP servers for accepting Redis client connections. Both servers share
+//! TCP servers for accepting RESP-speaking client connections. Both servers share
 //! the same command-dispatch logic via [`process_command_into`] and
 //! [`parse_command_bounds`] in the [`tcp`] module.
 //!

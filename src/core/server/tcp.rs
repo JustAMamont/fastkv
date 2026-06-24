@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Default port (same as Redis).
+/// Default port (matches the Redis default for client compatibility).
 pub const DEFAULT_PORT: u16 = 6379;
 
 /// Maximum per-connection read buffer (1 MiB).
@@ -68,7 +68,7 @@ pub struct ServerContext<'a, const N: usize = DEFAULT_INLINE_SIZE> {
 
 /// Tokio-based async TCP server.
 ///
-/// Accepts Redis clients (RESP protocol) on the configured port.
+/// Accepts RESP-speaking clients on the configured port.
 pub struct TokioServer<const N: usize = DEFAULT_INLINE_SIZE> {
     /// Shared lock-free KV store.
     #[allow(dead_code)]
@@ -217,7 +217,7 @@ impl<const N: usize> TokioServer<N> {
         };
 
         println!("FastKV server listening on {}", addr);
-        println!("Ready to accept Redis clients!");
+        println!("Ready to accept RESP clients!");
         println!();
 
         let wal = self.wal.clone();

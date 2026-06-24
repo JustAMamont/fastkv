@@ -7,3 +7,5 @@ criterion/
 /fastkv_data
 *.o
 *.d
+todo.md
+*.zip

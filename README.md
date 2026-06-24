@@ -1,6 +1,39 @@
 # FastKV
 
-High-performance, Redis-compatible key-value store written in Rust with lock-free data structures and zero-dependency client SDKs in Go, Python, Java, and Node.js.
+> ⚠️ **Pre-Alpha — NOT production-ready.**
+> FastKV is an experimental project under active development. It has known
+> correctness bugs (race conditions in `DEL`, O(N²) `FLUSHALL` that blocks the
+> event loop, no TLS, no replication/failover, no cluster mode, a 64 KB
+> key/value length limit, and more). Do **not** use it for any data you care
+> about. The wire protocol (`RESP`), command set, on-disk WAL format, and CLI
+> flags may still change in backward-incompatible ways between releases.
+> Production deployment is blocked until the P0 issues from the roadmap are
+> resolved.
+
+High-performance, Redis-compatible key-value store written in Rust with lock-free data structures. Ships with first-party client SDKs for Rust and Python; for any other language, use any existing Redis client (FastKV speaks standard RESP).
+
+## Project Status
+
+| Aspect | State |
+|--------|-------|
+| Overall | **Pre-alpha** — experimental, APIs and on-disk formats not stable |
+| Single-node core (GET/SET/DEL/INCR/...) | Works for basic workloads, but contains known race-condition and blocking bugs |
+| Persistence (WAL + checkpoint) | Implemented; recovery path has not been hardened against all crash scenarios |
+| TTL / expiration | Implemented; uses a coarse 1 s ticker with lazy + active purging |
+| Hash / List data types | Implemented; persisted to WAL since v1.2.3 |
+| Blob arena (zstd) | Implemented behind `blob-store` feature; recovery edge cases exist |
+| Similarity search (SimHash / MinHash / LSH) | Experimental, behind `similarity` feature |
+| TLS / encryption in transit | **Not implemented** — plaintext TCP only |
+| Authentication | `AUTH` password only; no ACL, no constant-time comparison guarantee |
+| Replication / failover | **Not implemented** — single node only |
+| Cluster mode / sharding | **Not implemented** |
+| Backup / restore tooling | Basic `BGSAVE`/`SAVE` only; no PITR, no snapshot verification |
+| Observability | Minimal `INFO` output; no Prometheus, no structured logs, no tracing |
+| Test coverage | Smoke tests via `redis-py`; no fuzzing, no Jepsen-style concurrency tests |
+
+**Use it for**: local experimentation, benchmarks, learning how a lock-free KV engine is built.
+
+**Do not use it for**: any production workload, any data you cannot afford to lose, any environment exposed to untrusted clients, any HA/DR scenario.
 
 ## Features
 
@@ -21,7 +54,7 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 - **Graceful shutdown** — SIGTERM/SIGINT handling with 30s drain timeout and WAL sync
 - **io_uring (Linux)** — optional kernel-bypass networking for maximum throughput
 - **Non-blocking command dispatch** — heavy writes (WAL `fsync`, BSET compression) run on `spawn_blocking` threads so reads (SCAN, GET) never starve under concurrent write load (v1.2.1+)
-- **Client SDKs** — zero-dependency libraries for Go, Python, Java, and Node.js
+- **Client SDKs** — first-party libraries for Rust and Python; any Redis-compatible client works for other languages (FastKV speaks standard RESP)
 
 ## Performance
 
@@ -182,17 +215,54 @@ fastkv-server-windows-amd64.exe server --port 6379
 
 ### Client Libraries
 
-All clients are **libraries** that you import into your own project — they connect to a running FastKV server over TCP.
+FastKV speaks the standard RESP wire protocol, so any Redis-compatible client works out of the box. We maintain first-party SDKs for Rust and Python; for other languages we recommend using an existing Redis client (see snippets below).
+
+#### First-party SDKs
 
 | Language | Zero Dependencies | Pipeline | Async | Install |
 |----------|:-:|:-:|:-:|--------|
 | **Python** | stdlib only | Yes | asyncio | `pip install git+https://github.com/JustAMamont/fastkv.git#subdirectory=clients/python` |
-| **Node.js** | stdlib only | Yes | native | `npm install fastkv-client-{version}.tgz` |
-| **Java** | JDK 8+ only | Yes | CompletableFuture | add `fastkv-client-java-{version}.jar` to classpath |
-| **Go** | stdlib only | Yes | — | download & vendor `fastkv-client-go-v{version}.tar.gz` |
 | **Rust** | tokio only | Yes | native | download & add `fastkv-client-rust-v{version}.tar.gz` |
 
 See [`clients/README.md`](clients/README.md) for full API reference and usage examples.
+
+#### Using existing Redis clients (community-supported)
+
+For languages where we don't ship a first-party SDK, use any mature Redis client. Custom FastKV commands (`BSET`/`BGET`/`SIMHASH`/`LSHADD`/...) are reachable through each client's raw-command escape hatch.
+
+```python
+# Python — redis-py
+import redis
+r = redis.Redis(host='127.0.0.1', port=6379)
+r.set('k', 'v')
+r.execute_command('BSET', 'blob_key', b'\x00\x01\x02')   # custom command
+```
+
+```go
+// Go — github.com/redis/go-redis/v9
+import "github.com/redis/go-redis/v9"
+rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+rdb.Set(ctx, "k", "v", 0)
+rdb.Do(ctx, "BSET", "blob_key", []byte{0,1,2})  // custom command
+```
+
+```javascript
+// Node.js — ioredis (or node-redis)
+const Redis = require('ioredis');
+const r = new Redis(6379, '127.0.0.1');
+await r.set('k', 'v');
+await r.call('BSET', 'blob_key', Buffer.from([0,1,2]));  // custom command
+```
+
+```java
+// Java — Jedis (or Lettuce)
+try (Jedis j = new Jedis("127.0.0.1", 6379)) {
+    j.set("k", "v");
+    j.sendCommand(new CommandObject<>("BSET"), "blob_key", new byte[]{0,1,2});  // custom command
+}
+```
+
+> Want to maintain a first-party client for a language we don't cover? Open a community repo, link it in [`clients/README.md`](clients/README.md), and we'll list it.
 
 ## Environment Variables
 
@@ -362,13 +432,13 @@ cargo test --features "blob-store,similarity"
 | `tcp.rs` | 8 | Dispatch handlers, DEL list cleanup, WRONGTYPE, PING, inline parsing |
 | `checkpoint.rs` | 3 | BGSAVE, SAVE, checkpoint on empty store, no-WAL edge case |
 
-### Integration Tests (all clients)
+### Integration Tests
 
 ```bash
-# Install all toolchains (Rust, Go, Python, Java, Node.js)
+# Install toolchains (Rust, Python, Node.js — Node is used as a portable port-wait helper)
 ./scripts/install_deps.sh
 
-# Run everything: server unit tests + all client integration tests
+# Run everything: server unit tests + Python + Rust client integration tests
 ./scripts/setup_and_test.sh
 ```
 
@@ -378,10 +448,6 @@ cargo test --features "blob-store,similarity"
 | Rust (client) | 23 |
 | Python sync | 27 |
 | Python async | 28 |
-| Go | 42 |
-| Java sync | 52 |
-| Java reactive | 23 |
-| Node.js | 51 |
 
 ## Benchmarks
 
@@ -458,28 +524,17 @@ fastkv/
 │           ├── tcp.rs          # Tokio TCP server (cross-platform)
 │           └── io_uring.rs     # io_uring server (Linux only)
 ├── clients/
-│   ├── README.md                     # Client SDK overview
+│   ├── README.md                     # Client SDK overview + community-client policy
 │   ├── rust/
 │   │   ├── src/                      # lib.rs, resp.rs, pipeline.rs
 │   │   ├── tests/integration_test.rs  # Integration tests
 │   │   └── examples/example.rs       # Usage example
-│   ├── go/fastkv/
-│   │   ├── fastkv.go                 # Client implementation
-│   │   ├── integration_test.go       # Integration tests
-│   │   └── example_test.go           # Usage examples (go test)
-│   ├── python/
-│   │   ├── fastkv/                   # Package (client.py, async_client.py, ...)
-│   │   └── tests/
-│   │       ├── test_integration.py       # Sync integration tests
-│   │       ├── test_async_integration.py # Async integration tests
-│   │       └── example.py                 # Usage example
-│   ├── java/
-│   │   └── src/*.java                 # Sync + reactive clients, pipelines, tests, examples
-│   └── node/fastkv/
-│       ├── client.js, resp.js, ...   # Client implementation
+│   └── python/
+│       ├── fastkv/                   # Package (client.py, async_client.py, ...)
 │       └── tests/
-│           ├── test_integration.js   # Integration tests
-│           └── example.js            # Usage example
+│           ├── test_integration.py       # Sync integration tests
+│           ├── test_async_integration.py # Async integration tests
+│           └── example.py                 # Usage example
 ├── scripts/
 │   ├── install_deps.sh               # Install all toolchains
 │   └── setup_and_test.sh             # Run all tests
@@ -676,7 +731,7 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 4 — Expiration: EXPIRE/TTL/PTTL/PERSIST, lazy + active purging, WAL persistence
 - [x] Phase 5 — Hash: HSET/HGET/HDEL/HGETALL/HEXISTS/HLEN/HKEYS/HVALS/HMGET/HMSET/HINCRBY/HSETNX
 - [x] Phase 6 — List: LPUSH/RPUSH, LPOP/RPOP, LRANGE/LLEN/LINDEX, LREM/LTRIM/LSET, WRONGTYPE
-- [x] Phase 7 — Client SDKs: Go, Python (sync + async), Java (sync + reactive), Node.js, Rust (zero-dependency, pipeline support)
+- [x] Phase 7 — Client SDKs: Python (sync + async) + Rust (zero-dependency, pipeline support). Java/Node.js/Go clients were moved to community repos — FastKV speaks standard RESP, so any Redis client works
 - [x] Phase 8 — Blob Arena: BSET/BGET/BGETRAW/BSTATS, zstd compression, lock-free arena, WAL persistence, Python client
 - [x] Phase 9 — SimHash/MinHash/LSH: similarity search for near-duplicate detection (feature: `similarity`)
 - [x] Phase 10 — SCAN/KEYS: cursor-based key iteration, glob MATCH, DBSTATS

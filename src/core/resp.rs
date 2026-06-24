@@ -1,6 +1,6 @@
 //! RESP (Redis Serialization Protocol) Implementation
 //!
-//! RESP is the protocol Redis uses for communication.
+//! RESP is the wire protocol used by Redis and Redis-compatible servers.
 //! It's simple, binary-safe, and human-readable.
 //!
 //! ## Protocol Overview

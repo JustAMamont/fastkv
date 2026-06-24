@@ -17,8 +17,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLIENTS_DIR="$PROJECT_DIR/clients"
 
 # Extend PATH so tools installed by install_deps.sh are found
-# (Go in /usr/local/go/bin, Rust in ~/.cargo/bin, etc.)
-export PATH="/usr/local/go/bin:${HOME}/.cargo/bin:${HOME}/.local/bin:/usr/local/bin:${PATH:-}"
+# (Rust in ~/.cargo/bin, Python in ~/.local/bin, etc.)
+export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:/usr/local/bin:${PATH:-}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -115,97 +115,7 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. Go client
-# ═══════════════════════════════════════════════════════════════════════════════
-
-section "Go client"
-
-GO_DIR="$CLIENTS_DIR/go/fastkv"
-
-if command -v go &>/dev/null; then
-    if [ -f "$GO_DIR/integration_test.go" ]; then
-        export FASTKV_ADDR="${FASTKV_HOST}:${FASTKV_PORT}"
-        run_test "Go integration tests" \
-            bash -c "cd '$GO_DIR' && go test -v -count=1 -timeout 30s ./... 2>&1"
-    else
-        fail "Go tests" "file not found: $GO_DIR/integration_test.go"
-    fi
-else
-    echo -e "  ${YELLOW}go not found — skipping${NC}"
-fi
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. Java client
-# ═══════════════════════════════════════════════════════════════════════════════
-
-section "Java client"
-
-JAVA_DIR="$CLIENTS_DIR/java"
-
-if command -v javac &>/dev/null; then
-    if [ -f "$JAVA_DIR/src/IntegrationTest.java" ]; then
-        BUILD_DIR="$JAVA_DIR/target/test-classes"
-        rm -rf "$BUILD_DIR"
-        mkdir -p "$BUILD_DIR"
-
-        echo -e "  ${YELLOW}Compiling Java ...${NC}"
-        if (find "$JAVA_DIR/src" -name "*.java" | xargs javac -d "$BUILD_DIR" 2>&1); then
-            ok "Java compiled"
-            run_test "Java integration tests" \
-                java -Dfastkv.host="$FASTKV_HOST" \
-                     -Dfastkv.port="$FASTKV_PORT" \
-                     -cp "$BUILD_DIR" \
-                     com.fastkv.client.IntegrationTest
-        else
-            fail "Java compile" "see errors above"
-        fi
-    else
-        fail "Java tests" "file not found: $JAVA_DIR/src/IntegrationTest.java"
-    fi
-else
-    echo -e "  ${YELLOW}javac not found — skipping${NC}"
-fi
-
-# 4b. Java client (reactive)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-section "Java client (reactive)"
-
-if command -v javac &>/dev/null; then
-    if [ -f "$JAVA_DIR/src/IntegrationTestReactive.java" ]; then
-        run_test "Java reactive integration tests" \
-            java -Dfastkv.host="$FASTKV_HOST" \
-                 -Dfastkv.port="$FASTKV_PORT" \
-                 -cp "$BUILD_DIR" \
-                 com.fastkv.client.IntegrationTestReactive
-    else
-        fail "Java reactive tests" "file not found: $JAVA_DIR/src/IntegrationTestReactive.java"
-    fi
-else
-    echo -e "  ${YELLOW}javac not found — skipping${NC}"
-fi
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5. Node.js client
-# ═══════════════════════════════════════════════════════════════════════════════
-
-section "Node.js client"
-
-NODE_DIR="$CLIENTS_DIR/node/fastkv"
-
-if command -v node &>/dev/null; then
-    if [ -f "$NODE_DIR/tests/test_integration.js" ]; then
-        run_test "Node.js integration tests" \
-            node "$NODE_DIR/tests/test_integration.js" "$FASTKV_HOST" "$FASTKV_PORT"
-    else
-        fail "Node.js tests" "file not found: $NODE_DIR/tests/test_integration.js"
-    fi
-else
-    echo -e "  ${YELLOW}node not found — skipping${NC}"
-fi
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 6. Rust client (async)
+# 3. Rust client (async)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 section "Rust client"
