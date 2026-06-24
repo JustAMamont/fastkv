@@ -12,6 +12,7 @@
 - [🟢 P2 — Долгосрочные возможности](#-p2--долгосрочные-возможности)
 - [🟦 P3 — Operational / Ops](#-p3--operational--ops)
 - [🟨 P4 — Code quality / Tech debt](#-p4--code-quality--tech-debt)
+- [🟪 Blob Arena — глубокий разбор и план доработки](#-blob-arena--глубокий-разбор-и-план-доработки)
 - [⭐ Резюме и рекомендуемый порядок](#-резюме-и-рекомендуемый-порядок)
 
 ---
@@ -665,6 +666,189 @@ GitHub Actions с test+clippy+fmt — минимум.
 
 ---
 
+## 🟪 Blob Arena — глубокий разбор и план доработки
+
+Отдельная подсистема за feature-флагом `blob-store` (`src/core/blob.rs`, ~900 строк).
+Заслуживает детального разбора, потому что это **самая хрупкая и потенциально самая
+killer-фичевая** часть FastKV: без неё lock-free хэш-таблица физически не может
+хранить значения длиннее `--inline-size` (по умолчанию 64, максимум 512 байт).
+
+### Что это такое и зачем
+
+`KvStoreLockFree<N>` держит key и value **inline** в массиве `[[AtomicU8; N]; 2]`.
+Значение длиннее N в таблицу просто не влезает. Без Blob Arena у тебя два плохих
+варианта:
+
+1. Отказывать в `SET` значений длиннее N → теряешь функциональность.
+2. Поставить `--inline-size 512` → каждая запись жрёт ~1 KB+, даже если там `"ok"`.
+   На 100K ключей это 100 MB вместо 19 MB.
+
+Blob Arena решает третьим путём: **маленькие значения остаются inline (zero
+overhead), большие уходят в отдельную арену со сжатием zstd, а в хэш-таблицу
+кладётся 33-байтный `BlobRef`** вместо самих данных.
+
+**BlobRef layout** (33 байта, влезает даже в N=64):
+
+```text
+Byte 0:     flag = 0xFD (маркер blob-ссылки)
+Bytes 1-8:  offset (u64 LE) — позиция в арене
+Bytes 9-12: comp_len (u32 LE) — длина сжатых данных
+Bytes 13-16: orig_len (u32 LE) — длина оригинала
+Bytes 17-32: data_hash ([u8; 16]) — dual crc32c
+```
+
+**Архитектура арены:**
+
+- Chunked allocation: 64 MB chunks, выделяются по требованию.
+- Lock-free write: CAS на `write_offset` для атомарного захвата места.
+- Lock-free read: данные иммутабельны после записи.
+- Free list: sorted best-fit с бинарным поиском, O(log n) reuse.
+- Сжатие: zstd level 3 (за feature-флагом).
+- Хеширование: dual crc32c (две разные сидушки) → 16-байтная integrity-проверка.
+
+### Где это реально полезно (target workload)
+
+- **ML feature store** — короткий ключ + 768-dim float эмбеддинг (~3 KB).
+- **Document cache** — JSON > 512 байт.
+- **Thumbnail / image cache** — 1-10 KB.
+- **Session blob storage** — сериализованные сессии 1-4 KB.
+
+Mixed-size workload (короткие ключи + редкие большие значения) — главный
+use case. Без Blob Arena такие workload'ы либо невозможны, либо раздуты по памяти.
+
+### Проблемы и план доработки
+
+#### BA1. BGET не использует `spawn_blocking` для decompress — может вешать event loop
+
+**Файл:** `src/core/server/tcp.rs` (обработчик `BGET`), `src/core/blob.rs:424` (`retrieve`)
+
+**Симптом:** `BSET` идёт через `spawn_blocking` (сжатие блокирующее), но `BGET` —
+нет, при том что `zstd::bulk::decompress` тоже блокирующий. Под read-heavy-нагрузкой
+на большие blob'ы event loop будет подвисать на decompress.
+
+**Сложность:** ⭐⭐
+**Бизнес-импакт:** Высокий (latency spike under load)
+**Что делать:** Обернуть `retrieve` в `spawn_blocking` симметрично с `BSET`.
+Альтернатива — пул decompress-воркеров, но это overkill на pre-alpha.
+
+#### BA2. Нет кэша распакованных blob'ов
+
+**Файл:** `src/core/blob.rs` (отсутствует)
+
+**Симптом:** `BGET` делает `zstd::bulk::decompress` при каждом вызове. На
+read-heavy-нагрузке (например, hot key) CPU упрётся в decompress, хотя тот же
+blob распаковывался секунду назад.
+
+**Сложность:** ⭐⭐⭐
+**Бизнес-импакт:** Высокий (throughput на hot blobs)
+**Что делать:** LRU-кэш на N последних распакованных blob'ов (по `BlobRef.offset`
+как ключу). Размер — конфигурируемый, по умолчанию 256 entries / 64 MB. Важно:
+инвалидация при `BSET` поверх существующего ключа (через отслеживание
+`BlobRef.offset` → удалять кэш-запись при перезаписи).
+
+#### BA3. Нет инкрементального GC арены — она только растёт
+
+**Файл:** `src/core/blob.rs:456` (`free`), `src/core/blob.rs:479` (`stats`)
+
+**Симптом:** `free()` кладёт слот в sorted free list для будущего reuse, но
+компактизация самой арены (дефрагментация чанков) происходит **только** при
+`BGSAVE`/checkpoint. Если чекпойнты редкие — арена утекает, особенно под
+churn-workload (частая перезапись больших ключей).
+
+Free list сам по себе не растёт бесконечно (есть doubling до `FREE_LIST_CAPACITY`),
+но физическая память чанков не освобождается до checkpoint.
+
+**Сложность:** ⭐⭐⭐⭐
+**Бизнес-импакт:** Средний (memory leak под churn)
+**Что делать:** Background GC тред, который периодически:
+1. Берёт чанк с наибольшим числом free slots.
+2. Перемещает live blob'ы в новый чанк (через `store` + обновление `BlobRef`
+   в хэш-таблице через CAS).
+3. Освобождает старый чанк.
+Это сложно из-за lock-free — нужны эпохи или hazard pointers, чтобы не
+освободить чанк, который ещё читается. На pre-alpha достаточно хотя бы
+метрики `wasted_bytes` в `BSTATS`, чтобы видеть проблему.
+
+#### BA4. Асимметрия BSET/BGET под load — path divergence
+
+**Файл:** `src/core/server/tcp.rs` (обработчики `BSET` / `BGET`)
+
+**Симптом:** `BSET` → `spawn_blocking` (compress + arena.store + WAL write),
+`BGET` → inline decompress. Это асимметрия, которая плохо кончается:
+под mixed read/write workload'ом writers не блокируют event loop, а readers —
+блокируют. Должно быть наоборот или симметрично.
+
+**Сложность:** ⭐⭐
+**Бизнес-импакт:** Высокий (tail latency на reads)
+**Что делать:** См. BA1 + BA2. После их решения симметрия восстановится.
+
+#### BA5. Recovery path хрупкий — v1.2.2 фиксил data loss
+
+**Файл:** `src/core/checkpoint.rs`, `src/core/wal.rs`, `src/main.rs` (replay)
+
+**Контекст:** В v1.2.2 чинили баг, где checkpoint писал blob-ключи как обычный
+`SET` с 33-байтным `BlobRef` в качестве значения, вместо `BSET` с оригинальным
+несжатым payload. После рестарта хэш-таблица содержала `BlobRef`, указывающий
+на пустую арену → `BGET` возвращал `nil`, `redis-cli GET` рапортовал
+`blob decompression failed`.
+
+**Симпакт:** Recovery path для blob-ключей имеет несколько точек отказа:
+1. Checkpoint должен правильно различать blob-ключи (через `BlobArena::is_blob_ref`)
+   и писать их как `BSET`.
+2. WAL replay должен корректно перестроить арену из `BSET` entries.
+3. Если `--inline-size` отличается от того, с которым был создан WAL → blob-ключи
+   могут не влезть в inline-поле и будут пропущены с warning.
+
+**Сложность:** ⭐⭐⭐
+**Бизнес-импакт:** Высокий (data loss при restart)
+**Что делать:**
+1. Integration-тест: записать blob-ключи → checkpoint → restart → проверить,
+   что `BGET` возвращает оригинал. Сейчас такого теста нет.
+2. Тест на разные `--inline-size` до/после restart.
+3. Тест на crash-mid-checkpoint (kill -9 во время BGSAVE → restart → integrity).
+4. В `BSTATS` добавить `recovery_warnings` счётчик.
+
+#### BA6. BSTATS недостаточен для observability
+
+**Файл:** `src/core/blob.rs:479` (`stats`), `src/core/server/tcp.rs` (`BSTATS`)
+
+**Симптом:** Сейчас `BSTATS` возвращает: `total_used`, `total_compressed`,
+`total_original`, `compression_ratio`, `free_slots`. Не хватает:
+- `wasted_bytes` (память в free list, которая не переиспользуется)
+- `chunk_count` (сколько 64MB чанков выделено)
+- `cache_hits` / `cache_misses` (после BA2)
+- `decompress_total_ns` / `compress_total_ns` (для profiling)
+- `decompress_queue_depth` (после BA1)
+
+**Сложность:** ⭐
+**Бизнес-импакт:** Низкий (но нужно для BA2/BA3 debugging)
+**Что делать:** Расширить `BlobStats` структуру + обновить `BSTATS` ответ.
+
+### Соответствие с индустрией
+
+| Проект | Inline/external разделение | Сжатие | Кэш декомпрессии | GC арены |
+|--------|:---:|:---:|:---:|:---:|
+| **FastKV** | ✅ (BlobRef) | ✅ zstd | ❌ (BA2) | ❌ только checkpoint (BA3) |
+| Redis | ❌ (всё SDS + malloc) | ❌ | — | — |
+| DragonflyDB | ✅ | опц. | ✅ | ✅ |
+| Garnet (MS) | ✅ | опц. | ✅ | ✅ |
+| FoundationDB | ✅ chunked | ✅ | — | ✅ |
+
+Blob Arena в FastKV — **разумный дизайн** для memory-constrained mixed-size
+workload. Но без кэша декомпрессии (BA2) и инкрементального GC (BA3) — это
+пока pre-alpha level. BGET на 10KB blob под нагрузкой будет тормозить.
+
+### Рекомендуемый порядок для Blob Arena
+
+1. **BA6** (расширить BSTATS) — даёт видимость для отладки следующих шагов.
+2. **BA1 + BA4** (`spawn_blocking` на BGET) — quick win, убирает tail latency.
+3. **BA5** (recovery integration tests) — страхует от data loss.
+4. **BA2** (LRU кэш декомпрессии) — killer-feature для read-heavy.
+5. **BA3** (инкрементальный GC) — последний, самый сложный, нужен только под
+   churn-workload.
+
+---
+
 ## ⭐ Резюме и рекомендуемый порядок
 
 ### Если цель — портфолио / диплом
@@ -718,6 +902,12 @@ GitHub Actions с test+clippy+fmt — минимум.
 | A6 | Feature | ⭐⭐ | Высокий | С C3 заодно |
 | A7 | Feature | ⭐⭐⭐ | Средний | С C7 заодно |
 | A10 | Feature | ⭐⭐ | Средний | Любой момент |
+| BA1 | Баг | ⭐⭐ | Высокий (latency) | После C1-C9 |
+| BA2 | Feature | ⭐⭐⭐ | 🔥 Killer (read-heavy) | После BA1 |
+| BA3 | Feature | ⭐⭐⭐⭐ | Средний (churn leak) | После BA2 |
+| BA4 | Баг | ⭐⭐ | Высокий (tail latency) | С BA1 заодно |
+| BA5 | Tech debt | ⭐⭐⭐ | Высокий (data loss) | После BA2 |
+| BA6 | Ops | ⭐ | Низкий (observability) | ✅ Срочно (даёт видимость) |
 
 ---
 
