@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] — 2026-07-10
+
+### Fixed (CI)
+
+- **CI build broken on macOS and Windows.** The previous workflow ran
+  `cargo test --release --all-features` on every platform. The only
+  remaining cargo feature, `io-uring`, transitively pulls in the
+  `io-uring` crate (version 0.6.4), which uses Linux-specific libc
+  symbols (`MAP_POPULATE`, `SYS_io_uring_setup`, `cpu_set_t`,
+  `sigset_t`, `iovec`, `msghdr`, …) and `std::os::unix::io::*`. On
+  macOS the build failed with `cannot find value MAP_POPULATE in
+  crate libc` (BSD libc does not export those constants); on Windows
+  it failed with `cannot find unix in os` because `std::os::unix` is
+  gated behind `target_os = "linux"`.
+  The fix splits the `Rust unit tests` step into two:
+    1. Linux (`matrix.label == 'linux-amd64'`):
+       `cargo test --release --features io-uring`
+    2. macOS / Windows (`matrix.label != 'linux-amd64'`):
+       `cargo test --release`
+  This matches the existing `Build server` step, which already gated
+  `--features io-uring` on Linux only.
+
+### Verification
+
+Both profiles were verified locally on Linux x86_64 (kernel 5.10,
+rustc 1.97.0):
+
+| Profile | Result |
+|---------|--------|
+| `cargo test` (dev, no features) | 206 tests passed, 0 warnings |
+| `cargo test --features io-uring` (dev, Linux) | 206 tests passed, 0 warnings |
+| `cargo test --release` (no features) | 206 tests passed, 0 warnings |
+| `cargo test --release --features io-uring` (Linux) | 206 tests passed, 0 warnings |
+
 ## [1.5.0] — 2026-07-10
 
 ### Changed — Distribution refactor

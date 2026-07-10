@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "fast_kv"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "crc32c",
  "criterion",

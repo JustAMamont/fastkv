@@ -61,11 +61,18 @@ jobs:
         if: matrix.target != ''
         run: rustup target add ${{ matrix.target }}
 
-      - name: Rust unit tests
-        if: matrix.native
+      - name: Rust unit tests (Linux, with io-uring)
+        if: matrix.native && matrix.label == 'linux-amd64'
         # v1.5.0+: blob-store and similarity are no longer cargo features —
-        # they are always compiled in. Only io-uring remains a feature.
-        run: cargo test --release --all-features
+        # they are always compiled in. Only io-uring remains a feature,
+        # and it is Linux-only (the io-uring crate uses Linux-specific libc
+        # symbols like MAP_POPULATE and SYS_io_uring_setup that are not
+        # present on macOS or Windows).
+        run: cargo test --release --features io-uring
+
+      - name: Rust unit tests (macOS / Windows, no io-uring)
+        if: matrix.native && matrix.label != 'linux-amd64'
+        run: cargo test --release
 
       - name: Build server
         shell: bash
