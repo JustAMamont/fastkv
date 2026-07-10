@@ -18,6 +18,8 @@ use crate::core::list::{self, ListManager};
 use crate::core::resp::{write_usize_buf, RespEncoder, RespParser};
 use crate::core::wal::WalWriter;
 use crate::core::checkpoint;
+use crate::core::sortedset::SortedSetStore;
+use crate::core::pubsub::PubSubRegistry;
 
 use crate::core::blob::BlobArena;
 use std::path::Path;
@@ -48,7 +50,7 @@ pub struct ServerContext<'a, const N: usize = DEFAULT_INLINE_SIZE> {
     pub wal: Option<&'a dyn WalWriter>,
     pub expiry: Option<&'a ExpirationManager<N>>,
     pub lists: Option<&'a ListManager<N>>,
-    
+    pub sorted_sets: Option<&'a SortedSetStore>,
     pub blob: Option<&'a BlobArena>,
     pub wal_path: Option<&'a Path>,
     /// Server password for AUTH. If set, clients must authenticate before
@@ -79,8 +81,11 @@ pub struct TokioServer<const N: usize = DEFAULT_INLINE_SIZE> {
     expiry: Option<Arc<ExpirationManager<N>>>,
     /// Optional list manager.
     lists: Option<Arc<ListManager<N>>>,
+    /// Optional sorted-set store (lock-free: SkipMap + DashMap).
+    sorted_sets: Option<Arc<SortedSetStore>>,
+    /// Optional Pub/Sub registry (async broadcast fan-out).
+    pubsub: Option<Arc<PubSubRegistry>>,
     /// Optional blob arena for large-value storage.
-    
     blob: Option<Arc<BlobArena>>,
     /// Path to the WAL file (for BGSAVE/checkpoint).
     wal_path: Option<std::path::PathBuf>,
@@ -109,7 +114,8 @@ impl<const N: usize> TokioServer<N> {
             wal: None,
             expiry: None,
             lists: None,
-            
+            sorted_sets: None,
+            pubsub: None,
             blob: None,
             wal_path: None,
             password: None,
@@ -131,7 +137,8 @@ impl<const N: usize> TokioServer<N> {
             wal: None,
             expiry: None,
             lists: None,
-            
+            sorted_sets: None,
+            pubsub: None,
             blob: None,
             wal_path: None,
             password: None,
@@ -152,6 +159,8 @@ impl<const N: usize> TokioServer<N> {
         wal: Option<Arc<dyn WalWriter>>,
         expiry: Option<Arc<ExpirationManager<N>>>,
         lists: Option<Arc<ListManager<N>>>,
+        sorted_sets: Option<Arc<SortedSetStore>>,
+        pubsub: Option<Arc<PubSubRegistry>>,
         blob: Option<Arc<BlobArena>>,
         wal_path: Option<std::path::PathBuf>,
         password: Option<String>,
@@ -160,6 +169,7 @@ impl<const N: usize> TokioServer<N> {
     ) -> Self {
         Self {
             store, wal, expiry, lists,
+            sorted_sets, pubsub,
             blob,
             wal_path,
             password,
@@ -198,7 +208,8 @@ impl<const N: usize> TokioServer<N> {
         let wal = self.wal.clone();
         let expiry = self.expiry.clone();
         let lists = self.lists.clone();
-        
+        let sorted_sets = self.sorted_sets.clone();
+        let pubsub = self.pubsub.clone();
         let blob = self.blob.clone();
         let wal_path = self.wal_path.clone();
         let password = self.password.clone();
@@ -274,7 +285,8 @@ impl<const N: usize> TokioServer<N> {
             let wal_c = wal.clone();
             let expiry_c = expiry.clone();
             let lists_c = lists.clone();
-            
+            let sorted_sets_c = sorted_sets.clone();
+            let pubsub_c = pubsub.clone();
             let blob_c = blob.clone();
             let wal_path_c = wal_path.clone();
             let password_c = password.clone();
@@ -289,8 +301,8 @@ impl<const N: usize> TokioServer<N> {
                 }
                 let _guard = ConnGuard { conn: active_conn };
 
-                
-                handle_client(socket, store, wal_c, expiry_c, lists_c, blob_c, wal_path_c, peer_addr, password_c, shutting_down_c).await;
+
+                handle_client(socket, store, wal_c, expiry_c, lists_c, sorted_sets_c, pubsub_c, blob_c, wal_path_c, peer_addr, password_c, shutting_down_c).await;
             });
         }
 
@@ -331,11 +343,16 @@ impl<const N: usize> Default for TokioServer<N> {
 /// (e.g. from a farmer process making many BSET/SET calls) would starve
 /// read commands (SCAN, GET) by blocking all tokio worker threads on WAL
 /// `std::sync::Mutex` + synchronous `file.write_all()` / `fsync`.
-struct OwnedCtx<const N: usize> {
+///
+/// Pub/Sub state is intentionally NOT included here — subscribe/unsubscribe
+/// require async operations on `tokio::sync::broadcast` and are handled in
+/// the async part of `handle_client` before any `spawn_blocking` dispatch.
+pub(crate) struct OwnedCtx<const N: usize> {
     store: Arc<KvStoreLockFree<N>>,
     wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
+    sorted_sets: Option<Arc<SortedSetStore>>,
     blob: Option<Arc<BlobArena>>,
     wal_path: Option<std::path::PathBuf>,
     password: Option<String>,
@@ -431,7 +448,7 @@ fn find_resp_array_end(data: &[u8]) -> Option<usize> {
 /// processes every complete command in *buffer*, accumulating responses.
 /// Incomplete trailing bytes (partial command) are returned as `remaining_bytes`
 /// so the caller can carry them over to the next read.
-fn process_buffer<const N: usize>(
+pub(crate) fn process_buffer<const N: usize>(
     ctx_owned: OwnedCtx<N>,
     mut buffer: Vec<u8>,
 ) -> (Vec<u8>, bool, Vec<u8>) {
@@ -440,6 +457,7 @@ fn process_buffer<const N: usize>(
         wal: ctx_owned.wal.as_deref(),
         expiry: ctx_owned.expiry.as_deref(),
         lists: ctx_owned.lists.as_deref(),
+        sorted_sets: ctx_owned.sorted_sets.as_deref(),
         blob: ctx_owned.blob.as_deref(),
         wal_path: ctx_owned.wal_path.as_deref(),
         password: ctx_owned.password.as_ref(),
@@ -474,20 +492,58 @@ fn process_buffer<const N: usize>(
 /// thread, but command processing (which may do synchronous WAL writes) is
 /// dispatched to `tokio::task::spawn_blocking`. This ensures that heavy
 /// write load from one connection cannot starve read commands (SCAN, GET)
-/// on other connections by blocking all async worker threads on WAL I/O.
+/// on other connections by blocking all tokio worker threads on WAL I/O.
+///
+/// **Pub/Sub model**: a dedicated writer task owns the socket write half.
+/// Command responses and inbound pub/sub messages both flow through a single
+/// mpsc channel into the writer. Each `SUBSCRIBE` spawns a small forwarder
+/// task that pumps `broadcast::Receiver` events into the same mpsc channel,
+/// so subscriber notifications never block publishers and never get blocked
+/// by heavy WAL writes on the same connection.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client<const N: usize>(
-    mut socket: TcpStream,
+    socket: TcpStream,
     store: Arc<KvStoreLockFree<N>>,
     wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
+    sorted_sets: Option<Arc<SortedSetStore>>,
+    pubsub: Option<Arc<PubSubRegistry>>,
     blob: Option<Arc<BlobArena>>,
     wal_path: Option<std::path::PathBuf>,
     addr: std::net::SocketAddr,
     password: Option<String>,
     shutting_down: Arc<AtomicBool>,
 ) {
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    // Split the socket into owned read and write halves so the writer task
+    // can own the write half without borrowing from the reader task.
+    let (mut socket_rx, socket_tx) = socket.into_split();
+
+    // Outbound channel: command responses + pub/sub messages flow here.
+    // 1024 is large enough to absorb a burst of pipelined replies without
+    // blocking the writer task, while bounding memory under load.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(1024);
+
+    // Per-connection subscription state: channel name -> forwarder JoinHandle.
+    // Owned by the reader task; forwarders are aborted on UNSUBSCRIBE / drop.
+    let mut subscriptions: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    // --- Writer task: sole owner of socket_tx ---
+    // Drains the outbound channel and flushes bytes to the socket. Aborts
+    // on write error; the reader observes this via channel close.
+    let writer_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let mut socket_tx = socket_tx;
+        while let Some(buf) = outbound_rx.recv().await {
+            if socket_tx.write_all(&buf).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut read_buf = vec![0u8; MAX_BUFFER_SIZE];
     let mut leftover: Vec<u8> = Vec::with_capacity(4096);
     let authenticated = Arc::new(AtomicBool::new(false));
@@ -498,7 +554,7 @@ async fn handle_client<const N: usize>(
             break;
         }
 
-        let n = match socket.read(&mut read_buf).await {
+        let n = match socket_rx.read(&mut read_buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => { eprintln!("[{}] Read error: {}", addr, e); break; }
@@ -506,49 +562,391 @@ async fn handle_client<const N: usize>(
 
         leftover.extend_from_slice(&read_buf[..n]);
 
-        // Skip the spawn_blocking round-trip if there is nothing to process yet.
         if leftover.is_empty() {
             continue;
         }
 
-        // Build the owned context for the blocking closure.
-        let ctx_owned = OwnedCtx::<N> {
-            store: Arc::clone(&store),
-            wal: wal.clone(),
-            expiry: expiry.clone(),
-            lists: lists.clone(),
-            blob: blob.clone(),
-            wal_path: wal_path.clone(),
-            password: password.clone(),
-            authenticated: Arc::clone(&authenticated),
-        };
+        // Walk the buffer one command at a time. Pub/Sub commands are handled
+        // inline (they require async broadcast operations); everything else
+        // is collected into a batch and dispatched to spawn_blocking so that
+        // synchronous WAL writes don't block the async worker thread.
+        let mut batch: Vec<u8> = Vec::with_capacity(leftover.len());
+        let mut consumed = 0usize;
+        let mut should_close = false;
 
-        // Move command processing to a blocking thread so that synchronous
-        // WAL writes (std::sync::Mutex + file.write_all + optional fsync)
-        // do not block the async worker thread. This is critical for
-        // concurrent read commands (SCAN, GET) to make progress while
-        // other connections are doing heavy writes.
-        let buffer_to_process = std::mem::take(&mut leftover);
-        let process_result = tokio::task::spawn_blocking(move || {
-            process_buffer(ctx_owned, buffer_to_process)
-        }).await;
-
-        let (resp_buf, should_close, remaining) = match process_result {
-            Ok(result) => result,
-            Err(join_err) => {
-                eprintln!("[{}] Command processing task panicked: {}", addr, join_err);
+        while consumed < leftover.len() {
+            let Some((len, is_inline)) = parse_command_bounds(&leftover[consumed..]) else {
                 break;
+            };
+            // Clone the command bytes so we can hand them to the pubsub
+            // helper without holding a borrow of `leftover` (which we may
+            // need to reassign below when flushing the batch).
+            let cmd_bytes: Vec<u8> = leftover[consumed..consumed + len].to_vec();
+
+            if is_pubsub_command(&cmd_bytes, is_inline) {
+                // Flush any accumulated batch first so order is preserved.
+                if !batch.is_empty() {
+                    let ctx_owned = build_ctx::<N>(
+                        &store, &wal, &expiry, &lists, &sorted_sets, &blob,
+                        &wal_path, &password, &authenticated,
+                    );
+                    let batch_buf = std::mem::take(&mut batch);
+                    let (resp, close, rem) = tokio::task::spawn_blocking(move || {
+                        process_buffer(ctx_owned, batch_buf)
+                    }).await.unwrap_or_else(|_| (Vec::new(), false, Vec::new()));
+                    if !resp.is_empty() {
+                        let _ = outbound_tx.send(resp).await;
+                    }
+                    should_close = should_close || close;
+                    leftover = rem;
+                    consumed = 0;
+                }
+
+                // Handle the pub/sub command inline.
+                let close = handle_pubsub_command::<N>(
+                    &cmd_bytes, is_inline, &pubsub, &password, &authenticated,
+                    &outbound_tx, &mut subscriptions,
+                ).await;
+                if close { should_close = true; }
+                consumed += len;
+                continue;
+            }
+
+            // Non-pubsub command: append to batch for spawn_blocking dispatch.
+            batch.extend_from_slice(&cmd_bytes);
+            consumed += len;
+        }
+
+        // Drain the consumed prefix; keep the unconsumed tail (partial command).
+        leftover.drain(..consumed);
+
+        // Dispatch the accumulated non-pubsub batch (if any) to a blocking thread.
+        if !batch.is_empty() {
+            let ctx_owned = build_ctx::<N>(
+                &store, &wal, &expiry, &lists, &sorted_sets, &blob,
+                &wal_path, &password, &authenticated,
+            );
+            let batch_buf = batch;
+            let (resp, close, rem) = tokio::task::spawn_blocking(move || {
+                process_buffer(ctx_owned, batch_buf)
+            }).await.unwrap_or_else(|_| (Vec::new(), false, Vec::new()));
+            if !resp.is_empty() {
+                let _ = outbound_tx.send(resp).await;
+            }
+            should_close = should_close || close;
+            leftover = rem;
+        }
+
+        if should_close { break; }
+    }
+
+    // Tear down: drop subscriptions, close outbound channel, wait for writer.
+    for (_, handle) in subscriptions.drain() {
+        handle.abort();
+    }
+    drop(outbound_tx);
+    let _ = writer_handle.await;
+}
+
+/// Construct an [`OwnedCtx`] from the shared component handles.
+///
+/// Factored out so the reader loop does not repeat the same `Arc::clone`
+/// boilerplate at every dispatch point.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_ctx<const N: usize>(
+    store: &Arc<KvStoreLockFree<N>>,
+    wal: &Option<Arc<dyn WalWriter>>,
+    expiry: &Option<Arc<ExpirationManager<N>>>,
+    lists: &Option<Arc<ListManager<N>>>,
+    sorted_sets: &Option<Arc<SortedSetStore>>,
+    blob: &Option<Arc<BlobArena>>,
+    wal_path: &Option<std::path::PathBuf>,
+    password: &Option<String>,
+    authenticated: &Arc<AtomicBool>,
+) -> OwnedCtx<N> {
+    OwnedCtx::<N> {
+        store: Arc::clone(store),
+        wal: wal.clone(),
+        expiry: expiry.clone(),
+        lists: lists.clone(),
+        sorted_sets: sorted_sets.clone(),
+        blob: blob.clone(),
+        wal_path: wal_path.clone(),
+        password: password.clone(),
+        authenticated: Arc::clone(authenticated),
+    }
+}
+
+/// Peek at the first token of a serialized command and return `true` if it
+/// is a Pub/Sub command that must be handled in the async context.
+///
+/// Supports both RESP array form (`*2\r\n$9\r\nSUBSCRIBE\r\n...`) and
+/// inline form (`SUBSCRIBE ch\r\n`). Matching is case-insensitive on the
+/// command name (the parser uppercases it, but inline input may not be).
+pub(crate) fn is_pubsub_command(data: &[u8], is_inline: bool) -> bool {
+    let name = if is_inline {
+        let end = data.iter().position(|&b| b == b' ' || b == b'\r' || b == b'\n')
+            .unwrap_or(data.len());
+        &data[..end]
+    } else {
+        // Skip `*N\r\n` then read bulk-string header `$L\r\n` and L bytes.
+        let mut pos = 1usize;
+        while pos + 1 < data.len() && !(data[pos] == b'\r' && data[pos + 1] == b'\n') {
+            pos += 1;
+        }
+        if pos + 2 >= data.len() { return false; }
+        pos += 2;
+        if pos >= data.len() || data[pos] != b'$' { return false; }
+        pos += 1;
+        let len_start = pos;
+        while pos + 1 < data.len() && !(data[pos] == b'\r' && data[pos + 1] == b'\n') {
+            pos += 1;
+        }
+        if pos + 2 >= data.len() { return false; }
+        let len: usize = match std::str::from_utf8(&data[len_start..pos]).ok()
+            .and_then(|s| s.parse().ok())
+        {
+            Some(n) => n,
+            None => return false,
+        };
+        pos += 2;
+        if pos + len > data.len() { return false; }
+        &data[pos..pos + len]
+    };
+
+    const PUBSUB_COMMANDS: &[&[u8]] = &[
+        b"SUBSCRIBE", b"UNSUBSCRIBE", b"PUBLISH", b"PUBSUB",
+    ];
+    PUBSUB_COMMANDS.iter().any(|cmd| {
+        name.len() == cmd.len()
+            && name.iter().zip(cmd.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// Handle a Pub/Sub command in the async context.
+///
+/// Returns `true` if the connection should be closed (currently always false;
+/// kept for symmetry with [`process_command_into`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_pubsub_command<const N: usize>(
+    data: &[u8],
+    _is_inline: bool,
+    pubsub: &Option<Arc<PubSubRegistry>>,
+    password: &Option<String>,
+    authenticated: &Arc<AtomicBool>,
+    outbound_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    subscriptions: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+) -> bool {
+    use crate::core::resp::RespParser;
+
+    let cmd = match RespParser::parse(data) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("ERR parse error: {}", e);
+            let _ = outbound_tx.send(RespEncoder::encode_error(&msg)).await;
+            return false;
+        }
+    };
+    let name = cmd.name.as_str();
+
+    if password.is_some() && !authenticated.load(Ordering::SeqCst)
+        && !matches!(name, "AUTH" | "PING" | "QUIT")
+    {
+        let _ = outbound_tx.send(b"-NOAUTH Authentication required\r\n".to_vec()).await;
+        return false;
+    }
+
+    let Some(registry) = pubsub else {
+        let _ = outbound_tx.send(RespEncoder::encode_error("ERR pubsub not enabled")).await;
+        return false;
+    };
+
+    match name {
+        "SUBSCRIBE" => handle_subscribe(&cmd, registry, outbound_tx, subscriptions).await,
+        "UNSUBSCRIBE" => handle_unsubscribe(&cmd, registry, outbound_tx, subscriptions).await,
+        "PUBLISH" => handle_publish(&cmd, registry, outbound_tx).await,
+        "PUBSUB" => handle_pubsub_meta(&cmd, registry, outbound_tx).await,
+        _ => {
+            let msg = format!("ERR unknown command '{}'", cmd.name);
+            let _ = outbound_tx.send(RespEncoder::encode_error(&msg)).await;
+        }
+    }
+    false
+}
+
+/// Encode the standard `subscribe` / `unsubscribe` reply:
+/// `*3\r\n$9\r\nsubscribe\r\n$<ch_len>\r\n<channel>\r\n:<count>\r\n`
+fn write_subscribe_reply(out: &mut Vec<u8>, verb: &str, channel: &str, count: i64) {
+    use std::io::Write;
+    let _ = write!(out, "*3\r\n${}\r\n{}\r\n${}\r\n{}\r\n:{}\r\n",
+        verb.len(), verb, channel.len(), channel, count);
+}
+
+/// Encode a `message` frame: `*3\r\n$7\r\nmessage\r\n$<ch_len>\r\n<ch>\r\n$<msg_len>\r\n<msg>\r\n`
+fn write_message_frame(out: &mut Vec<u8>, channel: &str, message: &[u8]) {
+    use std::io::Write;
+    let _ = write!(out, "*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n${}\r\n",
+        channel.len(), channel, message.len());
+    out.extend_from_slice(message);
+    out.extend_from_slice(b"\r\n");
+}
+
+async fn handle_subscribe(
+    cmd: &crate::core::resp::Command,
+    registry: &Arc<PubSubRegistry>,
+    outbound_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    subscriptions: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    if cmd.argc() < 2 {
+        let _ = outbound_tx.send(b"-ERR wrong number of arguments\r\n".to_vec()).await;
+        return;
+    }
+    for i in 1..cmd.argc() {
+        let Some(channel_bytes) = cmd.arg(i) else { continue; };
+        let channel = match std::str::from_utf8(channel_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                let _ = outbound_tx.send(b"-ERR channel name must be valid UTF-8\r\n".to_vec()).await;
+                continue;
             }
         };
-
-        // Carry over unconsumed bytes (partial command) to the next iteration.
-        leftover = remaining;
-
-        if !resp_buf.is_empty()
-            && let Err(e) = socket.write_all(&resp_buf).await {
-                eprintln!("[{}] Write error: {}", addr, e); break;
+        if subscriptions.contains_key(&channel) {
+            let count = subscriptions.len() as i64;
+            let mut buf = Vec::with_capacity(64);
+            write_subscribe_reply(&mut buf, "subscribe", &channel, count);
+            let _ = outbound_tx.send(buf).await;
+            continue;
+        }
+        let mut rx = registry.subscribe(&channel).await;
+        let tx = outbound_tx.clone();
+        // Forwarder task: pump broadcast events into the outbound channel.
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        let mut buf = Vec::with_capacity(msg.message.len() + 64);
+                        write_message_frame(&mut buf, &msg.channel, &msg.message);
+                        if tx.send(buf).await.is_err() { break; }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
-        if should_close { break; }
+        });
+        subscriptions.insert(channel.clone(), handle);
+        let count = subscriptions.len() as i64;
+        let mut buf = Vec::with_capacity(64);
+        write_subscribe_reply(&mut buf, "subscribe", &channel, count);
+        let _ = outbound_tx.send(buf).await;
+    }
+}
+
+async fn handle_unsubscribe(
+    cmd: &crate::core::resp::Command,
+    registry: &Arc<PubSubRegistry>,
+    outbound_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    subscriptions: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    if cmd.argc() < 2 {
+        // No args -> unsubscribe from all.
+        let count_before = subscriptions.len();
+        for (_, handle) in subscriptions.drain() {
+            handle.abort();
+        }
+        for _ in 0..count_before {
+            let mut buf = Vec::with_capacity(48);
+            write_subscribe_reply(&mut buf, "unsubscribe", "", 0);
+            let _ = outbound_tx.send(buf).await;
+        }
+        let _ = registry;
+        return;
+    }
+    for i in 1..cmd.argc() {
+        let Some(channel_bytes) = cmd.arg(i) else { continue; };
+        let channel = match std::str::from_utf8(channel_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => continue,
+        };
+        if let Some(handle) = subscriptions.remove(&channel) {
+            handle.abort();
+            registry.cleanup_channel(&channel).await;
+        }
+        let count = subscriptions.len() as i64;
+        let mut buf = Vec::with_capacity(64);
+        write_subscribe_reply(&mut buf, "unsubscribe", &channel, count);
+        let _ = outbound_tx.send(buf).await;
+    }
+}
+
+async fn handle_publish(
+    cmd: &crate::core::resp::Command,
+    registry: &Arc<PubSubRegistry>,
+    outbound_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    if cmd.argc() != 3 {
+        let _ = outbound_tx.send(b"-ERR wrong number of arguments\r\n".to_vec()).await;
+        return;
+    }
+    let Some(channel_bytes) = cmd.arg(1) else { return; };
+    let Some(message) = cmd.arg(2) else { return; };
+    let channel = match std::str::from_utf8(channel_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = outbound_tx.send(b"-ERR channel name must be valid UTF-8\r\n".to_vec()).await;
+            return;
+        }
+    };
+    let n = registry.publish(channel, message.to_vec()).await;
+    let mut buf = Vec::with_capacity(16);
+    RespEncoder::write_integer(&mut buf, n as i64);
+    let _ = outbound_tx.send(buf).await;
+}
+
+async fn handle_pubsub_meta(
+    cmd: &crate::core::resp::Command,
+    registry: &Arc<PubSubRegistry>,
+    outbound_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    if cmd.argc() < 2 {
+        let _ = outbound_tx.send(b"-ERR wrong number of arguments\r\n".to_vec()).await;
+        return;
+    }
+    let Some(sub) = cmd.arg(1) else { return; };
+    let sub_upper: String = sub.iter().map(|&b| b.to_ascii_uppercase() as char).collect();
+    match sub_upper.as_str() {
+        "CHANNELS" => {
+            let pattern = cmd.arg(2).and_then(|b| std::str::from_utf8(b).ok());
+            let channels = registry.list_channels(pattern).await;
+            let mut buf = Vec::with_capacity(channels.len() * 32);
+            let refs: Vec<&[u8]> = channels.iter().map(|s| s.as_bytes()).collect();
+            RespEncoder::write_array_of_bulks(&mut buf, &refs);
+            let _ = outbound_tx.send(buf).await;
+        }
+        "NUMSUB" => {
+            let mut items: Vec<Vec<u8>> = Vec::with_capacity((cmd.argc() - 2) * 2);
+            for i in 2..cmd.argc() {
+                let Some(ch) = cmd.arg(i) else { continue; };
+                items.push(ch.to_vec());
+                let count = match std::str::from_utf8(ch) {
+                    Ok(name) => registry.numsub(name).await,
+                    Err(_) => 0,
+                };
+                items.push(count.to_string().into_bytes());
+            }
+            let mut buf = Vec::with_capacity(items.len() * 16);
+            let refs: Vec<&[u8]> = items.iter().map(|v| v.as_slice()).collect();
+            RespEncoder::write_array_of_bulks(&mut buf, &refs);
+            let _ = outbound_tx.send(buf).await;
+        }
+        "NUMPAT" => {
+            let mut buf = Vec::with_capacity(8);
+            RespEncoder::write_integer(&mut buf, 0);
+            let _ = outbound_tx.send(buf).await;
+        }
+        _ => {
+            let _ = outbound_tx.send(RespEncoder::encode_error("ERR Unknown PUBSUB subcommand")).await;
+        }
     }
 }
 
@@ -680,6 +1078,16 @@ fn dispatch_command<const N: usize>(
         "LREM"   => { cmd_lrem(cmd, ctx, out); false }
         "LTRIM"  => { cmd_ltrim(cmd, ctx, out); false }
         "LSET"   => { cmd_lset(cmd, ctx, out); false }
+
+        // ----- Sorted Sets (lock-free: SkipMap + DashMap) -----
+        "ZADD"             => { cmd_zadd(cmd, ctx, out); false }
+        "ZSCORE"           => { cmd_zscore(cmd, ctx, out); false }
+        "ZCARD"            => { cmd_zcard(cmd, ctx, out); false }
+        "ZRANGE"           => { cmd_zrange(cmd, ctx, out); false }
+        "ZREVRANGE"        => { cmd_zrevrange(cmd, ctx, out); false }
+        "ZREVRANGEBYSCORE" => { cmd_zrevrangebyscore(cmd, ctx, out); false }
+        "ZREM"             => { cmd_zrem(cmd, ctx, out); false }
+        "ZINCRBY"          => { cmd_zincrby(cmd, ctx, out); false }
 
         // ----- Blob -----
         
@@ -2374,6 +2782,274 @@ fn cmd_lset<const N: usize>(cmd: &crate::core::resp::Command, ctx: &ServerContex
 }
 
 // ---------------------------------------------------------------------------
+// Sorted Set commands (lock-free: crossbeam_skiplist::SkipMap + dashmap::DashMap)
+// ---------------------------------------------------------------------------
+
+/// Parse a f64 score from a command argument.
+///
+/// Accepts the same textual forms as Redis: decimal, scientific, "+inf",
+/// "-inf", "inf". Returns `None` for malformed input so the caller can emit
+/// the canonical `ERR value is not a valid float` reply.
+fn parse_score(bytes: &[u8]) -> Option<f64> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    // Trim leading '+' so "+inf" and "+1.5" parse the same as "inf" / "1.5".
+    let trimmed = s.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "inf" | "+inf" => return Some(f64::INFINITY),
+        "-inf" => return Some(f64::NEG_INFINITY),
+        "nan" => return Some(f64::NAN),
+        _ => {}
+    }
+    trimmed.parse::<f64>().ok()
+}
+
+/// ZADD key score member [score member ...]
+///
+/// Returns the number of *new* members added (existing members whose score
+/// is updated do not count, matching Redis semantics).
+fn cmd_zadd<const N: usize>(
+    cmd: &crate::core::resp::Command,
+    ctx: &ServerContext<N>,
+    out: &mut Vec<u8>,
+) {
+    let Some(sets) = ctx.sorted_sets else {
+        RespEncoder::write_error(out, "ERR sorted sets not enabled");
+        return;
+    };
+    let Some(key_bytes) = cmd.key() else { return err_wrong_args(out); };
+    // argc = 1 (ZADD) + 1 (key) + 2k (score/member pairs); need at least one pair.
+    if cmd.argc() < 4 || (cmd.argc() - 2) % 2 != 0 {
+        return err_wrong_args(out);
+    }
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            RespEncoder::write_error(out, "ERR key must be valid UTF-8");
+            return;
+        }
+    };
+    let mut pairs: Vec<(f64, Vec<u8>)> = Vec::with_capacity((cmd.argc() - 2) / 2);
+    let mut i = 2;
+    while i + 1 < cmd.argc() {
+        let Some(score_bytes) = cmd.arg(i) else { return err_wrong_args(out); };
+        let Some(member) = cmd.arg(i + 1) else { return err_wrong_args(out); };
+        let Some(score) = parse_score(score_bytes) else {
+            RespEncoder::write_error(out, "ERR value is not a valid float");
+            return;
+        };
+        pairs.push((score, member.to_vec()));
+        i += 2;
+    }
+    let added = sets.zadd(key, &pairs);
+    RespEncoder::write_integer(out, added as i64);
+}
+
+/// ZSCORE key member — bulk-string reply with the score, or nil bulk.
+fn cmd_zscore<const N: usize>(
+    cmd: &crate::core::resp::Command,
+    ctx: &ServerContext<N>,
+    out: &mut Vec<u8>,
+) {
+    let Some(sets) = ctx.sorted_sets else {
+        RespEncoder::write_error(out, "ERR sorted sets not enabled");
+        return;
+    };
+    let Some(key_bytes) = cmd.key() else { return err_wrong_args(out); };
+    let Some(member) = cmd.arg(2) else { return err_wrong_args(out); };
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            RespEncoder::write_error(out, "ERR key must be valid UTF-8");
+            return;
+        }
+    };
+    match sets.zscore(key, member) {
+        Some(score) => {
+            // Redis uses bulk-string for ZSCORE (so "1" -> b"1", "1.5" -> b"1.5").
+            let s = format_f64_for_resp(score);
+            RespEncoder::write_bulk_string(out, s.as_bytes());
+        }
+        None => RespEncoder::write_null(out),
+    }
+}
+
+/// ZCARD key — number of members in the sorted set.
+fn cmd_zcard<const N: usize>(
+    cmd: &crate::core::resp::Command,
+    ctx: &ServerContext<N>,
+    out: &mut Vec<u8>,
+) {
+    let Some(sets) = ctx.sorted_sets else {
+        RespEncoder::write_error(out, "ERR sorted sets not enabled");
+        return;
+    };
+    let Some(key_bytes) = cmd.key() else { return err_wrong_args(out); };
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            RespEncoder::write_error(out, "ERR key must be valid UTF-8");
+            return;
+        }
+    };
+    RespEncoder::write_integer(out, sets.zcard(key) as i64);
+}
+
+/// ZRANGE key start stop — members in ascending score order.
+fn cmd_zrange<const N: usize>(
+    cmd: &crate::core::resp::Command,
+    ctx: &ServerContext<N>,
+    out: &mut Vec<u8>,
+) {
+    let Some(sets) = ctx.sorted_sets else {
+        RespEncoder::write_error(out, "ERR sorted sets not enabled");
+        return;
+    };
+    let Some(key_bytes) = cmd.key() else { return err_wrong_args(out); };
+    let Some(start) = cmd.arg(2).and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.parse::<i64>().ok()) else {
+        return err_wrong_args(out);
+    };
+    let Some(stop) = cmd.arg(3).and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.parse::<i64>().ok()) else {
+        return err_wrong_args(out);
+    };
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            RespEncoder::write_error(out, "ERR key must be valid UTF-8");
+            return;
+        }
+    };
+    let members = sets.zrange(key, start, stop);
+    let refs: Vec<&[u8]> = members.iter().map(|m| m.as_slice()).collect();
+    RespEncoder::write_array(out, &refs);
+}
+
+/// ZREVRANGE key start stop — members in descending score order.
+fn cmd_zrevrange<const N: usize>(
+    cmd: &crate::core::resp::Command,
+    ctx: &ServerContext<N>,
+    out: &mut Vec<u8>,
+) {
+    let Some(sets) = ctx.sorted_sets else {
+        RespEncoder::write_error(out, "ERR sorted sets not enabled");
+        return;
+    };
+    let Some(key_bytes) = cmd.key() else { return err_wrong_args(out); };
+    let Some(start) = cmd.arg(2).and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.parse::<i64>().ok()) else {
+        return err_wrong_args(out);
+    };
+    let Some(stop) = cmd.arg(3).and_then(|b| std::str::from_utf8(b).ok()).and_then(|s| s.parse::<i64>().ok()) else {
+        return err_wrong_args(out);
+    };
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            RespEncoder::write_error(out, "ERR key must be valid UTF-8");
+            return;
+        }
+    };
+    let members = sets.zrevrange(key, start, stop);
+    let refs: Vec<&[u8]> = members.iter().map(|m| m.as_slice()).collect();
+    RespEncoder::write_array(out, &refs);
+}
+
+/// ZREVRANGEBYSCORE key max min — members with score in [min, max], descending.
+fn cmd_zrevrangebyscore<const N: usize>(
+    cmd: &crate::core::resp::Command,
+    ctx: &ServerContext<N>,
+    out: &mut Vec<u8>,
+) {
+    let Some(sets) = ctx.sorted_sets else {
+        RespEncoder::write_error(out, "ERR sorted sets not enabled");
+        return;
+    };
+    let Some(key_bytes) = cmd.key() else { return err_wrong_args(out); };
+    let Some(max_bytes) = cmd.arg(2) else { return err_wrong_args(out); };
+    let Some(min_bytes) = cmd.arg(3) else { return err_wrong_args(out); };
+    let Some(max) = parse_score(max_bytes) else {
+        RespEncoder::write_error(out, "ERR min or max is not a float");
+        return;
+    };
+    let Some(min) = parse_score(min_bytes) else {
+        RespEncoder::write_error(out, "ERR min or max is not a float");
+        return;
+    };
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            RespEncoder::write_error(out, "ERR key must be valid UTF-8");
+            return;
+        }
+    };
+    let members = sets.zrevrangebyscore(key, max, min);
+    let refs: Vec<&[u8]> = members.iter().map(|m| m.as_slice()).collect();
+    RespEncoder::write_array(out, &refs);
+}
+
+/// ZREM key member [member ...] — count of removed members.
+fn cmd_zrem<const N: usize>(
+    cmd: &crate::core::resp::Command,
+    ctx: &ServerContext<N>,
+    out: &mut Vec<u8>,
+) {
+    let Some(sets) = ctx.sorted_sets else {
+        RespEncoder::write_error(out, "ERR sorted sets not enabled");
+        return;
+    };
+    let Some(key_bytes) = cmd.key() else { return err_wrong_args(out); };
+    if cmd.argc() < 3 { return err_wrong_args(out); }
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            RespEncoder::write_error(out, "ERR key must be valid UTF-8");
+            return;
+        }
+    };
+    let members: Vec<Vec<u8>> = (2..cmd.argc()).filter_map(|i| cmd.arg(i).map(|b| b.to_vec())).collect();
+    let removed = sets.zrem(key, &members);
+    RespEncoder::write_integer(out, removed as i64);
+}
+
+/// ZINCRBY key increment member — new score, bulk-string reply.
+fn cmd_zincrby<const N: usize>(
+    cmd: &crate::core::resp::Command,
+    ctx: &ServerContext<N>,
+    out: &mut Vec<u8>,
+) {
+    let Some(sets) = ctx.sorted_sets else {
+        RespEncoder::write_error(out, "ERR sorted sets not enabled");
+        return;
+    };
+    let Some(key_bytes) = cmd.key() else { return err_wrong_args(out); };
+    let Some(incr_bytes) = cmd.arg(2) else { return err_wrong_args(out); };
+    let Some(member) = cmd.arg(3) else { return err_wrong_args(out); };
+    let Some(incr) = parse_score(incr_bytes) else {
+        RespEncoder::write_error(out, "ERR value is not a valid float");
+        return;
+    };
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            RespEncoder::write_error(out, "ERR key must be valid UTF-8");
+            return;
+        }
+    };
+    let new_score = sets.zincrby(key, incr, member);
+    let s = format_f64_for_resp(new_score);
+    RespEncoder::write_bulk_string(out, s.as_bytes());
+}
+
+/// Format an f64 score the way Redis does for ZSCORE / ZINCRBY replies:
+/// integers without a trailing `.0`, infinities as `inf` / `-inf`, NaN as
+/// `nan`. The default `Display` impl for f64 already matches this for
+/// finite values; we only special-case the non-finite values.
+fn format_f64_for_resp(n: f64) -> String {
+    if n.is_nan() { "nan".to_string() }
+    else if n.is_infinite() { if n > 0.0 { "inf".to_string() } else { "-inf".to_string() } }
+    else { n.to_string() }
+}
+
+// ---------------------------------------------------------------------------
 // Blob commands (always compiled in; runtime-enabled, default on)
 // ---------------------------------------------------------------------------
 
@@ -2848,7 +3524,7 @@ mod tests {
             store: &store,
             wal: None,
             expiry: None,
-            lists: None,
+            lists: None, sorted_sets: None,
             
             blob: None,
             wal_path: None,
@@ -2877,7 +3553,7 @@ mod tests {
     fn test_dispatch_ping() {
         let store: KvStoreLockFree = KvStoreLockFree::with_capacity(100);
         let authenticated = AtomicBool::new(false);
-        let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None,
+        let ctx = ServerContext { store: &store, wal: None, expiry: None, lists: None, sorted_sets: None,
             
             blob: None,
             wal_path: None,
@@ -2903,7 +3579,7 @@ mod tests {
             store: &store,
             wal: None,
             expiry: None,
-            lists: Some(&lists),
+            lists: Some(&lists), sorted_sets: None,
             
             blob: None,
             wal_path: None,
@@ -2946,7 +3622,7 @@ mod tests {
             store: &store,
             wal: None,
             expiry: None,
-            lists: Some(&lists),
+            lists: Some(&lists), sorted_sets: None,
             
             blob: None,
             wal_path: None,
@@ -2985,7 +3661,7 @@ mod tests {
             store: &store,
             wal: None,
             expiry: None,
-            lists: Some(&lists),
+            lists: Some(&lists), sorted_sets: None,
             
             blob: None,
             wal_path: None,

@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] — 2026-07-10
+
+### Fixed (critical: missing dispatch entries)
+
+- **Sorted Set commands were unreachable over TCP.** The Sorted Set store
+  (`src/core/sortedset.rs`) and its 15 unit tests were wired in correctly,
+  but the central dispatcher in `src/core/server/tcp.rs::dispatch_command`
+  had no `match` arms for `ZADD` / `ZSCORE` / `ZCARD` / `ZRANGE` /
+  `ZREVRANGE` / `ZREVRANGEBYSCORE` / `ZREM` / `ZINCRBY`. Every Z* command
+  returned `-ERR unknown command 'ZADD'` on the wire. The v1.5.1 release
+  binary shipped with this bug — every previous release since v1.4.0 had
+  it too. Fixed by adding the missing dispatch arms and eight `cmd_z*`
+  handlers that translate between the RESP command layer and the
+  lock-free `SortedSetStore` API.
+
+- **Pub/Sub commands were unreachable over TCP.** Same root cause: the
+  `PubSubRegistry` (`src/core/pubsub.rs`) and its 8 unit tests existed,
+  but `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH` / `PUBSUB CHANNELS` /
+  `PUBSUB NUMSUB` had no entries in `dispatch_command`. Fixed by adding
+  a Pub/Sub-aware connection architecture (see below).
+
+### Added
+
+- **Pub/Sub connection architecture.** Both `TokioServer` and
+  `IoUringServer` now use a dedicated writer task per connection:
+  command responses and inbound pub/sub messages flow through a single
+  `tokio::sync::mpsc` channel into the writer task, which owns the
+  socket write half. Each `SUBSCRIBE` spawns a small forwarder task
+  that pumps `broadcast::Receiver` events into the same channel. This
+  means subscriber notifications never block publishers and never get
+  blocked by heavy WAL writes on the same connection. The reader task
+  splits pub/sub commands out of the normal batch and handles them in
+  the async context (they need async `broadcast::send`); non-pubsub
+  commands still go through `spawn_blocking` as before so synchronous
+  WAL writes don't block the async worker thread.
+
+  On the io_uring backend the socket is wrapped in `Arc<TcpStream>`
+  (tokio-uring's `read` and `write_all` take `&self`, so both tasks can
+  share it). On the Tokio backend the socket is split into
+  `OwnedReadHalf` / `OwnedWriteHalf` via `into_split()`.
+
+- **`SortedSetStore` is now sync.** The previous `async fn` signatures
+  on `zadd`/`zscore`/`zcard`/`zrange`/`zrevrange`/`zrevrangebyscore`/
+  `zrem`/`zincrby`/`del`/`exists` were misleading — none of them
+  contained a single `.await`. Internally they all operate on
+  lock-free `crossbeam_skiplist::SkipMap` and `dashmap::DashMap`, so
+  they are genuinely synchronous. Removed the `async` qualifier so
+  callers don't pay a no-op `Future` allocation per call.
+
+- **`RespEncoder::encode_error` and `write_array_of_bulks` helpers.**
+  Convenience wrappers used by the pub/sub handlers.
+
+- **`tests/test_tcp_integration.rs` — 9 end-to-end tests** that spawn a
+  real FastKV server in a background thread and drive commands over a
+  TCP socket. Catches the entire class of "command implemented but not
+  dispatched" regressions that v1.5.1 shipped with. Covers String, TTL,
+  Hash, List, Sorted Set, Blob Arena, Similarity, Scan, and Pub/Sub
+  command groups.
+
+### Verification
+
+| Profile | Result |
+|---------|--------|
+| `cargo test` (dev, no features) | 215 tests passed, 0 warnings |
+| `cargo test --features io-uring` (dev, Linux) | 215 tests passed, 0 warnings |
+| `cargo test --release` (no features) | 215 tests passed |
+| `cargo test --release --features io-uring` (Linux) | 215 tests passed |
+| Release binary smoke test (18 commands over TCP) | 18 passed, 0 failed |
+
+Test breakdown: 182 lib + 8 pubsub + 15 sortedset + 9 tcp_integration +
+1 doctest = 215.
+
 ## [1.5.1] — 2026-07-10
 
 ### Fixed (CI)

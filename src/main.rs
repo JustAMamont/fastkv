@@ -316,6 +316,14 @@ fn run_server_with_n<const N: usize>(
         None
     };
 
+    // --- Sorted Set store (lock-free: SkipMap + DashMap) ---
+    let sorted_sets: Arc<fast_kv::core::sortedset::SortedSetStore> =
+        Arc::new(fast_kv::core::sortedset::SortedSetStore::new());
+
+    // --- Pub/Sub registry (broadcast fan-out, shared across all connections) ---
+    let pubsub: Arc<fast_kv::core::pubsub::PubSubRegistry> =
+        Arc::new(fast_kv::core::pubsub::PubSubRegistry::new());
+
     // --- Expiration ---
     let expiry = Some(Arc::new(ExpirationManager::<N>::with_on_expire(
         Arc::clone(&store),
@@ -480,7 +488,11 @@ fn run_server_with_n<const N: usize>(
             use fast_kv::core::server::IoUringServer;
             println!("Starting FastKV io_uring server on {}:{} (inline-size={})...", host, port, N);
             
-            let server = IoUringServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob, wal_path_buf, password, max_connections);
+            let server = IoUringServer::<N>::with_components(
+                port, host, store, wal_writer, expiry, lists,
+                Some(Arc::clone(&sorted_sets)), Some(Arc::clone(&pubsub)),
+                blob, wal_path_buf, password, max_connections,
+            );
             
             if let Err(e) = server.run() {
                 eprintln!("Error: {}", e);
@@ -499,7 +511,11 @@ fn run_server_with_n<const N: usize>(
             // Graceful shutdown flag — shared between the signal handler and the server.
             let shutting_down = Arc::new(AtomicBool::new(false));
 
-            let server = TokioServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob, wal_path_buf, password, max_connections, Arc::clone(&shutting_down));
+            let server = TokioServer::<N>::with_components(
+                port, host, store, wal_writer, expiry, lists,
+                Some(Arc::clone(&sorted_sets)), Some(Arc::clone(&pubsub)),
+                blob, wal_path_buf, password, max_connections, Arc::clone(&shutting_down),
+            );
             
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             if let Err(e) = rt.block_on(server.run()) {

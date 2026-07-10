@@ -432,6 +432,26 @@ impl RespEncoder {
     pub fn write_empty_array(out: &mut Vec<u8>) {
         out.extend_from_slice(b"*0\r\n");
     }
+
+    /// Allocate a new `Vec<u8>` containing `-ERR <msg>\r\n`.
+    ///
+    /// Convenience wrapper around [`write_error`] for call sites that need
+    /// an owned buffer (e.g. sending through an mpsc channel).
+    #[inline]
+    pub fn encode_error(msg: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(msg.len() + 8);
+        Self::write_error(&mut out, msg);
+        out
+    }
+
+    /// Append `*<count>\r\n` followed by each item as a bulk string.
+    ///
+    /// Identical to [`write_array`] but named to make intent explicit at
+    /// call sites that already hold a `Vec<&[u8]>` of bulk elements.
+    #[inline]
+    pub fn write_array_of_bulks(out: &mut Vec<u8>, items: &[&[u8]]) {
+        Self::write_array(out, items);
+    }
 }
 
 // ============================================================================

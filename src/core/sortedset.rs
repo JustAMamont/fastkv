@@ -98,7 +98,7 @@ impl SortedSetStore {
     }
 
     /// ZADD key score member [score member ...] → count of new elements.
-    pub async fn zadd(&self, key: &str, pairs: &[(Score, Vec<u8>)]) -> usize {
+    pub fn zadd(&self, key: &str, pairs: &[(Score, Vec<u8>)]) -> usize {
         let set = self.get_or_create(key);
         let mut added = 0;
 
@@ -121,19 +121,19 @@ impl SortedSetStore {
     }
 
     /// ZSCORE key member → Option<Score>
-    pub async fn zscore(&self, key: &str, member: &[u8]) -> Option<Score> {
+    pub fn zscore(&self, key: &str, member: &[u8]) -> Option<Score> {
         let set = self.sets.get(key)?;
         set.by_member.get(member).map(|e| *e.value())
     }
 
     /// ZCARD key → count
-    pub async fn zcard(&self, key: &str) -> usize {
+    pub fn zcard(&self, key: &str) -> usize {
         let Some(set) = self.sets.get(key) else { return 0 };
         set.by_member.len()
     }
 
     /// ZRANGE key start stop — ascending score order. Supports negative indices.
-    pub async fn zrange(&self, key: &str, start: i64, stop: i64) -> Vec<Vec<u8>> {
+    pub fn zrange(&self, key: &str, start: i64, stop: i64) -> Vec<Vec<u8>> {
         let Some(set) = self.sets.get(key) else { return vec![] };
         let total = set.by_member.len() as i64;
         if total == 0 { return vec![]; }
@@ -157,7 +157,7 @@ impl SortedSetStore {
     }
 
     /// ZREVRANGE key start stop — descending score order.
-    pub async fn zrevrange(&self, key: &str, start: i64, stop: i64) -> Vec<Vec<u8>> {
+    pub fn zrevrange(&self, key: &str, start: i64, stop: i64) -> Vec<Vec<u8>> {
         let Some(set) = self.sets.get(key) else { return vec![] };
         let total = set.by_member.len() as i64;
         if total == 0 { return vec![]; }
@@ -180,7 +180,7 @@ impl SortedSetStore {
     }
 
     /// ZREVRANGEBYSCORE key max min — members with score in [min, max], descending.
-    pub async fn zrevrangebyscore(&self, key: &str, max: Score, min: Score) -> Vec<Vec<u8>> {
+    pub fn zrevrangebyscore(&self, key: &str, max: Score, min: Score) -> Vec<Vec<u8>> {
         let Some(set) = self.sets.get(key) else { return vec![] };
         let mut result = vec![];
         for entry in set.by_score.iter().rev() {
@@ -193,7 +193,7 @@ impl SortedSetStore {
     }
 
     /// ZREM key member [member ...] → count removed.
-    pub async fn zrem(&self, key: &str, members: &[Vec<u8>]) -> usize {
+    pub fn zrem(&self, key: &str, members: &[Vec<u8>]) -> usize {
         let Some(set) = self.sets.get(key) else { return 0 };
         let mut removed = 0;
         for member in members {
@@ -206,7 +206,7 @@ impl SortedSetStore {
     }
 
     /// ZINCRBY key increment member → new score.
-    pub async fn zincrby(&self, key: &str, increment: Score, member: &[u8]) -> Score {
+    pub fn zincrby(&self, key: &str, increment: Score, member: &[u8]) -> Score {
         let set = self.get_or_create(key);
 
         let mut entry = set.by_member.entry(member.to_vec()).or_insert(0.0);
@@ -223,12 +223,12 @@ impl SortedSetStore {
     }
 
     /// Delete entire sorted set.
-    pub async fn del(&self, key: &str) -> bool {
+    pub fn del(&self, key: &str) -> bool {
         self.sets.remove(key).is_some()
     }
 
     /// Check if key exists.
-    pub async fn exists(&self, key: &str) -> bool {
+    pub fn exists(&self, key: &str) -> bool {
         self.sets.contains_key(key)
     }
 }
