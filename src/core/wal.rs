@@ -388,7 +388,7 @@ impl Wal {
         buf[0..4].copy_from_slice(&checksum.to_le_bytes());
 
         let mut file = self.file.lock().map_err(|e| {
-            WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            WalError::Io(io::Error::other(e.to_string()))
         })?;
         file.write_all(&buf)?;
 
@@ -537,7 +537,7 @@ impl Wal {
     /// Useful for graceful shutdown sequences.
     pub fn sync_now(&self) -> Result<(), WalError> {
         let file = self.file.lock().map_err(|e| {
-            WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            WalError::Io(io::Error::other(e.to_string()))
         })?;
         file.sync_data()?;
         Ok(())
@@ -550,7 +550,7 @@ impl Wal {
     /// subsequent writes go to the new (compact) WAL file.
     pub fn reopen(&self) -> Result<(), WalError> {
         let mut file = self.file.lock().map_err(|e| {
-            WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            WalError::Io(io::Error::other(e.to_string()))
         })?;
         // Sync and close the old file.
         let _ = file.sync_data();

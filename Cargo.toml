@@ -1,16 +1,18 @@
 [package]
 name = "fast_kv"
-version = "1.2.4"
+version = "1.5.0"
 edition = "2024"
-description = "High-performance, Redis-compatible key-value store with WAL persistence, TTL expiration, and lock-free concurrency"
+description = "High-performance, Redis-compatible key-value store with WAL persistence, TTL expiration, Pub/Sub, lock-free Sorted Sets, Blob Arena, Similarity Search, and lock-free concurrency"
 license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "signal", "time"] }
-zerocopy = { version = "0.8", optional = true }
+zerocopy = "0.8"
 tokio-uring = { version = "0.5", optional = true }
 crc32c = "0.6"
-zstd = { version = "0.13", optional = true }
+zstd = "0.13"
+crossbeam-skiplist = "0.1"
+dashmap = "6"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -31,7 +33,7 @@ opt-level = 0
 
 [features]
 default = []
-zero-copy = ["zerocopy"]
+# io-uring is the only remaining compile-time feature:
+# it requires Linux and the tokio-uring crate.
+# Runtime detection handles fallback to tokio TCP on unsupported kernels.
 io-uring = ["tokio-uring"]
-blob-store = ["zstd"]
-similarity = []

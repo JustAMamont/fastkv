@@ -5,6 +5,129 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-07-10
+
+### Changed — Distribution refactor
+
+- **`blob-store` and `similarity` cargo features removed.** All subsystems
+  (Blob Arena, SimHash/MinHash/LSH, Compressed WAL Segment) are now always
+  compiled into a single binary per platform. This eliminates the combinatorial
+  explosion of feature-flag build matrices and makes every binary feature-complete
+  by default.
+  - `Cargo.toml`: removed `optional = true` from `zstd` and `zerocopy`; removed
+    `blob-store` and `similarity` from `[features]`. Only `io-uring` remains
+    as a compile-time feature (it requires the Linux-only `tokio-uring` crate).
+  - `src/core/mod.rs`: all `pub mod` declarations are now unconditional
+    (was: gated by `#[cfg(feature = ...)]`).
+  - `src/core/server/tcp.rs`: already used `Option<Arc<BlobArena>>` everywhere
+    — no changes needed.
+  - `src/core/server/io_uring.rs`: removed `#[cfg(not(feature = "blob-store"))]`
+    duplicate definitions of `handle_client` and `with_components_no_blob`
+    (these were the root cause of the E0428/E0061/E0063 compile errors when
+    `cargo test --all-features` was run).
+  - `src/core/checkpoint.rs`: removed 3 duplicate `#[cfg(not(feature = "blob-store"))]`
+    `let count = ...` lines in tests.
+  - `benches/kv_benchmark.rs`: removed all `#[cfg(feature = "blob-store")]` /
+    `#[cfg(feature = "similarity")]` guards; replaced the 4-way `criterion_main!`
+    cfg dispatch with a single unconditional `criterion_main!(core_benches, blob_benches, similarity_benches)`.
+
+### Added
+
+- **`--no-blob-store` runtime flag.** Blob Arena is enabled by default; pass
+  `--no-blob-store` to disable it at server start (BSET/BGET return errors,
+  saves a small amount of arena bookkeeping memory). Documented in `--help`
+  and `README.md`.
+
+### Fixed
+
+- **`--wal-compress` was silently broken in v1.4.0.** `run_server_with_n` in
+  `src/main.rs` had duplicate `let wal`, `let entries`, and `let wal_writer`
+  bindings left over from the in-progress distribution refactor. The second
+  binding in each pair unconditionally overwrote the first, so the
+  `WalSegment`-based compressed WAL path was dead code — `--wal-compress`
+  silently fell back to the raw `Wal`. Removed the duplicate bindings; the
+  segment WAL path is now reachable and verified to start correctly.
+- **Stale `#[cfg(not(feature = "blob-store"))]` guards in `src/main.rs`
+  `run_server_with_n`** that referenced the removed `blob-store` feature
+  (would have caused `unexpected_cfgs` warnings and dead branches).
+- **Unreachable `_` arm in WAL recovery match** (all 6 `WalOp` variants
+  now explicitly covered; `_` was dead code emitting `unreachable_patterns`
+  warning).
+
+### Tests
+
+- Test count grew from 149 → 206 (182 lib + 8 pubsub + 15 sortedset + 1 doctest)
+  because blob, simhash, minhash, lsh, and wal_segment tests are now always
+  compiled and run.
+
+### Documentation
+
+- `README.md`: removed all `--features blob-store` / `--features similarity`
+  build commands; added `--no-blob-store` to server flags table; updated
+  benchmark group table (removed "Feature Flag" column); updated test counts;
+  added v1.5.0 entry to Roadmap (Phase 15d).
+- `src/main.rs` `print_usage`: fixed orphaned `io_uring` println (was between
+  `--wal-segment-size` and env vars); documented `--no-blob-store`;
+  added Pub/Sub + Sorted Sets + Blob Arena + Similarity to Features list.
+
+## [1.4.0] — 2026-07-09
+
+### Changed
+
+- **Sorted Sets: rewritten to lock-free.** Replaced `RwLock<BTreeMap>` +
+  `RwLock<HashMap>` with `crossbeam_skiplist::SkipMap` +
+  `dashmap::DashMap`. No locks, no blocking — reads and writes are
+  fully concurrent. This eliminates the main bottleneck identified
+  in v1.3.0.
+
+### Added
+
+- Dependencies: `crossbeam-skiplist = "0.1"`, `dashmap = "6"`.
+
+### Fixed (P0 from todo.md)
+
+- **C1: `RespParser::parse_inline` — inline format detection.** Was
+  branching by first letter (`G|S|D|P|I|H|L`); now: `*` → array,
+  any ASCII → inline. Commands like `CLIENT`, `CONFIG`, `EXPIRE` now
+  work in inline mode (telnet, redis-cli --pipe).
+
+- **C8: `glob_match` — exponential backtracking DoS.** Replaced
+  recursive `glob_match_impl` (O(2^n) on `***a***a***a` patterns)
+  with iterative backtracking via `star_pi`/`match_ti` — O(n*m) worst
+  case, no recursion.
+
+- **C9: `KvStoreLockFree::del` — silent failure under contention.**
+  Added 3 retry attempts before returning `false`. Previously, a
+  concurrent writer changing the version between hash check and
+  tombstone store would cause `del` to silently fail.
+
+- **C12: `cmd_auth` — timing attack via plain `==` comparison.**
+  Replaced `provided == expected.as_bytes()` with constant-time XOR
+  comparison with `0xFF` padding for length mismatch.
+
+- **io-uring: `tokio_uring::io::write_all` removed API.** Replaced
+  with `stream.write_all(&b"..."[..])` — `tokio_uring::io` module is
+  private in tokio-uring 0.5.
+
+- **Warning: unreachable_code in io_uring.rs.** Added
+  `#[allow(unreachable_code)]` on `Ok(())` after infinite accept loop.
+
+## [1.3.0] — 2026-07-09
+
+### Added
+
+- **Pub/Sub**: `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`, `PUBSUB CHANNELS`,
+  `PUBSUB NUMSUB` commands via `tokio::sync::broadcast` for fan-out.
+  Supports glob pattern matching for `CHANNELS`. Auto-cleanup of empty
+  channels.
+
+- **Sorted Sets** (v1.3.0, rewritten in v1.4.0): `ZADD`, `ZSCORE`,
+  `ZCARD`, `ZRANGE`, `ZREVRANGE`, `ZREVRANGEBYSCORE`, `ZREM`, `ZINCRBY`.
+  Supports negative indices, negative scores, and NaN.
+
+- **23 integration tests**: 8 for Pub/Sub, 15 for Sorted Sets. All
+  passing alongside 126 existing unit tests (149 total).
+
 ## [1.2.3] — 2026-06-21
 
 ### Fixed

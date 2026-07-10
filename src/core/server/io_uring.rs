@@ -12,7 +12,7 @@ use crate::core::kv::{KvStoreLockFree, DEFAULT_INLINE_SIZE};
 use crate::core::list::ListManager;
 use crate::core::server::tcp::{parse_command_bounds, process_command_into, ServerContext};
 use crate::core::wal::WalWriter;
-#[cfg(feature = "blob-store")]
+
 use crate::core::blob::BlobArena;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ pub struct IoUringServer<const N: usize = DEFAULT_INLINE_SIZE> {
     wal: Option<Arc<dyn WalWriter>>,
     expiry: Option<Arc<ExpirationManager<N>>>,
     lists: Option<Arc<ListManager<N>>>,
-    #[cfg(feature = "blob-store")]
+    
     blob: Option<Arc<BlobArena>>,
     wal_path: Option<std::path::PathBuf>,
     password: Option<String>,
@@ -51,7 +51,7 @@ impl<const N: usize> IoUringServer<N> {
             wal: None,
             expiry: None,
             lists: None,
-            #[cfg(feature = "blob-store")]
+            
             blob: None,
             wal_path: None,
             password: None,
@@ -72,7 +72,7 @@ impl<const N: usize> IoUringServer<N> {
             wal: None,
             expiry: None,
             lists: None,
-            #[cfg(feature = "blob-store")]
+            
             blob: None,
             wal_path: None,
             password: None,
@@ -84,7 +84,7 @@ impl<const N: usize> IoUringServer<N> {
     }
 
     /// Create a fully configured server.
-    #[cfg(feature = "blob-store")]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_components(
         port: u16,
         host: String,
@@ -98,22 +98,6 @@ impl<const N: usize> IoUringServer<N> {
         max_connections: u32,
     ) -> Self {
         Self { store, wal, expiry, lists, blob, wal_path, password, max_connections, active_connections: Arc::new(AtomicU32::new(0)), host, port }
-    }
-
-    /// Create a fully configured server (no blob-store).
-    #[cfg(not(feature = "blob-store"))]
-    pub fn with_components_no_blob(
-        port: u16,
-        host: String,
-        store: Arc<KvStoreLockFree<N>>,
-        wal: Option<Arc<dyn WalWriter>>,
-        expiry: Option<Arc<ExpirationManager<N>>>,
-        lists: Option<Arc<ListManager<N>>>,
-        wal_path: Option<std::path::PathBuf>,
-        password: Option<String>,
-        max_connections: u32,
-    ) -> Self {
-        Self { store, wal, expiry, lists, wal_path, password, max_connections, active_connections: Arc::new(AtomicU32::new(0)), host, port }
     }
 
     /// Block the calling thread running the io_uring event loop.
@@ -143,7 +127,7 @@ impl<const N: usize> IoUringServer<N> {
         let wal = self.wal.clone();
         let expiry = self.expiry.clone();
         let lists = self.lists.clone();
-        #[cfg(feature = "blob-store")]
+        
         let blob = self.blob.clone();
         let wal_path = self.wal_path.clone();
         let password = self.password.clone();
@@ -161,7 +145,7 @@ impl<const N: usize> IoUringServer<N> {
 
             // Check connection limit before spawning.
             if active_connections.load(Ordering::Relaxed) >= max_connections {
-                let _ = tokio_uring::io::write_all(stream, b"-ERR max number of clients reached\r\n").await;
+                let _ = stream.write_all(&b"-ERR max number of clients reached\r\n"[..]).await;
                 continue;
             }
 
@@ -172,7 +156,7 @@ impl<const N: usize> IoUringServer<N> {
             let wal = wal.clone();
             let expiry = expiry.clone();
             let lists = lists.clone();
-            #[cfg(feature = "blob-store")]
+            
             let blob = blob.clone();
             let wal_path = wal_path.clone();
             let password = password.clone();
@@ -186,18 +170,19 @@ impl<const N: usize> IoUringServer<N> {
                 }
                 let _guard = ConnGuard { conn: active_conn };
 
-                #[cfg(feature = "blob-store")]
+                
                 handle_client(stream, store, wal, expiry, lists, blob, wal_path, client_addr, password).await;
-                #[cfg(not(feature = "blob-store"))]
-                handle_client(stream, store, wal, expiry, lists, wal_path, client_addr, password).await;
             });
         }
+        // loop is infinite (accept runs forever until shutdown)
+        // Ok(()) unreachable but kept for type signature
+        #[allow(unreachable_code)]
         Ok(())
     }
 }
 
-/// Per-connection state and main read/write loop (io_uring edition, with blob-store).
-#[cfg(feature = "blob-store")]
+/// Per-connection state and main read/write loop (io_uring edition).
+#[allow(clippy::too_many_arguments)]
 async fn handle_client<const N: usize>(
     stream: tokio_uring::net::TcpStream,
     store: Arc<KvStoreLockFree<N>>,
@@ -220,81 +205,6 @@ async fn handle_client<const N: usize>(
         expiry: expiry.as_deref(),
         lists: lists.as_deref(),
         blob: blob.as_deref(),
-        wal_path: wal_path.as_deref(),
-        password: password.as_ref(),
-        authenticated: &authenticated,
-    };
-
-    loop {
-        let (result, buf) = stream.read(buffer).await;
-        buffer = buf;
-
-        let n = match result {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("[{}] Read error: {}", addr, e);
-                break;
-            }
-        };
-
-        leftover.extend_from_slice(&buffer[..n]);
-        response.clear();
-
-        let mut consumed = 0;
-        let mut should_close = false;
-        while consumed < leftover.len() {
-            match parse_command_bounds(&leftover[consumed..]) {
-                Some((len, is_inline)) => {
-                    let cmd_data = &leftover[consumed..consumed + len];
-                    should_close = process_command_into(
-                        cmd_data,
-                        &ctx,
-                        &mut response,
-                        is_inline,
-                    );
-                    consumed += len;
-                    if should_close { break; }
-                }
-                None => break,
-            }
-        }
-        leftover.drain(..consumed);
-
-        if !response.is_empty() {
-            let (result, resp) = stream.write_all(response).await;
-            response = resp;
-            if let Err(e) = result {
-                eprintln!("[{}] Write error: {}", addr, e);
-                break;
-            }
-        }
-        if should_close { break; }
-    }
-}
-
-/// Per-connection state and main read/write loop (io_uring edition, no blob-store).
-#[cfg(not(feature = "blob-store"))]
-async fn handle_client<const N: usize>(
-    stream: tokio_uring::net::TcpStream,
-    store: Arc<KvStoreLockFree<N>>,
-    wal: Option<Arc<dyn WalWriter>>,
-    expiry: Option<Arc<ExpirationManager<N>>>,
-    lists: Option<Arc<ListManager<N>>>,
-    wal_path: Option<std::path::PathBuf>,
-    addr: SocketAddr,
-    password: Option<String>,
-) {
-    let mut buffer = vec![0u8; MAX_BUFFER_SIZE];
-    let mut leftover: Vec<u8> = Vec::with_capacity(4096);
-    let mut response: Vec<u8> = Vec::with_capacity(4096);
-    let authenticated = Arc::new(AtomicBool::new(false));
-
-    let ctx = ServerContext::<N> {
-        store: &store,
-        wal: wal.as_deref(),
-        expiry: expiry.as_deref(),
-        lists: lists.as_deref(),
         wal_path: wal_path.as_deref(),
         password: password.as_ref(),
         authenticated: &authenticated,

@@ -22,7 +22,7 @@
 //! - **Lock-free write**: CAS on `write_offset` to atomically claim space.
 //! - **Lock-free read**: data is immutable after write.
 //! - **Free list**: sorted best-fit free list with binary search for O(log n) reuse.
-//! - **Compression**: zstd (feature-gated behind `blob-store`).
+//! - **Compression**: zstd (always compiled in; runtime-toggleable via `--no-blob-store`).
 //! - **Hashing**: dual crc32c (two seeds) for 16-byte integrity check.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -705,7 +705,7 @@ mod tests {
     #[test]
     fn test_blob_ref_size_fits_inline() {
         // 33 bytes should fit in the default inline size (64 bytes).
-        assert!(BLOB_REF_SIZE <= 64);
+        const { assert!(BLOB_REF_SIZE <= 64); }
     }
 
     // ----- is_blob_ref -----

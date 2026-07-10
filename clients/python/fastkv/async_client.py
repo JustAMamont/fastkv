@@ -535,7 +535,8 @@ class FastKVAsyncClient:
         return result == b"OK" or result == "OK"
 
     # =========================================================================
-    # Blob commands (require blob-store feature on server)
+    # Blob commands (require Blob Arena enabled on server — default on;
+    # disable with --no-blob-store)
     # =========================================================================
 
     async def bset(self, key: str, value: Union[str, bytes]) -> bool:

@@ -9,7 +9,7 @@ use fast_kv::{
     core::expiration::spawn_active_expiration,
     core::kv::DEFAULT_INLINE_SIZE,
 };
-#[cfg(feature = "blob-store")]
+
 use fast_kv::{BlobArena, WalSegment, SegmentConfig, recover_segments};
 use std::env;
 use std::sync::Arc;
@@ -61,14 +61,13 @@ fn print_usage() {
     println!("  --fsync <policy>     fsync policy: always | everysec | never (default: everysec)");
     println!("  --checkpoint-interval <seconds>  Auto-checkpoint interval in seconds (default: disabled)");
     println!("  --mode <backend>     Server backend: tokio (default)");
-    println!("  --requirepass <pw>   Require clients to authenticate with AUTH");
-    println!("  --max-connections <N>  Max concurrent clients (default: 10000)");
-    #[cfg(feature = "blob-store")]
-    println!("  --wal-compress       Enable compressed segment-based WAL (saves disk for high-volume)");
-    #[cfg(feature = "blob-store")]
-    println!("  --wal-segment-size   Max WAL segment size in MB (default: 64, only with --wal-compress)");
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     println!("                       io_uring (Linux only, maximum performance)");
+    println!("  --requirepass <pw>   Require clients to authenticate with AUTH");
+    println!("  --max-connections <N>  Max concurrent clients (default: 10000)");
+    println!("  --no-blob-store      Disable Blob Arena (BSET/BGET return errors). Default: enabled.");
+    println!("  --wal-compress       Enable compressed segment-based WAL (saves disk for high-volume)");
+    println!("  --wal-segment-size   Max WAL segment size in MB (default: 64, only with --wal-compress)");
     println!();
     println!("Environment variables (override defaults):");
     println!("  FASTKV_HOST          Bind address");
@@ -99,9 +98,14 @@ fn print_usage() {
     println!("  + Thread-safe (Send + Sync)");
     println!("  + Redis-compatible protocol (RESP)");
     println!("  + Pipeline support");
-    println!("  + WAL persistence");
-    println!("  + String commands: INCR, MGET, APPEND, ...");
+    println!("  + WAL persistence (raw or compressed-segment)");
+    println!("  + String commands: INCR, MGET, APPEND, GETRANGE, SETRANGE, STRLEN, ...");
     println!("  + TTL / Expiration with active purging");
+    println!("  + Pub/Sub (SUBSCRIBE/PUBLISH/PUBSUB)");
+    println!("  + Lock-free Sorted Sets (ZADD/ZRANGE/ZREVRANGEBYSCORE/...)");
+    println!("  + Lists (LPUSH/RPUSH/LRANGE/...)");
+    println!("  + Blob Arena — zstd-compressed large-value storage (BSET/BGET/BGETRAW/BSTATS)");
+    println!("  + Similarity Search — SimHash/MinHash/LSH (SIMHADD/SIMHSEARCH/MHADD/...)");
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +122,7 @@ fn get_flag(args: &[String], name: &str) -> Option<String> {
     None
 }
 
-#[cfg(feature = "blob-store")]
+
 fn has_flag(args: &[String], name: &str) -> bool {
     let long = format!("--{}", name);
     args.iter().any(|a| a == &long)
@@ -169,17 +173,15 @@ fn run_server(args: &[String]) {
     let mode = get_flag(args, "mode")
         .unwrap_or_else(|| "tokio".into());
 
-    #[cfg(feature = "blob-store")]
     let wal_compress = has_flag(args, "wal-compress");
-    #[cfg(not(feature = "blob-store"))]
-    let wal_compress = false;
 
-    #[cfg(feature = "blob-store")]
     let wal_segment_size_mb: u64 = get_flag(args, "wal-segment-size")
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
-    #[cfg(not(feature = "blob-store"))]
-    let wal_segment_size_mb: u64 = 64;
+
+    // Blob arena is always compiled in; --no-blob-store disables it at runtime.
+    let blob_store_enabled = !has_flag(args, "no-blob-store");
+
 
     let password: Option<String> = get_flag(args, "requirepass")
         .or_else(|| env::var("FASTKV_REQUIREPASS").ok());
@@ -222,8 +224,7 @@ fn run_server(args: &[String]) {
         println!("  requirepass: (disabled)");
     }
     println!("  max-connections: {}", max_connections);
-    #[cfg(feature = "blob-store")]
-    println!("  blob-store:  enabled (zstd compression)");
+    println!("  blob-store:  {}", if blob_store_enabled { "enabled (zstd compression)" } else { "disabled (--no-blob-store)" });
     if wal_compress {
         println!("  wal-compress: enabled (segment size: {} MB)", wal_segment_size_mb);
     }
@@ -240,10 +241,10 @@ fn run_server(args: &[String]) {
 
     // --- Dispatch to the monomorphized server for the chosen inline size ---
     match inline_size {
-        64  => run_server_with_n::<64>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, checkpoint_interval, password, max_connections),
-        128 => run_server_with_n::<128>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, checkpoint_interval, password, max_connections),
-        256 => run_server_with_n::<256>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, checkpoint_interval, password, max_connections),
-        512 => run_server_with_n::<512>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, checkpoint_interval, password, max_connections),
+        64  => run_server_with_n::<64>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, blob_store_enabled, checkpoint_interval, password, max_connections),
+        128 => run_server_with_n::<128>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, blob_store_enabled, checkpoint_interval, password, max_connections),
+        256 => run_server_with_n::<256>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, blob_store_enabled, checkpoint_interval, password, max_connections),
+        512 => run_server_with_n::<512>(host, port, capacity, data_dir, fsync_policy, mode, wal_compress, wal_segment_size_mb, blob_store_enabled, checkpoint_interval, password, max_connections),
         _   => unreachable!(), // validated above
     }
 }
@@ -253,6 +254,7 @@ fn run_server(args: &[String]) {
 /// This function is instantiated once per supported inline size by the
 /// `match` in [`run_server`], producing optimal lock-free code for each
 /// configuration without any dynamic-dispatch overhead.
+#[allow(clippy::too_many_arguments)]
 fn run_server_with_n<const N: usize>(
     host: String,
     port: u16,
@@ -262,18 +264,14 @@ fn run_server_with_n<const N: usize>(
     mode: String,
     wal_compress: bool,
     wal_segment_size_mb: u64,
+    blob_store_enabled: bool,
     checkpoint_interval: Option<u64>,
     password: Option<String>,
     max_connections: u32,
 ) {
-    // Suppress unused-variable warnings when blob-store is disabled.
-    #[cfg(not(feature = "blob-store"))]
-    let _ = (wal_compress, wal_segment_size_mb);
-
     // --- WAL ---
-    // When wal_compress is enabled (requires blob-store), use WalSegment.
-    // Otherwise, use the legacy v1 Wal.
-    #[cfg(feature = "blob-store")]
+    // --wal-compress selects the compressed segment-based WAL (WalSegment, zstd).
+    // Otherwise, use the legacy v1 Wal (raw fsync-ed append-only file).
     let (wal, wal_seg): (Option<Arc<Wal>>, Option<Arc<WalSegment>>) = if wal_compress {
         // Compressed segment WAL.
         let mut seg_config = SegmentConfig::new(&data_dir);
@@ -303,21 +301,6 @@ fn run_server_with_n<const N: usize>(
         }
     };
 
-    #[cfg(not(feature = "blob-store"))]
-    let (wal, _wal_seg): (Option<Arc<Wal>>, Option<()>) = {
-        let wal_path = format!("{}/fastkv.wal", data_dir);
-        match Wal::open(&wal_path, fsync_policy) {
-            Ok(w) => {
-                println!("  WAL:    {} (fsync: {:?})", wal_path, fsync_policy);
-                (Some(Arc::new(w)), None)
-            }
-            Err(e) => {
-                eprintln!("  WAL:    disabled (open failed: {})", e);
-                (None, None)
-            }
-        }
-    };
-
     // --- KV store ---
     let store = Arc::new(KvStoreLockFree::<N>::with_capacity(capacity));
 
@@ -326,8 +309,12 @@ fn run_server_with_n<const N: usize>(
     let lists = Some(Arc::clone(&lists_mgr));
 
     // --- Blob arena ---
-    #[cfg(feature = "blob-store")]
-    let blob: Option<Arc<BlobArena>> = Some(Arc::new(BlobArena::new()));
+    // Always compiled in; created at runtime unless --no-blob-store was passed.
+    let blob: Option<Arc<BlobArena>> = if blob_store_enabled {
+        Some(Arc::new(BlobArena::new()))
+    } else {
+        None
+    };
 
     // --- Expiration ---
     let expiry = Some(Arc::new(ExpirationManager::<N>::with_on_expire(
@@ -340,7 +327,6 @@ fn run_server_with_n<const N: usize>(
     let _expiry_handle = spawn_active_expiration(expiry.as_ref().unwrap().clone());
 
     // --- WAL recovery ---
-    #[cfg(feature = "blob-store")]
     let entries: Vec<fast_kv::WalEntry> = if let Some(ref seg) = wal_seg {
         // Compressed segment recovery.
         match recover_segments(seg.data_dir()) {
@@ -351,19 +337,6 @@ fn run_server_with_n<const N: usize>(
             }
         }
     } else if let Some(ref wal_arc) = wal {
-        match Wal::recover(wal_arc.path()) {
-            Ok(e) => e,
-            Err(err) => {
-                eprintln!("Warning: WAL recovery failed: {}", err);
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    #[cfg(not(feature = "blob-store"))]
-    let entries: Vec<fast_kv::WalEntry> = if let Some(ref wal_arc) = wal {
         match Wal::recover(wal_arc.path()) {
             Ok(e) => e,
             Err(err) => {
@@ -392,7 +365,7 @@ fn run_server_with_n<const N: usize>(
                 }
             }
             WalOp::Expire => { /* handled below */ }
-            #[cfg(feature = "blob-store")]
+            
             WalOp::BSet => {
                 if let Some(ref blob_arena) = blob {
                     if let Some(blob_ref) = blob_arena.store(&entry.value) {
@@ -410,17 +383,14 @@ fn run_server_with_n<const N: usize>(
                     skipped += 1;
                 }
             }
-            #[cfg(feature = "blob-store")]
+            
             WalOp::BDel => {
-                if let Some(ref blob_arena) = blob {
-                    if let Some(v) = store.get(&entry.key) {
-                        if fast_kv::core::blob::BlobArena::is_blob_ref(&v) {
-                            if let Some(blob_ref) = fast_kv::core::blob::BlobRef::decode(&v) {
+                if let Some(ref blob_arena) = blob
+                    && let Some(v) = store.get(&entry.key)
+                        && fast_kv::core::blob::BlobArena::is_blob_ref(&v)
+                            && let Some(blob_ref) = fast_kv::core::blob::BlobRef::decode(&v) {
                                 blob_arena.free(&blob_ref);
                             }
-                        }
-                    }
-                }
                 if store.del(&entry.key) {
                     recovered += 1;
                 }
@@ -428,10 +398,6 @@ fn run_server_with_n<const N: usize>(
             WalOp::ListOp => {
                 fast_kv::core::list::replay_list_op(&lists_mgr, &entry.key, &entry.value);
                 recovered += 1;
-            }
-            #[cfg(not(feature = "blob-store"))]
-            _ => {
-                skipped += 1;
             }
         }
     }
@@ -457,7 +423,6 @@ fn run_server_with_n<const N: usize>(
         }
     }
 
-    #[cfg(feature = "blob-store")]
     if let Some(ref blob_arena) = blob {
         let stats = blob_arena.stats();
         if stats.total_used > 0 {
@@ -487,30 +452,11 @@ fn run_server_with_n<const N: usize>(
             let expiry_clone = expiry.as_ref().map(Arc::clone);
             let wp_clone = wp.clone();
             let lists_clone = lists.as_ref().map(Arc::clone);
-            #[cfg(feature = "blob-store")]
+            
             let blob_clone = blob.as_ref().map(Arc::clone);
             let _checkpoint_handle = {
-                #[cfg(feature = "blob-store")]
-                {
-                    fast_kv::core::checkpoint::spawn_checkpoint_thread(
-                        store_clone,
-                        expiry_clone,
-                        wp_clone,
-                        interval,
-                        lists_clone,
-                        blob_clone,
-                    )
-                }
-                #[cfg(not(feature = "blob-store"))]
-                {
-                    fast_kv::core::checkpoint::spawn_checkpoint_thread(
-                        store_clone,
-                        expiry_clone,
-                        wp_clone,
-                        interval,
-                        lists_clone,
-                    )
-                }
+                
+                fast_kv::core::checkpoint::spawn_checkpoint_thread(store_clone, expiry_clone, wp_clone, interval, lists_clone, blob_clone)
             };
             println!("  Checkpoint thread started (interval: {}s)", interval);
         } else {
@@ -519,7 +465,7 @@ fn run_server_with_n<const N: usize>(
     }
 
     // Convert WAL references to trait objects for the server.
-    #[cfg(feature = "blob-store")]
+    
     let wal_writer: Option<Arc<dyn fast_kv::WalWriter>> = if let Some(ref seg) = wal_seg {
         Some(Arc::clone(seg) as Arc<dyn fast_kv::WalWriter>)
     } else if let Some(ref w) = wal {
@@ -528,18 +474,14 @@ fn run_server_with_n<const N: usize>(
         None
     };
 
-    #[cfg(not(feature = "blob-store"))]
-    let wal_writer: Option<Arc<dyn fast_kv::WalWriter>> = wal.map(|w| w as Arc<dyn fast_kv::WalWriter>);
-
     match mode.as_str() {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         "io_uring" => {
             use fast_kv::core::server::IoUringServer;
             println!("Starting FastKV io_uring server on {}:{} (inline-size={})...", host, port, N);
-            #[cfg(feature = "blob-store")]
+            
             let server = IoUringServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob, wal_path_buf, password, max_connections);
-            #[cfg(not(feature = "blob-store"))]
-            let server = IoUringServer::<N>::with_components_no_blob(port, host, store, wal_writer, expiry, lists, wal_path_buf, password, max_connections);
+            
             if let Err(e) = server.run() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -557,10 +499,8 @@ fn run_server_with_n<const N: usize>(
             // Graceful shutdown flag — shared between the signal handler and the server.
             let shutting_down = Arc::new(AtomicBool::new(false));
 
-            #[cfg(feature = "blob-store")]
             let server = TokioServer::<N>::with_components(port, host, store, wal_writer, expiry, lists, blob, wal_path_buf, password, max_connections, Arc::clone(&shutting_down));
-            #[cfg(not(feature = "blob-store"))]
-            let server = TokioServer::<N>::with_components_no_blob(port, host, store, wal_writer, expiry, lists, wal_path_buf, password, max_connections, Arc::clone(&shutting_down));
+            
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             if let Err(e) = rt.block_on(server.run()) {
                 eprintln!("Error: {}", e);
@@ -706,7 +646,7 @@ fn run_benchmark() {
         let key = format!("incr:{}", i);
         let _ = store.incr(key.as_bytes(), 1);
     }
-    let incr_ops = 1000 as f64 / start.elapsed().as_secs_f64();
+    let incr_ops = 1000_f64 / start.elapsed().as_secs_f64();
     println!("  Throughput: {:.0} ops/sec", incr_ops);
 
     println!("\nBenchmark: EXISTS");

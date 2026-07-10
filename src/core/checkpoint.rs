@@ -31,7 +31,7 @@ use crate::core::kv::KvStoreLockFree;
 use crate::core::wal::{FsyncPolicy, Wal};
 use crate::core::expiration::ExpirationManager;
 use crate::core::list::{ListManager, LIST_MAGIC, ListSubOp};
-#[cfg(feature = "blob-store")]
+
 use crate::core::blob::{BlobArena, BlobRef};
 
 // ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ pub fn checkpoint<const N: usize>(
     expiry: Option<&ExpirationManager<N>>,
     wal_path: &Path,
     lists: Option<&ListManager<N>>,
-    #[cfg(feature = "blob-store")] blob_arena: Option<&BlobArena>,
+     blob_arena: Option<&BlobArena>,
 ) -> Result<usize, CheckpointError> {
     let wal_dir = wal_path.parent().unwrap_or_else(|| Path::new("."));
     let wal_file_name = wal_path
@@ -134,9 +134,9 @@ pub fn checkpoint<const N: usize>(
     let mut total_keys_seen = 0usize;
 
     // Counters for the final log line.
-    #[cfg(feature = "blob-store")]
+    
     let mut blob_keys_written = 0usize;
-    #[cfg(feature = "blob-store")]
+    
     let mut blob_keys_degraded = 0usize;
 
     // STREAM keys in batches of 1000, writing each to the new WAL immediately.
@@ -163,8 +163,8 @@ pub fn checkpoint<const N: usize>(
             // contents. Without this, list keys would survive restart
             // (the magic byte is restored) but their contents would be
             // empty.
-            if value.len() == 1 && value[0] == LIST_MAGIC {
-                if let Some(lists) = lists {
+            if value.len() == 1 && value[0] == LIST_MAGIC
+                && let Some(lists) = lists {
                     // Write SET(magic) first so the key exists in the hash
                     // table when the LIST_OP entry is replayed.
                     new_wal.set(key, &value)?;
@@ -182,13 +182,12 @@ pub fn checkpoint<const N: usize>(
                 }
                 // No ListManager — fall through to write as plain SET
                 // (key survives, but list contents will be empty after recovery).
-            }
 
-            #[cfg(feature = "blob-store")]
+            
             {
                 if BlobArena::is_blob_ref(&value) {
-                    if let Some(arena) = blob_arena {
-                        if let Some(blob_ref) = BlobRef::decode(&value) {
+                    if let Some(arena) = blob_arena
+                        && let Some(blob_ref) = BlobRef::decode(&value) {
                             // Retrieve the original (decompressed) payload,
                             // write BSET to the compact WAL, then drop it.
                             if let Some(original) = arena.retrieve(&blob_ref) {
@@ -200,7 +199,6 @@ pub fn checkpoint<const N: usize>(
                                 continue;
                             }
                         }
-                    }
                     // Degraded path: write bare BlobRef as SET.
                     new_wal.set(key, &value)?;
                     blob_keys_degraded += 1;
@@ -249,7 +247,7 @@ pub fn checkpoint<const N: usize>(
     // Step 4: Remove backup.
     let _ = fs::remove_file(&bak_path);
 
-    #[cfg(feature = "blob-store")]
+    
     {
         if blob_keys_written > 0 || blob_keys_degraded > 0 {
             eprintln!(
@@ -270,15 +268,6 @@ pub fn checkpoint<const N: usize>(
             );
         }
     }
-    #[cfg(not(feature = "blob-store"))]
-    {
-        eprintln!(
-            "[CHECKPOINT] Compacted WAL: {} keys, {} TTL entries ({} total entries written)",
-            total_keys_seen,
-            ttl_entries.len(),
-            written
-        );
-    }
 
     Ok(written)
 }
@@ -293,7 +282,7 @@ pub fn spawn_checkpoint_thread<const N: usize>(
     wal_path: PathBuf,
     interval_secs: u64,
     lists: Option<Arc<ListManager<N>>>,
-    #[cfg(feature = "blob-store")] blob_arena: Option<Arc<BlobArena>>,
+     blob_arena: Option<Arc<BlobArena>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("fastkv-checkpoint".to_string())
@@ -301,25 +290,13 @@ pub fn spawn_checkpoint_thread<const N: usize>(
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(interval_secs));
                 let res = {
-                    #[cfg(feature = "blob-store")]
-                    {
-                        checkpoint(
-                            &store,
-                            expiry.as_deref(),
-                            &wal_path,
-                            lists.as_deref(),
-                            blob_arena.as_deref(),
-                        )
-                    }
-                    #[cfg(not(feature = "blob-store"))]
-                    {
-                        checkpoint(
-                            &store,
-                            expiry.as_deref(),
-                            &wal_path,
-                            lists.as_deref(),
-                        )
-                    }
+                    checkpoint(
+                        &store,
+                        expiry.as_deref(),
+                        &wal_path,
+                        lists.as_deref(),
+                        blob_arena.as_deref(),
+                    )
                 };
                 match res {
                     Ok(count) => {
@@ -378,10 +355,8 @@ mod tests {
         drop(wal);
 
         // Run checkpoint.
-        #[cfg(feature = "blob-store")]
+        
         let count = checkpoint(&store, Some(&expiry), &wal_path, None, None).unwrap();
-        #[cfg(not(feature = "blob-store"))]
-        let count = checkpoint(&store, Some(&expiry), &wal_path, None).unwrap();
         // Should have 2 SET + 1 EXPIRE = 3 entries.
         assert_eq!(count, 3);
 
@@ -417,10 +392,8 @@ mod tests {
         let wal = Wal::open(&wal_path, FsyncPolicy::Never).unwrap();
         drop(wal);
 
-        #[cfg(feature = "blob-store")]
+        
         let count = checkpoint(&store, None, &wal_path, None, None).unwrap();
-        #[cfg(not(feature = "blob-store"))]
-        let count = checkpoint(&store, None, &wal_path, None).unwrap();
         assert_eq!(count, 0);
 
         let entries = Wal::recover(&wal_path).unwrap();
@@ -436,10 +409,8 @@ mod tests {
         store.set(b"key", b"value");
 
         // WAL file doesn't exist yet — checkpoint should still work.
-        #[cfg(feature = "blob-store")]
+        
         let count = checkpoint(&store, None, &wal_path, None, None).unwrap();
-        #[cfg(not(feature = "blob-store"))]
-        let count = checkpoint(&store, None, &wal_path, None).unwrap();
         assert_eq!(count, 1);
 
         let entries = Wal::recover(&wal_path).unwrap();
@@ -454,7 +425,7 @@ mod tests {
     ///
     /// With the fix, checkpoint writes a proper BSET entry to the compact
     /// WAL, so recovery can rebuild the blob arena correctly.
-    #[cfg(feature = "blob-store")]
+    
     #[test]
     fn test_checkpoint_preserves_blob_keys() {
         use crate::core::blob::BlobArena;
@@ -501,7 +472,7 @@ mod tests {
 
     /// Verify that even after checkpoint compacts the WAL, a fresh server
     /// doing recovery correctly rebuilds the blob arena and BGET works.
-    #[cfg(feature = "blob-store")]
+    
     #[test]
     fn test_checkpoint_then_recover_rebuilds_arena() {
         use crate::core::blob::BlobArena;

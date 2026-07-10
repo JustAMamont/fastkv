@@ -39,7 +39,7 @@
 use crate::core::simhash::{self, hamming_distance};
 use crate::core::minhash::MinHashSig;
 use crate::core::kv::KvStoreLockFree;
-#[cfg(feature = "blob-store")]
+
 use crate::core::blob::BlobArena;
 
 // ---------------------------------------------------------------------------
@@ -117,63 +117,36 @@ pub struct LshProfile {
 // LSH operations
 // ---------------------------------------------------------------------------
 
-/// Compute a SimHash for a blob value stored in the KV store.
+/// Compute a SimHash for a value stored in the KV store.
 ///
 /// The value is treated as a set of features separated by newlines
 /// (or null bytes for structured data). Each feature is hashed
 /// individually.
 ///
 /// Returns the 64-bit SimHash, or `None` if the key doesn't exist.
-#[cfg(feature = "blob-store")]
 pub fn compute_simhash_for_key<const N: usize>(
     store: &KvStoreLockFree<N>,
     blob: Option<&BlobArena>,
     key: &[u8],
 ) -> Option<u64> {
-    let value = store.get(key)?;
+    let data = store.get(key)?;
 
-    // If it's a blob ref, decompress first.
-    let data = if BlobArena::is_blob_ref(&value) {
-        if let Some(arena) = blob {
-            if let Some(blob_ref) = crate::core::blob::BlobRef::decode(&value) {
-                arena.retrieve(&blob_ref)?
+    // If the data is a BlobRef, try to dereference it
+    let data = if data.len() == crate::core::blob::BLOB_REF_SIZE
+        && data[0] == crate::core::blob::BLOB_REF_FLAG
+    {
+        if let Some(blob_arena) = blob {
+            if let Some(blob_ref) = crate::core::blob::BlobRef::decode(&data) {
+                blob_arena.retrieve(&blob_ref).unwrap_or(data)
             } else {
-                value
+                data
             }
         } else {
-            value
+            data
         }
     } else {
-        value
+        data
     };
-
-    // Split into features by null bytes or newlines.
-    let features: Vec<&[u8]> = if data.contains(&0x00) {
-        data.split(|&b| b == 0x00).filter(|s| !s.is_empty()).collect()
-    } else {
-        data.split(|&b| b == b'\n').filter(|s| !s.is_empty()).collect()
-    };
-
-    if features.is_empty() {
-        return Some(0);
-    }
-
-    Some(simhash::simhash_uniform(&features))
-}
-
-/// Compute a SimHash for a plain value stored in the KV store (no blob).
-///
-/// The value is treated as a set of features separated by newlines
-/// (or null bytes for structured data). Each feature is hashed
-/// individually.
-///
-/// Returns the 64-bit SimHash, or `None` if the key doesn't exist.
-#[cfg(not(feature = "blob-store"))]
-pub fn compute_simhash_for_key<const N: usize>(
-    store: &KvStoreLockFree<N>,
-    key: &[u8],
-) -> Option<u64> {
-    let data = store.get(key)?;
 
     let features: Vec<&[u8]> = if data.contains(&0x00) {
         data.split(|&b| b == 0x00).filter(|s| !s.is_empty()).collect()

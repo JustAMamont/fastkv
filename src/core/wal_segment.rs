@@ -50,11 +50,10 @@
 //! them. The user can delete the old WAL file after confirming successful
 //! recovery.
 //!
-//! # Feature Flag
+//! # Build
 //!
-//! Compressed WAL requires the `blob-store` feature (which pulls in `zstd`).
-//! When `blob-store` is not enabled, this module is not compiled and the
-//! server falls back to the plain v1 WAL.
+//! Compressed WAL is always compiled in (zstd is a non-optional dependency
+//! since v1.5.0). Activate at runtime with the `--wal-compress` server flag.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -245,11 +244,10 @@ impl WalSegment {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             // Segment files: seg_0000000000000001.wal
-            if let Some(id_str) = name_str.strip_prefix("seg_").and_then(|s| s.strip_suffix(".wal")) {
-                if let Ok(id) = u64::from_str_radix(id_str, 16) {
+            if let Some(id_str) = name_str.strip_prefix("seg_").and_then(|s| s.strip_suffix(".wal"))
+                && let Ok(id) = u64::from_str_radix(id_str, 16) {
                     max_id = max_id.max(id);
                 }
-            }
         }
 
         let next_segment_id = AtomicU64::new(max_id + 2);
@@ -367,7 +365,7 @@ impl WalSegment {
         };
 
         let mut seg = self.file.lock().map_err(|e| {
-            WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            WalError::Io(io::Error::other(e.to_string()))
         })?;
 
         // Write header if this is the first entry in the segment.
@@ -462,7 +460,7 @@ impl WalSegment {
 
         // Compress with zstd.
         let compressed = zstd_compress(&raw_buf, ZSTD_LEVEL)
-            .map_err(|e| WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| WalError::Io(io::Error::other(e.to_string())))?;
         let comp_len = compressed.len() as u32;
 
         // Write batch header: batch_crc(4) + uncomp_len(4) + comp_len(4) + zstd_data.
@@ -540,7 +538,7 @@ impl WalSegment {
     /// Force an fsync (regardless of policy).
     pub fn sync_now(&self) -> Result<(), WalError> {
         let seg = self.file.lock().map_err(|e| {
-            WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            WalError::Io(io::Error::other(e.to_string()))
         })?;
         seg.file.sync_data()?;
         Ok(())
@@ -549,7 +547,7 @@ impl WalSegment {
     /// Close the current segment gracefully (write footer + flush).
     pub fn close(&self) -> Result<(), WalError> {
         let mut seg = self.file.lock().map_err(|e| {
-            WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            WalError::Io(io::Error::other(e.to_string()))
         })?;
 
         if seg.total_entries > 0 {
@@ -616,11 +614,10 @@ pub fn recover_segments(data_dir: &Path) -> Result<Vec<WalEntry>, WalError> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if let Some(id_str) = name_str.strip_prefix("seg_").and_then(|s| s.strip_suffix(".wal")) {
-                if let Ok(id) = u64::from_str_radix(id_str, 16) {
+            if let Some(id_str) = name_str.strip_prefix("seg_").and_then(|s| s.strip_suffix(".wal"))
+                && let Ok(id) = u64::from_str_radix(id_str, 16) {
                     segment_files.push((id, entry.path()));
                 }
-            }
         }
     }
 
@@ -824,7 +821,7 @@ fn read_compressed_batch(
 
     // Decompress.
     let raw = zstd_decompress(&compressed, uncomp_len as usize)
-        .map_err(|e| WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| WalError::Io(io::Error::other(e.to_string())))?;
 
     // Parse entries from raw buffer.
     parse_entries_from_buffer(&raw)
@@ -868,7 +865,7 @@ fn read_compressed_batch_sequential(reader: &mut impl Read) -> Result<Vec<WalEnt
 
     // Decompress.
     let raw = zstd_decompress(&compressed, uncomp_len as usize)
-        .map_err(|e| WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| WalError::Io(io::Error::other(e.to_string())))?;
 
     parse_entries_from_buffer(&raw)
 }

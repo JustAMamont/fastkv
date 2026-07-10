@@ -21,15 +21,17 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 | Persistence (WAL + checkpoint) | Implemented; recovery path has not been hardened against all crash scenarios |
 | TTL / expiration | Implemented; uses a coarse 1 s ticker with lazy + active purging |
 | Hash / List data types | Implemented; persisted to WAL since v1.2.3 |
-| Blob arena (zstd) | Implemented behind `blob-store` feature; recovery edge cases exist |
-| Similarity search (SimHash / MinHash / LSH) | Experimental, behind `similarity` feature |
+| Pub/Sub (SUBSCRIBE/PUBLISH) | Implemented (v1.3.0); uses `tokio::sync::broadcast` for fan-out |
+| Sorted Sets (ZADD/ZRANGE/...) | Implemented (v1.4.0); lock-free via `crossbeam-skiplist::SkipMap` + `dashmap::DashMap` |
+| Blob arena (zstd) | Implemented (always compiled in; disable at runtime with `--no-blob-store`); recovery edge cases exist |
+| Similarity search (SimHash / MinHash / LSH) | Experimental, always compiled in (runtime-enabled, no feature flag) |
 | TLS / encryption in transit | **Not implemented** — plaintext TCP only |
-| Authentication | `AUTH` password only; no ACL, no constant-time comparison guarantee |
+| Authentication | `AUTH` password with constant-time comparison (v1.4.0); no ACL |
 | Replication / failover | **Not implemented** — single node only |
 | Cluster mode / sharding | **Not implemented** |
 | Backup / restore tooling | Basic `BGSAVE`/`SAVE` only; no PITR, no snapshot verification |
 | Observability | Minimal `INFO` output; no Prometheus, no structured logs, no tracing |
-| Test coverage | Smoke tests via `redis-py`; no fuzzing, no Jepsen-style concurrency tests |
+| Test coverage | 206 tests (unit + integration); no fuzzing, no Jepsen-style concurrency tests |
 
 **Use it for**: local experimentation, benchmarks, learning how a lock-free KV engine is built.
 
@@ -39,8 +41,8 @@ High-performance, Redis-compatible key-value store written in Rust with lock-fre
 
 - **Lock-free hash table** — thread-safe without mutexes; uses atomic CAS and optimistic version reads
 - **Configurable inline size** — `--inline-size 64|128|256|512` per-side storage, zero-overhead monomorphization
-- **Blob Arena** — zstd-compressed large-value storage (feature `blob-store`); `BSET`/`BGET`/`BGETRAW`/`BSTATS`
-- **Similarity search** — SimHash (64-bit near-duplicate), MinHash (Jaccard estimation), LSH O(1) bucket search (feature `similarity`); `SIMHASH`/`FINDSIM`/`LSHADD`/`LSHREM`
+- **Blob Arena** — zstd-compressed large-value storage; `BSET`/`BGET`/`BGETRAW`/`BSTATS`. Always compiled in; disable at runtime with `--no-blob-store`
+- **Similarity search** — SimHash (64-bit near-duplicate), MinHash (Jaccard estimation), LSH O(1) bucket search; `SIMHASH`/`FINDSIM`/`LSHADD`/`LSHREM`. Always compiled in, no feature flag
 - **Redis-compatible RESP protocol** — works with `redis-cli` and any Redis-compatible tooling
 - **Pipeline support** — batch multiple commands in a single round-trip for higher throughput
 - **WAL persistence** — crash-consistent write-ahead log with configurable fsync policy and TTL recovery (including BSET/BDel ops)
@@ -73,18 +75,18 @@ FastKV vs Redis (io_uring, 2 cores)
 ### Build
 
 ```bash
-# Standard build (without blob arena)
+# Standard build — all subsystems (Blob Arena, Similarity, WAL Segment) are
+# always compiled in. There is no longer a `blob-store` or `similarity` feature.
 cargo build --release
 
-# With blob arena (zstd-compressed large-value storage)
-cargo build --release --features blob-store
-
-# With similarity search (SimHash/MinHash/LSH)
-cargo build --release --features similarity
-
-# All features
-cargo build --release --features "blob-store,similarity"
+# With io_uring (Linux only, maximum throughput)
+cargo build --release --features io-uring
 ```
+
+> **v1.5.0 distribution refactor**: `blob-store` and `similarity` are no longer
+> cargo features — all code is always compiled into a single binary per platform.
+> Blob Arena and Similarity are runtime-enabled (Blob Arena can be disabled
+> with `--no-blob-store`; Similarity has no runtime cost when unused).
 
 ### Run Server
 
@@ -101,21 +103,15 @@ fast_kv server --capacity 1000000
 # Larger values (up to 256 bytes per side): increase inline-size
 fast_kv server --inline-size 256 --capacity 500000
 
-# With blob arena (zstd-compressed large values)
-cargo build --release --features blob-store
-fast_kv server
+# Disable Blob Arena (BSET/BGET return errors; saves a few MB of arena overhead)
+fast_kv server --no-blob-store
+
+# Compressed segment-based WAL (zstd, saves disk for high-volume writes)
+fast_kv server --wal-compress --wal-segment-size 64
 
 # With io_uring (Linux only, maximum throughput)
 cargo build --release --features io-uring
 fast_kv server --mode io_uring
-
-# With both blob arena and io_uring
-cargo build --release --features "blob-store,io-uring"
-fast_kv server --mode io_uring
-
-# With blob arena + similarity
-cargo build --release --features "blob-store,similarity"
-fast_kv server
 
 # Via environment variables
 FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_INLINE_SIZE=256 FASTKV_FSYNC=always fast_kv server
@@ -131,10 +127,13 @@ FASTKV_HOST=0.0.0.0 FASTKV_PORT=6379 FASTKV_CAPACITY=500000 FASTKV_INLINE_SIZE=2
 | `--inline-size <N>` | `64` | Per-side inline storage: `64`, `128`, `256`, or `512` bytes |
 | `--dir <path>` | `./fastkv_data` | Data directory for WAL |
 | `--fsync <policy>` | `everysec` | WAL fsync: `always`, `everysec`, `never` |
-| `--mode <backend>` | `tokio` | Server backend: `tokio` or `io_uring` (Linux only) |
+| `--mode <backend>` | `tokio` | Server backend: `tokio` or `io_uring` (Linux only, requires `--features io-uring` at build time) |
 | `--requirepass <pw>` | (disabled) | Require clients to authenticate with `AUTH` command |
 | `--max-connections <N>` | `10000` | Maximum concurrent client connections |
 | `--checkpoint-interval <secs>` | (disabled) | Auto-checkpoint interval in seconds |
+| `--no-blob-store` | (disabled) | Disable Blob Arena at runtime (BSET/BGET return errors) |
+| `--wal-compress` | (disabled) | Use compressed segment-based WAL (zstd) instead of raw append-only WAL |
+| `--wal-segment-size <MB>` | `64` | Max WAL segment size in MB (only with `--wal-compress`) |
 
 #### Capacity & Memory
 
@@ -167,12 +166,17 @@ OK
 PONG
 ```
 
-### Blob Arena (large values, requires `--features blob-store`)
+### Blob Arena (large values, runtime-enabled)
+
+The Blob Arena is always compiled in. It is enabled by default; pass
+`--no-blob-store` at server start to disable it (BSET/BGET will return errors).
 
 ```bash
-# Build with blob-store feature
-cargo build --release --features blob-store
+# Default — Blob Arena enabled
 fast_kv server
+
+# Disable Blob Arena
+fast_kv server --no-blob-store
 ```
 
 ```
@@ -345,7 +349,7 @@ try (Jedis j = new Jedis("127.0.0.1", 6379)) {
 | `HINCRBY key field delta` | Increment hash field by delta (atomic) |
 | `HSETNX key field value` | Set hash field only if field does not exist |
 
-### Blob Store (feature: `blob-store`)
+### Blob Store (runtime-enabled, default on)
 
 | Command | Description |
 |---------|-------------|
@@ -373,6 +377,33 @@ try (Jedis j = new Jedis("127.0.0.1", 6379)) {
 
 > List operations are persisted to WAL (op 0x06 = LIST_OP with sub-ops LPUSH/RPUSH/LPOP/RPOP/LTRIM). Crash recovery replays list operations from WAL.
 
+### Pub/Sub (v1.3.0+)
+
+| Command | Description |
+|---------|-------------|
+| `SUBSCRIBE channel [channel ...]` | Subscribe to one or more channels (enters subscribe mode) |
+| `UNSUBSCRIBE [channel ...]` | Unsubscribe from channels (all if none given) |
+| `PUBLISH channel message` | Publish a message to a channel; returns number of receivers |
+| `PUBSUB CHANNELS [pattern]` | List active channels (optional glob pattern) |
+| `PUBSUB NUMSUB [channel ...]` | Subscriber count for each channel |
+
+> Fan-out is implemented via `tokio::sync::broadcast` — publishers never block on slow subscribers (each subscriber has its own bounded buffer). Channel matching supports glob patterns (`*`, `?`, `[abc]`). Empty channels are auto-cleaned.
+
+### Sorted Sets (v1.4.0+, lock-free)
+
+| Command | Description |
+|---------|-------------|
+| `ZADD key score member [score member ...]` | Add member(s) with score |
+| `ZSCORE key member` | Get score of member |
+| `ZCARD key` | Number of members |
+| `ZRANGE key start stop` | Range by index (ascending) — supports negative indices |
+| `ZREVRANGE key start stop` | Range by index (descending) |
+| `ZREVRANGEBYSCORE key max min` | Range by score (descending) |
+| `ZREM key member [member ...]` | Remove member(s) |
+| `ZINCRBY key delta member` | Increment score of member |
+
+> Backed by `crossbeam_skiplist::SkipMap` (member → score) + `dashmap::DashMap` (member → score index). No locks on the hot path; reads and writes are fully concurrent. Supports negative scores and NaN.
+
 ### Scan / Stats
 
 | Command | Description |
@@ -387,7 +418,7 @@ try (Jedis j = new Jedis("127.0.0.1", 6379)) {
 > **Python client**: `scan(cursor=0, count=10, match=None)` returns `(next_cursor, keys)`;
 > `dbstats()` returns a dict with all statistics fields.
 
-### Similarity (feature: `similarity`)
+### Similarity (runtime-enabled, always compiled)
 
 | Command | Description |
 |---------|-------------|
@@ -407,14 +438,11 @@ try (Jedis j = new Jedis("127.0.0.1", 6379)) {
 ### Server Unit Tests
 
 ```bash
-# Standard tests (124 tests)
+# All tests — every subsystem is always compiled in
 cargo test
 
-# With blob-store feature
-cargo test --features blob-store
-
-# With blob-store + similarity features
-cargo test --features "blob-store,similarity"
+# Include io_uring server tests (Linux only)
+cargo test --features io-uring
 ```
 
 | Module | Tests | Coverage |
@@ -444,7 +472,7 @@ cargo test --features "blob-store,similarity"
 
 | Suite | Tests |
 |-------|------:|
-| Rust (server) | 164 (with blob-store + similarity) / 121 (without) |
+| Rust (server) | 206 (all subsystems always compiled in) |
 | Rust (client) | 23 |
 | Python sync | 27 |
 | Python async | 28 |
@@ -452,17 +480,12 @@ cargo test --features "blob-store,similarity"
 ## Benchmarks
 
 ```bash
-# Core benchmarks (always available)
+# All benchmarks — Blob Arena, Similarity, and WAL Segment benchmarks are
+# always compiled in (no feature flags needed)
 cargo bench --bench kv_benchmark
 
-# Core + Blob Arena benchmarks
-cargo bench --bench kv_benchmark --features blob-store
-
-# Core + Similarity benchmarks
-cargo bench --bench kv_benchmark --features similarity
-
-# All benchmarks (core + blob arena + similarity)
-cargo bench --bench kv_benchmark --features "blob-store,similarity"
+# With io_uring server benchmarks (Linux only)
+cargo bench --bench kv_benchmark --features io-uring
 
 # Filter by name
 cargo bench -- blob          # blob arena benchmarks only
@@ -475,28 +498,28 @@ cargo run --release --example netbench -- all
 
 ### Benchmark Groups
 
-| Group | Feature Flag | What It Measures |
-|-------|-------------|------------------|
-| `set_operations` | — | SET at 100 / 1K / 10K keys |
-| `get_operations` | — | GET at 100 / 1K / 10K keys |
-| `incr_operations` | — | INCR on 10K keys |
-| `exists_operations` | — | EXISTS on 10K keys |
-| `mget_operations` | — | MGET on 100 keys |
-| `threaded_set` | — | Multi-threaded SET (1/2/4/8 threads) |
-| `threaded_get` | — | Multi-threaded GET (1/2/4/8 threads) |
-| `threaded_incr` | — | Multi-threaded INCR (8 threads, 1K keys) |
-| `wal_write` | — | WAL write 10K entries (fsync=never) |
-| `string_operations` | — | APPEND/STRLEN/GETRANGE/SETRANGE on 10K keys |
-| `wal_recovery` | — | WAL recovery 10K entries |
-| `expiration` | — | EXPIRE/TTL on 10K keys |
-| `scan` | — | SCAN at 1K/10K/50K keys, with/without MATCH |
-| `dbstats` | — | DBSTATS at 1K/10K/50K keys |
-| `blob_arena` | `blob-store` | BSET store/retrieve at 256B/1KB/4KB/10KB, BGETRAW, BlobRef encode/decode, stats, compression ratio |
-| `blob_vs_inline` | `blob-store` | SET (inline) vs BSET (blob) for 10K ops, small vs 4KB payloads |
-| `wal_segment` | `blob-store` | Compressed WAL: SET/BSET write, recovery, raw vs compressed |
-| `simhash` | `similarity` | hash64, simhash (weighted/uniform), hamming_distance, is_similar |
-| `minhash` | `similarity` | MinHash 128/256 hashes, Jaccard similarity, serialization |
-| `lsh` | `similarity` | LSH add/find/remove for 1K profiles |
+| Group | What It Measures |
+|-------|------------------|
+| `set_operations` | SET at 100 / 1K / 10K keys |
+| `get_operations` | GET at 100 / 1K / 10K keys |
+| `incr_operations` | INCR on 10K keys |
+| `exists_operations` | EXISTS on 10K keys |
+| `mget_operations` | MGET on 100 keys |
+| `threaded_set` | Multi-threaded SET (1/2/4/8 threads) |
+| `threaded_get` | Multi-threaded GET (1/2/4/8 threads) |
+| `threaded_incr` | Multi-threaded INCR (8 threads, 1K keys) |
+| `wal_write` | WAL write 10K entries (fsync=never) |
+| `string_operations` | APPEND/STRLEN/GETRANGE/SETRANGE on 10K keys |
+| `wal_recovery` | WAL recovery 10K entries |
+| `expiration` | EXPIRE/TTL on 10K keys |
+| `scan` | SCAN at 1K/10K/50K keys, with/without MATCH |
+| `dbstats` | DBSTATS at 1K/10K/50K keys |
+| `blob_arena` | BSET store/retrieve at 256B/1KB/4KB/10KB, BGETRAW, BlobRef encode/decode, stats, compression ratio |
+| `blob_vs_inline` | SET (inline) vs BSET (blob) for 10K ops, small vs 4KB payloads |
+| `wal_segment` | Compressed WAL: SET/BSET write, recovery, raw vs compressed |
+| `simhash` | hash64, simhash (weighted/uniform), hamming_distance, is_similar |
+| `minhash` | MinHash 128/256 hashes, Jaccard similarity, serialization |
+| `lsh` | LSH add/find/remove for 1K profiles |
 
 ## Project Structure
 
@@ -504,47 +527,60 @@ cargo run --release --example netbench -- all
 fastkv/
 ├── Cargo.toml
 ├── README.md
+├── CHANGELOG.md
+├── todo.md                            # Strategic roadmap / code review notes
 ├── src/
-│   ├── lib.rs
-│   ├── main.rs
+│   ├── lib.rs                         # Public API re-exports
+│   ├── main.rs                        # CLI entry point + server bootstrap
 │   └── core/
-│       ├── mod.rs
-│       ├── kv.rs               # Lock-free hash table + string operations
-│       ├── resp.rs             # RESP protocol parser/encoder
-│       ├── wal.rs              # Write-ahead log (SET/DEL/EXPIRE/BSET/BDel)
-│       ├── blob.rs             # Blob Arena — zstd-compressed large-value storage
-│       ├── simhash.rs          # SimHash 64-bit locality-sensitive hashing
-│       ├── minhash.rs          # MinHash signature for Jaccard similarity
-│       ├── lsh.rs              # LSH bucket indexing + O(1) similarity search
-│       ├── expiration.rs       # TTL / key expiration
-│       ├── hash.rs             # Hash data type
-│       ├── list.rs             # List data type
+│       ├── mod.rs                     # Module declarations (no feature gates)
+│       ├── kv.rs                      # Lock-free hash table + string operations
+│       ├── resp.rs                    # RESP protocol parser/encoder
+│       ├── wal.rs                     # Write-ahead log (SET/DEL/EXPIRE/BSET/BDel/LIST_OP)
+│       ├── wal_segment.rs             # Compressed segment-based WAL (zstd)
+│       ├── checkpoint.rs              # BGSAVE / SAVE / periodic checkpoint
+│       ├── blob.rs                    # Blob Arena — zstd-compressed large-value storage
+│       ├── simhash.rs                 # SimHash 64-bit locality-sensitive hashing
+│       ├── minhash.rs                 # MinHash signature for Jaccard similarity
+│       ├── lsh.rs                     # LSH bucket indexing + O(1) similarity search
+│       ├── expiration.rs              # TTL / key expiration (lazy + active purging)
+│       ├── hash.rs                    # Hash data type
+│       ├── list.rs                    # List data type
+│       ├── pubsub.rs                  # Pub/Sub via tokio::sync::broadcast (v1.3.0)
+│       ├── sortedset.rs               # Lock-free sorted set via SkipMap + DashMap (v1.4.0)
 │       └── server/
 │           ├── mod.rs
-│           ├── tcp.rs          # Tokio TCP server (cross-platform)
-│           └── io_uring.rs     # io_uring server (Linux only)
+│           ├── tcp.rs                 # Tokio TCP server (cross-platform)
+│           └── io_uring.rs            # io_uring server (Linux only)
 ├── clients/
-│   ├── README.md                     # Client SDK overview + community-client policy
+│   ├── README.md                      # Client SDK overview + community-client policy
 │   ├── rust/
-│   │   ├── src/                      # lib.rs, resp.rs, pipeline.rs
+│   │   ├── Cargo.toml
+│   │   ├── README.md
+│   │   ├── src/                       # lib.rs, resp.rs, pipeline.rs
 │   │   ├── tests/integration_test.rs  # Integration tests
-│   │   └── examples/example.rs       # Usage example
+│   │   └── examples/example.rs        # Usage example
 │   └── python/
-│       ├── fastkv/                   # Package (client.py, async_client.py, ...)
+│       ├── pyproject.toml
+│       ├── fastkv/                    # Package (client.py, async_client.py, ...)
+│       │   └── README.md
 │       └── tests/
-│           ├── test_integration.py       # Sync integration tests
-│           ├── test_async_integration.py # Async integration tests
-│           └── example.py                 # Usage example
+│           ├── test_integration.py        # Sync integration tests
+│           ├── test_async_integration.py  # Async integration tests
+│           └── example.py                  # Usage example
 ├── scripts/
-│   ├── install_deps.sh               # Install all toolchains
-│   └── setup_and_test.sh             # Run all tests
+│   ├── install_deps.sh                # Install Rust + Python + Node toolchains
+│   ├── setup_and_test.sh              # Run all integration tests
+│   └── remove_duplicates.py           # One-shot refactor script (v1.5.0 cleanup)
 ├── tests/
-│   └── test_fastkv.py                # Server-level tests (uses redis-py)
+│   ├── test_fastkv.py                 # Server-level tests (uses redis-py)
+│   ├── test_pubsub.rs                 # Pub/Sub integration tests (8 cases)
+│   └── test_sortedset.rs              # Sorted Set integration tests (15 cases)
 ├── benches/
-│   ├── kv_benchmark.rs
-│   └── network_benchmark.rs
-└── examples/
-    └── netbench.rs                   # Network benchmark (cargo run --example)
+│   └── kv_benchmark.rs                # Criterion benchmarks (all subsystems)
+└── .github/
+    └── workflows/
+        └── ci.yml                     # Multi-platform build + integration tests
 ```
 
 ## Architecture
@@ -603,15 +639,15 @@ Operations:
   INCR — CAS loop on version for atomic read-modify-write
 ```
 
-### Blob Arena (feature: `blob-store`)
+### Blob Arena (runtime-enabled, default on)
 
 ```
 Blob Ref (inline value with flag 0xFD):
-┌──────────┬──────────┬───────────┬───────────┬──────────────┐
+┌───────────┬──────────┬───────────┬───────────┬─────────────┐
 │ flag: 0xFD│ offset:  │ comp_len: │ orig_len: │ data_hash:  │
 │ 1 byte    │ u64 8B   │ u32 4B    │ u32 4B    │ dual-crc32c │
 │           │          │           │           │ 16B         │
-└──────────┴──────────┴───────────┴───────────┴──────────────┘
+└───────────┴──────────┴───────────┴───────────┴─────────────┘
 Total: 33 bytes — fits even in N=64 inline size
 
 Architecture:
@@ -641,8 +677,8 @@ Expected characteristics:
 Fsync policies:  always (safest) | everysec (balanced) | never (fastest)
 
 WAL Operations:
-  0x00 = SET     0x01 = DEL     0x02 = EXPIRE
-  0x04 = BSET    0x05 = BDel   (blob-store feature only)
+  0x01 = SET     0x02 = DEL     0x03 = EXPIRE
+  0x04 = BSET    0x05 = BDel   (always compiled in; runtime-disabled with --no-blob-store)
   0x06 = LIST_OP              (sub-ops: LPUSH=0x01, RPUSH=0x02, LPOP=0x03, RPOP=0x04, LTRIM=0x05)
 
 Recovery:
@@ -688,7 +724,7 @@ Two strategies work together:
 
 EXPIRE entries are written to WAL and restored on recovery after keys are loaded.
 
-### Similarity (feature: `similarity`)
+### Similarity (runtime-enabled, always compiled)
 
 ```
 SimHash (64-bit near-duplicate detection)
@@ -733,7 +769,7 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 6 — List: LPUSH/RPUSH, LPOP/RPOP, LRANGE/LLEN/LINDEX, LREM/LTRIM/LSET, WRONGTYPE
 - [x] Phase 7 — Client SDKs: Python (sync + async) + Rust (zero-dependency, pipeline support). Java/Node.js/Go clients were moved to community repos — FastKV speaks standard RESP, so any Redis client works
 - [x] Phase 8 — Blob Arena: BSET/BGET/BGETRAW/BSTATS, zstd compression, lock-free arena, WAL persistence, Python client
-- [x] Phase 9 — SimHash/MinHash/LSH: similarity search for near-duplicate detection (feature: `similarity`)
+- [x] Phase 9 — SimHash/MinHash/LSH: similarity search for near-duplicate detection (v1.5.0: now always compiled in, no feature flag)
 - [x] Phase 10 — SCAN/KEYS: cursor-based key iteration, glob MATCH, DBSTATS
 - [ ] Phase 11 — Set: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER
 - [x] Phase 12 — List WAL: persistent list operations (LPUSH/RPUSH/LPOP/RPOP/LTRIM)
@@ -741,7 +777,9 @@ LSH (O(1) approximate nearest-neighbor search)
 - [x] Phase 14 — Production readiness: AUTH, connection limits, graceful shutdown, checkpoint/BGSAVE, TYPE, RENAME, GETSET, GETDEL, SETNX, PSETEX, UNLINK, FLUSHALL/FLUSHDB, HINCRBY, HSETNX, critical bug fixes
 - [x] Phase 14.1 — v1.2.2 hotfix: WAL checkpoint now correctly persists blob keys as `BSET` entries (was: `SET` with bare `BlobRef`, causing `BGET` to return `nil` after restart)
 - [x] Phase 14.2 — v1.2.3 hotfix: LIST operations (LPUSH/RPUSH/LPOP/RPOP/LREM/LTRIM/LSET) now persist to WAL (were in-memory only, lost on restart); checkpoint streaming rewrite (v1.2.2) avoids OOM under high blob-key count; Python client gains `get_str`/`set_str` helpers
-- [ ] Phase 15 — Advanced: Pub/Sub, Transactions (MULTI/EXEC), BLPOP/BRPOP, Lua scripting
+- [x] Phase 15a — Pub/Sub (SUBSCRIBE/UNSUBSCRIBE/PUBLISH/PUBSUB) — implemented in v1.3.0
+- [x] Phase 15b — Sorted Sets (ZADD/ZRANGE/ZREVRANGE/ZREVRANGEBYSCORE/ZSCORE/ZCARD/ZREM/ZINCRBY) — implemented in v1.4.0 (lock-free: SkipMap + DashMap)
+- [x] Phase 15c — P0 bug fixes: C1 (inline parser), C8 (glob DoS), C9 (del retry), C12 (constant-time auth) — fixed in v1.4.0
 - [ ] Phase 16 — Cluster: hash-slot sharding, node discovery, failover
 - [ ] Phase 17 — TLS: optional `--tls-cert` / `--tls-key` via tokio-rustls
 - [ ] Phase 18 — CI/CD, Docker, monitoring /metrics endpoint

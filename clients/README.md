@@ -13,7 +13,7 @@ If you maintain a community FastKV client in another language, open a PR to list
 | Language | Dependencies | Pipeline | Async | Install |
 |----------|:------------:|:--------:|:-----:|---------|
 | **Python** | stdlib only | Yes | asyncio | `pip install git+https://github.com/JustAMamont/fastkv.git#subdirectory=clients/python` |
-| **Rust** | tokio only | Yes | native | extract `fastkv-client-rust-v{version}.tar.gz` |
+| **Rust** | tokio only | Yes | native (tokio) | extract `fastkv-client-rust-v{version}.tar.gz` |
 | _other_ | — | — | — | use any Redis-compatible client (`redis-py`, `go-redis`, `ioredis`, `jedis`, ...) |
 
 The first-party clients are **libraries** — you import them into your project, they connect to a running FastKV server over TCP. They implement the RESP protocol from scratch and have **no Redis SDK dependency**.
@@ -58,6 +58,15 @@ with FastKVClient("localhost", 6379) as c:
     c.lpush("queue:tasks", "task1", "task2", "task3")
     print(c.lrange("queue:tasks", 0, -1))  # [b"task3", b"task2", b"task1"]
 
+    # Blob Arena (large-value storage, zstd-compressed)
+    c.bset("doc:1", b"x" * 5000)    # ~5 KB blob
+    print(c.bget("doc:1")[:10])     # b"xxxxxxxxxx"
+
+    # Similarity search (SimHash + LSH)
+    c.lsh_add("doc:1")
+    c.lsh_add("doc:2")
+    print(c.find_similar("doc:1"))  # [b"doc:2"]
+
     # Pipeline (batch commands in one round-trip)
     with c.pipeline() as pipe:
         pipe.set("k1", "v1")
@@ -70,6 +79,8 @@ c = FastKVClient("10.0.0.1", 6380, socket_timeout=10)
 ```
 
 ### Async Client (FastAPI, aiohttp, etc.)
+
+The async client class is **`FastKVAsyncClient`** (declared in `fastkv/async_client.py` and re-exported from `fastkv/__init__.py`).
 
 ```python
 import asyncio
@@ -153,9 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{:?}", val);    // Some("Hello, FastKV!")
 
     // TTL
-    c.set_expires("session", "data", 3600).await?;
+    c.expire("session", 3600).await?;
     let ttl = c.ttl("session").await?;
-    println!("{:?}", ttl);    // Some(3600)
+    println!("{:?}", ttl);    // 3600
 
     // Hash
     c.hset("user:1", "name", "Alice").await?;
@@ -221,43 +232,55 @@ let results = pipe.execute().await?;
 
 ---
 
-## Supported Commands
+## Command Coverage Matrix
 
-All clients support the same command set:
+The server implements the full command set listed in the main [`README.md`](../README.md#supported-commands). The first-party clients cover a subset — anything not covered can still be invoked through each client's raw-command escape hatch (Python: `_execute_command(*args)`; Rust: add a new method on `Client` calling `self.request(&[...])`).
 
-**Core:** `ping`, `echo`, `info`, `dbsize`
+| Category | Commands | Python sync | Python async | Rust |
+|----------|----------|:---:|:---:|:---:|
+| Core | `PING`, `ECHO`, `DBSIZE`, `INFO`, `QUIT`, `AUTH` | ✅ | ✅ | ✅ |
+| String | `SET` (NX/XX/EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `GETRANGE`, `SETRANGE`, `MSET`, `MGET`, `SETNX`, `PSETEX`, `GETSET`, `GETDEL` | ✅ | ✅ | ✅ |
+| TTL | `EXPIRE`, `TTL`, `PTTL`, `PERSIST` | ✅ | ✅ | ✅ |
+| Hash | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HMGET`, `HMSET`, `HINCRBY`, `HSETNX` | ✅ | ✅ | ✅ |
+| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`, `LREM`, `LTRIM`, `LSET` | ✅ | ✅ | ✅ |
+| Key mgmt | `TYPE`, `RENAME`, `UNLINK`, `FLUSHALL`, `FLUSHDB` | ✅ | ✅ | ✅ |
+| Server | `SAVE`, `BGSAVE` | ✅ | ✅ | ✅ |
+| Scan | `SCAN`, `DBSTATS` | ✅ | ✅ | ❌ (use raw command) |
+| Blob Arena | `BSET`, `BGET`, `BGETRAW`, `BSTATS` | ✅ | ✅ | ❌ (use raw command) |
+| Similarity | `SIMHASH`, `FINDSIM`, `LSHADD`, `LSHREM` | ✅ | ✅ | ❌ (use raw command) |
+| Pub/Sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`, `PUBSUB CHANNELS`, `PUBSUB NUMSUB` | ❌ (use raw socket) | ❌ (use raw socket) | ❌ (use raw command) |
+| Sorted Sets | `ZADD`, `ZSCORE`, `ZCARD`, `ZRANGE`, `ZREVRANGE`, `ZREVRANGEBYSCORE`, `ZREM`, `ZINCRBY` | ❌ (use raw command) | ❌ (use raw command) | ❌ (use raw command) |
 
-**String:** `set` (NX/XX/EX/PX), `get`, `del`, `exists`, `incr`, `decr`, `incrby`, `decrby`, `append`, `strlen`, `getrange`, `setrange`, `mset`, `mget`, `setnx`, `psetex`, `getset`, `getdel`
-
-**TTL:** `expire`, `ttl`, `pttl`, `persist`
-
-**Hash:** `hset`, `hget`, `hdel`, `hgetall`, `hexists`, `hlen`, `hkeys`, `hvals`, `hmget`, `hmset`, `hincrby`, `hsetnx`
-
-**List:** `lpush`, `rpush`, `lpop`, `rpop`, `lrange`, `llen`, `lindex`, `lrem`, `ltrim`, `lset`
-
-**Key management:** `type`, `rename`, `unlink`, `flushall`, `flushdb`
-
-**Server:** `auth`, `save`, `bsave`
+> **Pub/Sub note**: subscribe mode requires a long-lived socket read loop that is incompatible with the request/response pipeline pattern of the current sync / async clients. Use a raw socket with the `fastkv.resp` encoder/decoder, or any Redis-compatible client's `SUBSCRIBE` API.
 
 ---
 
 ## Design Principles
 
 - **No Redis dependency** — hand-rolled RESP protocol implementation
-- **Zero external deps** — only standard library (except Rust: tokio)
-- **Consistent API** — same method names across all languages
-- **Sync + Async** — blocking and non-blocking variants (Python asyncio + Rust tokio)
+- **Zero external deps** — Python: standard library only; Rust: tokio only
+- **Consistent API** — same method names across sync and async variants
+- **Sync + Async** — blocking (`FastKVClient`) and non-blocking (`FastKVAsyncClient`) variants in Python; native async in Rust
 - **Pipeline support** — batch commands for maximum throughput
-- **Thread-safe** — Rust: async, Python: sync lock
+- **Thread-safe** — Rust: async (tokio); Python sync client is guarded by an internal lock for shared use across threads
 
 ---
 
 ## Testing
 
 ```bash
-# Install toolchains
+# Install toolchains (Rust + Python + Node — Node is used as a portable
+# port-wait helper by setup_and_test.sh)
 ./scripts/install_deps.sh
 
-# Run all integration tests
+# Run all integration tests (server unit tests + Python sync + Python async
+# + Rust client integration tests)
 ./scripts/setup_and_test.sh
 ```
+
+| Suite | Tests |
+|-------|------:|
+| Rust (server unit + integration) | 206 |
+| Rust (client SDK) | 23 |
+| Python sync | 27 |
+| Python async | 28 |

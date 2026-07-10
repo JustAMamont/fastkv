@@ -62,6 +62,9 @@ pub const ACTIVE_EXPIRY_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum number of keys examined per active-expiration cycle.
 pub const ACTIVE_EXPIRY_MAX_KEYS: usize = 200;
 
+/// Callback invoked when a key expires and is deleted.
+pub type OnExpireFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // ExpirationManager
 // ---------------------------------------------------------------------------
@@ -81,7 +84,7 @@ pub struct ExpirationManager<const N: usize = DEFAULT_INLINE_SIZE> {
     /// Reference to the KV store so we can delete expired keys.
     store: Arc<KvStoreLockFree<N>>,
     /// Optional callback invoked when a key is expired and deleted.
-    on_expire: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+    on_expire: Option<OnExpireFn>,
 }
 
 // SAFETY: all fields are `Send + Sync`.
@@ -111,7 +114,7 @@ impl<const N: usize> ExpirationManager<N> {
     /// key expires.
     pub fn with_on_expire(
         store: Arc<KvStoreLockFree<N>>,
-        on_expire: Arc<dyn Fn(&[u8]) + Send + Sync>,
+        on_expire: OnExpireFn,
     ) -> Self {
         Self {
             deadlines: RwLock::new(HashMap::new()),
@@ -156,15 +159,14 @@ impl<const N: usize> ExpirationManager<N> {
 
         // Slow path: write lock to remove.
         let mut map = self.deadlines.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(&deadline) = map.get(key) {
-            if deadline <= Instant::now() {
+        if let Some(&deadline) = map.get(key)
+            && deadline <= Instant::now() {
                 map.remove(key);
                 drop(map);
                 self.store.del(key);
                 self.fire_on_expire(key);
                 return true;
             }
-        }
         false
     }
 
@@ -326,9 +328,7 @@ impl<const N: usize> ExpirationManager<N> {
     ///
     /// Returns `None` if the key does not exist.
     pub fn expire_with_deadline(&self, key: &[u8], ttl: Duration) -> Option<u64> {
-        if self.store.get(key).is_none() {
-            return None;
-        }
+        self.store.get(key)?;
         let deadline = Instant::now() + ttl;
         let mut map = self.deadlines.write().unwrap_or_else(|e| e.into_inner());
         map.insert(key.to_vec(), deadline);
@@ -412,12 +412,11 @@ impl<const N: usize> ExpirationManager<N> {
             let mut map = self.deadlines.write().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
             buf.retain(|key| {
-                if let Some(&deadline) = map.get(key) {
-                    if deadline <= now {
+                if let Some(&deadline) = map.get(key)
+                    && deadline <= now {
                         map.remove(key);
                         return true; // confirmed expired — KEEP in buf for Phase 3
                     }
-                }
                 false // not expired or already removed — DROP from buf
             });
         }

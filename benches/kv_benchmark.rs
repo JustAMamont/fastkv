@@ -1,10 +1,12 @@
 //! Criterion Benchmarks for FastKV
 //!
 //! Run with:
-//!   cargo bench
-//!   cargo bench --features blob-store          # include Blob Arena benchmarks
-//!   cargo bench --features blob-store,similarity  # all benchmarks
-//!   cargo bench -- <pattern>                   # e.g. cargo bench -- blob
+//!   cargo bench                              # all benchmarks
+//!   cargo bench --features io-uring          # same + io-uring (Linux only)
+//!   cargo bench -- <pattern>                 # e.g. cargo bench -- blob
+//!
+//! All subsystems (Blob Arena, Similarity, WAL Segment) are always compiled
+//! — they are runtime-enabled, not feature-gated.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use fast_kv::KvStore;
@@ -378,10 +380,9 @@ fn benchmark_expiration(c: &mut Criterion) {
 }
 
 // ============================================================================
-// BLOB ARENA BENCHMARKS (feature: blob-store)
+// BLOB ARENA BENCHMARKS
 // ============================================================================
 
-#[cfg(feature = "blob-store")]
 fn benchmark_blob_arena(c: &mut Criterion) {
     use fast_kv::{BlobArena, BlobRef};
 
@@ -481,7 +482,6 @@ fn benchmark_blob_arena(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "blob-store")]
 fn benchmark_blob_vs_inline(c: &mut Criterion) {
     use fast_kv::{BlobArena, BlobRef};
 
@@ -540,13 +540,11 @@ fn benchmark_blob_vs_inline(c: &mut Criterion) {
         b.iter(|| {
             for i in 0..10_000 {
                 let key = format!("k{}", i);
-                if let Some(val) = store.get(key.as_bytes()) {
-                    if BlobArena::is_blob_ref(&val) {
-                        if let Some(br) = BlobRef::decode(&val) {
+                if let Some(val) = store.get(key.as_bytes())
+                    && BlobArena::is_blob_ref(&val)
+                        && let Some(br) = BlobRef::decode(&val) {
                             black_box(arena.retrieve(&br));
                         }
-                    }
-                }
             }
         });
     });
@@ -555,10 +553,9 @@ fn benchmark_blob_vs_inline(c: &mut Criterion) {
 }
 
 // ============================================================================
-// SIMHASH / MINHASH / LSH BENCHMARKS (feature: similarity)
+// SIMHASH / MINHASH / LSH BENCHMARKS
 // ============================================================================
 
-#[cfg(feature = "similarity")]
 fn benchmark_simhash(c: &mut Criterion) {
     use fast_kv::core::simhash;
 
@@ -629,7 +626,6 @@ fn benchmark_simhash(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "similarity")]
 fn benchmark_minhash(c: &mut Criterion) {
     use fast_kv::core::minhash::MinHashSig;
 
@@ -685,7 +681,6 @@ fn benchmark_minhash(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "similarity")]
 fn benchmark_lsh(c: &mut Criterion) {
     use fast_kv::core::lsh;
     use fast_kv::core::simhash;
@@ -809,7 +804,8 @@ fn benchmark_scan(c: &mut Criterion) {
     }
 
     // --- Full SCAN loop (all keys, small stores only) ---
-    for (label, count) in [("1k", 1_000)] {
+    {
+        let (label, count) = ("1k", 1_000);
         group.bench_with_input(
             BenchmarkId::new("full_loop", label),
             &count,
@@ -877,10 +873,9 @@ fn benchmark_dbstats(c: &mut Criterion) {
 }
 
 // ============================================================================
-// COMPRESSED WAL SEGMENT BENCHMARKS (feature: blob-store)
+// COMPRESSED WAL SEGMENT BENCHMARKS
 // ============================================================================
 
-#[cfg(feature = "blob-store")]
 fn benchmark_wal_segment(c: &mut Criterion) {
     use fast_kv::{SegmentConfig, WalSegment};
 
@@ -964,7 +959,7 @@ fn benchmark_wal_segment(c: &mut Criterion) {
 // REGISTER ALL BENCHMARKS
 // ============================================================================
 
-// Core benchmarks (always compiled)
+// Core benchmarks
 criterion_group!(
     core_benches,
     benchmark_set,
@@ -983,23 +978,11 @@ criterion_group!(
     benchmark_dbstats,
 );
 
-// Blob Arena benchmarks (feature: blob-store)
-#[cfg(feature = "blob-store")]
+// Blob Arena benchmarks
 criterion_group!(blob_benches, benchmark_blob_arena, benchmark_blob_vs_inline, benchmark_wal_segment);
 
-// Similarity benchmarks (feature: similarity)
-#[cfg(feature = "similarity")]
+// Similarity benchmarks
 criterion_group!(similarity_benches, benchmark_simhash, benchmark_minhash, benchmark_lsh);
 
-// Merge all groups
-#[cfg(all(feature = "blob-store", feature = "similarity"))]
+// Merge all groups — all subsystems are always compiled.
 criterion_main!(core_benches, blob_benches, similarity_benches);
-
-#[cfg(all(feature = "blob-store", not(feature = "similarity")))]
-criterion_main!(core_benches, blob_benches);
-
-#[cfg(all(not(feature = "blob-store"), feature = "similarity"))]
-criterion_main!(core_benches, similarity_benches);
-
-#[cfg(all(not(feature = "blob-store"), not(feature = "similarity")))]
-criterion_main!(core_benches);

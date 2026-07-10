@@ -104,7 +104,7 @@ impl MinHashSig {
     /// Each element is hashed and the minimum across all elements is
     /// recorded for each of *k* hash functions.
     pub fn new(elements: &[&[u8]], k: usize) -> Self {
-        let k = k.min(MAX_NUM_HASHES).max(1);
+        let k = k.clamp(1, MAX_NUM_HASHES);
         let coeffs = HashCoefficients::new(k);
 
         // Initialise with maximum values.
@@ -133,7 +133,7 @@ impl MinHashSig {
     /// The seed is mixed into the initial hash to produce different
     /// signatures for the same set (useful for ensemble methods).
     pub fn new_seeded(elements: &[&[u8]], k: usize, seed: u64) -> Self {
-        let k = k.min(MAX_NUM_HASHES).max(1);
+        let k = k.clamp(1, MAX_NUM_HASHES);
         let coeffs = HashCoefficients::new(k);
         let mut sig = vec![u32::MAX; k];
 
@@ -199,7 +199,7 @@ impl MinHashSig {
     ///
     /// Returns `None` if the input length is not a multiple of 4.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() % 4 != 0 {
+        if !data.len().is_multiple_of(4) {
             return None;
         }
         let values: Vec<u32> = data.chunks_exact(4)

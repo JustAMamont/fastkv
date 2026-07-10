@@ -232,7 +232,7 @@ impl<const N: usize> ListManager<N> {
                 let mut i = list.len();
                 while i > 0 && removed < abs_count {
                     i -= 1;
-                    if &list[i] == element.as_ref() {
+                    if list[i] == element {
                         list.remove(i);
                         removed += 1;
                     }
@@ -330,11 +330,10 @@ impl<const N: usize> ListManager<N> {
 
     /// Check that *key* either doesn't exist or already holds a list.
     fn check_type(&self, key: &[u8]) -> Result<(), ListError> {
-        if let Some(val) = self.store.get(key) {
-            if !is_list_value(&val) {
+        if let Some(val) = self.store.get(key)
+            && !is_list_value(&val) {
                 return Err(ListError::WrongType);
             }
-        }
         Ok(())
     }
 

@@ -89,10 +89,13 @@ impl RespParser {
         match data[0] {
             // RESP array: *<count>\r\n...
             b'*' => Self::parse_array(data),
-            
-            // Inline command: GET key\r\n
-            b'G' | b'S' | b'D' | b'P' | b'I' | b'H' | b'L' => Self::parse_inline(data),
-            
+
+            // Inline command: anything that's not * and is printable ASCII.
+            // Redis defines inline as "any input that doesn't start with *".
+            // This fixes C1: commands like CLIENT, CONFIG, EXPIRE, etc.
+            // now work in inline mode (telnet, redis-cli --pipe).
+            c if c.is_ascii_alphabetic() || c == b' ' => Self::parse_inline(data),
+
             _ => Err(ParseError::UnknownFormat),
         }
     }
@@ -192,7 +195,7 @@ impl RespParser {
         }
         let mut n: i64 = 0;
         for &b in &bytes[pos..] {
-            if b < b'0' || b > b'9' {
+            if !b.is_ascii_digit() {
                 return Err(ParseError::InvalidNumber);
             }
             n = n.checked_mul(10).ok_or(ParseError::InvalidNumber)?
@@ -212,7 +215,7 @@ impl RespParser {
         }
 
         let name = args[0].iter()
-            .map(|&b| if b >= b'a' && b <= b'z' { (b - 32) as char } else { b as char })
+            .map(|&b| if b.is_ascii_lowercase() { (b - 32) as char } else { b as char })
             .collect::<String>();
 
         Ok(Command { name, args })

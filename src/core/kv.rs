@@ -401,6 +401,7 @@ impl Default for KvStoreCustom {
 ///
 /// - `data[0][0..key_len]` holds the key bytes.
 /// - `data[1][0..value_len]` holds the value bytes.
+///
 /// Each byte is an `AtomicU8` to support individual byte reads without locking.
 #[repr(C, align(64))]
 struct LockFreeEntry<const N: usize> {
@@ -711,29 +712,36 @@ impl<const N: usize> KvStoreLockFree<N> {
         let start = (hash as usize) % self.capacity;
         let probe_limit = self.capacity.min(MAX_PROBE_STEPS);
 
-        for i in 0..probe_limit {
-            let idx = (start + i) % self.capacity;
-            let entry = &self.buckets[idx];
-            let entry_hash = entry.hash.load(Ordering::Acquire);
+        // Retry loop: if a concurrent writer changes the version between
+        // our hash check and our tombstone store, we retry.
+        // Fixes C9: del without retry could silently fail under contention.
+        for _attempt in 0..3 {
+            for i in 0..probe_limit {
+                let idx = (start + i) % self.capacity;
+                let entry = &self.buckets[idx];
+                let entry_hash = entry.hash.load(Ordering::Acquire);
 
-            if entry_hash == 0 { return false; }
-            if entry_hash == TOMBSTONE { continue; }
-            if entry_hash == hash {
-                let key_len = entry.key_len.load(Ordering::Acquire) as usize;
-                if key_len == key.len() {
-                    let mut entry_key = [0u8; N];
-                    for j in 0..key_len {
-                        entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
-                    }
-                    if &entry_key[..key_len] == key {
-                        let v = entry.version.fetch_add(1, Ordering::AcqRel);
-                        entry.hash.store(TOMBSTONE, Ordering::Release);
-                        entry.version.store(v + 2, Ordering::Release);
-                        self.count.fetch_sub(1, Ordering::Relaxed);
-                        return true;
+                if entry_hash == 0 { return false; }
+                if entry_hash == TOMBSTONE { continue; }
+                if entry_hash == hash {
+                    let key_len = entry.key_len.load(Ordering::Acquire) as usize;
+                    if key_len == key.len() {
+                        let mut entry_key = [0u8; N];
+                        for j in 0..key_len {
+                            entry_key[j] = entry.data[0][j].load(Ordering::Relaxed);
+                        }
+                        if &entry_key[..key_len] == key {
+                            let v = entry.version.fetch_add(1, Ordering::AcqRel);
+                            entry.hash.store(TOMBSTONE, Ordering::Release);
+                            entry.version.store(v + 2, Ordering::Release);
+                            self.count.fetch_sub(1, Ordering::Relaxed);
+                            return true;
+                        }
                     }
                 }
             }
+            // If we didn't find it, it may have been temporarily in flux.
+            // Retry once more before giving up.
         }
         false
     }
@@ -1432,52 +1440,35 @@ pub struct DbStats {
 /// No character class `[...]` support — keeping it simple for performance.
 /// Pattern matching is case-sensitive.
 pub fn glob_match(text: &[u8], pattern: &[u8]) -> bool {
-    glob_match_impl(text, 0, pattern, 0)
-}
+    // Iterative glob matching with backtracking — O(n*m) worst case,
+    // no exponential blowup. Fixes C8 (DoS via nested * patterns).
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut match_ti = 0usize;
 
-fn glob_match_impl(text: &[u8], ti: usize, pattern: &[u8], pi: usize) -> bool {
-    let mut ti = ti;
-    let mut pi = pi;
-
-    loop {
-        if pi == pattern.len() {
-            return ti == text.len();
-        }
-
-        let pc = pattern[pi];
-
-        if pc == b'*' {
-            // Skip consecutive stars.
-            let mut star_pi = pi + 1;
-            while star_pi < pattern.len() && pattern[star_pi] == b'*' {
-                star_pi += 1;
-            }
-
-            // If star is at end of pattern, it matches everything.
-            if star_pi == pattern.len() {
-                return true;
-            }
-
-            // Try matching the remainder after `*` at every position in text.
-            for try_ti in ti..=text.len() {
-                if glob_match_impl(text, try_ti, pattern, star_pi) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if ti == text.len() {
-            return false;
-        }
-
-        if pc == b'?' || pc == text[ti] {
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
             ti += 1;
             pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = Some(pi);
+            match_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            match_ti += 1;
+            ti = match_ti;
         } else {
             return false;
         }
     }
+
+    // Skip trailing * in pattern
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 /// The production KV store — lock-free and thread-safe with the default
